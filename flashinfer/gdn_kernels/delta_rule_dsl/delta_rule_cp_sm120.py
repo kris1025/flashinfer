@@ -30,6 +30,8 @@ from .varlen_helper import (
     CP_CHUNK_LEN_GRANULARITY,
     choose_cp_chunk_len_host,
     chunks_for_len,
+    integer_dtype_to_cutlass,
+    is_integer_dtype,
     max_num_chunks_host,
     varlen_chunk_idx,
     varlen_chunk_valid_len,
@@ -492,9 +494,9 @@ def cp_delta_rule_t_precompute_dsl_sm120(
             raise RuntimeError(
                 f"total_seqlen must match k.shape[0], got {total_seqlen} and {k.shape[0]}"
             )
-        if cu_seqlens.dtype != torch.int64:
+        if not is_integer_dtype(cu_seqlens.dtype):
             raise RuntimeError(
-                f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+                f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
             )
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
@@ -550,7 +552,9 @@ def cp_delta_rule_t_precompute_dsl_sm120(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
 
-    kernel = CPDeltaRuleTPrecomputeSm120(kernel_dtype)
+    kernel = CPDeltaRuleTPrecomputeSm120(
+        kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens.dtype)
+    )
     kernel_args = (
         from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
         from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic(),
@@ -608,9 +612,11 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         self,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
     ):
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.cu_seqlens_dtype = cu_seqlens_dtype
         self.BLK = 64
         self.D = 128
         self.k_stage = 2
@@ -620,6 +626,7 @@ class CPDeltaRuleMNPrecomputeSm120(KeyedCompileMixin):
         self.manual_cache_key(
             "dtype",
             "acc_dtype",
+            "cu_seqlens_dtype",
             "BLK",
             "D",
             "k_stage",
@@ -1628,9 +1635,9 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
             raise RuntimeError(
                 f"cp_chunk_len must be a multiple of 64, got {cp_chunk_len}"
             )
-        if cu_seqlens.dtype != torch.int64:
+        if not is_integer_dtype(cu_seqlens.dtype):
             raise RuntimeError(
-                f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+                f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
             )
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
@@ -1717,7 +1724,9 @@ def cp_delta_rule_mn_precompute_dsl_sm120(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
 
-    kernel = CPDeltaRuleMNPrecomputeSm120(kernel_dtype)
+    kernel = CPDeltaRuleMNPrecomputeSm120(
+        kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens.dtype)
+    )
     kernel_args = (
         from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
         from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
@@ -1755,6 +1764,9 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
         use_state_indices: bool = False,
+        state_indices_dtype: type[cutlass.Numeric] | None = None,
+        initial_state_inner_strides: tuple[int, ...] | None = None,
+        output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
@@ -1763,6 +1775,9 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         self.state_dtype = state_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.use_state_indices = use_state_indices
+        self.state_indices_dtype = state_indices_dtype
+        self.initial_state_inner_strides = initial_state_inner_strides
+        self.output_state_inner_strides = output_state_inner_strides
         self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = 64
@@ -1784,6 +1799,9 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
             "state_dtype",
             "cu_seqlens_dtype",
             "use_state_indices",
+            "state_indices_dtype",
+            "initial_state_inner_strides",
+            "output_state_inner_strides",
             "store_initial_state",
             "D",
             "rows_per_cta",
@@ -2148,16 +2166,20 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         if cutlass.const_expr(self.use_state_indices):
             state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
+            initial_state_ref_layout = cute.make_layout(
+                (
+                    g_initial_state_t.shape[0],
+                    g_initial_state_t.shape[1],
+                    self.D,
+                    self.D,
+                ),
+                stride=g_initial_state_t.stride,
+            )
+            indexed_initial_state_layout = cute.select(
+                initial_state_ref_layout, mode=[2, 3, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                initial_state_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
-                    stride=(
-                        g_initial_state_t.stride[2],
-                        g_initial_state_t.stride[3],
-                        g_initial_state_t.stride[1],
-                        g_initial_state_t.stride[0],
-                    ),
-                )
+                initial_state_layout = indexed_initial_state_layout
                 gInitialState = cute.make_tensor(
                     g_initial_state_t.iterator, initial_state_layout
                 )
@@ -2168,16 +2190,20 @@ class CPDeltaRuleFixupHmmaSm120(KeyedCompileMixin):
         else:
             gInitialState = gFixedState
         if cutlass.const_expr(self.store_final_state):
+            output_state_ref_layout = cute.make_layout(
+                (
+                    g_output_state_t.shape[0],
+                    g_output_state_t.shape[1],
+                    self.D,
+                    self.D,
+                ),
+                stride=g_output_state_t.stride,
+            )
+            indexed_output_state_layout = cute.select(
+                output_state_ref_layout, mode=[2, 3, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                output_state_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
-                    stride=(
-                        g_output_state_t.stride[2],
-                        g_output_state_t.stride[3],
-                        g_output_state_t.stride[1],
-                        g_output_state_t.stride[0],
-                    ),
-                )
+                output_state_layout = indexed_output_state_layout
                 gOutputState = cute.make_tensor(
                     g_output_state_t.iterator, output_state_layout
                 )
@@ -2378,6 +2404,9 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         state_dtype: type[cutlass.Numeric] = cutlass.Float32,
         cu_seqlens_dtype: type[cutlass.Numeric] = cutlass.Int64,
         use_state_indices: bool = False,
+        state_indices_dtype: type[cutlass.Numeric] | None = None,
+        initial_state_inner_strides: tuple[int, ...] | None = None,
+        output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
     ):
         self.needs_initial_state = needs_initial_state
@@ -2386,6 +2415,9 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         self.state_dtype = state_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
         self.use_state_indices = use_state_indices
+        self.state_indices_dtype = state_indices_dtype
+        self.initial_state_inner_strides = initial_state_inner_strides
+        self.output_state_inner_strides = output_state_inner_strides
         self.store_initial_state = store_initial_state
         self.D = 128
         self.rows_per_cta = rows_per_cta
@@ -2401,6 +2433,9 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
             "state_dtype",
             "cu_seqlens_dtype",
             "use_state_indices",
+            "state_indices_dtype",
+            "initial_state_inner_strides",
+            "output_state_inner_strides",
             "store_initial_state",
             "D",
             "rows_per_cta",
@@ -2652,16 +2687,20 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         if cutlass.const_expr(self.use_state_indices):
             state_idx = cutlass.Int32(g_state_indices_t[seq_idx])
         if cutlass.const_expr(self.needs_initial_state):
+            initial_state_ref_layout = cute.make_layout(
+                (
+                    g_initial_state_t.shape[0],
+                    g_initial_state_t.shape[1],
+                    self.D,
+                    self.D,
+                ),
+                stride=g_initial_state_t.stride,
+            )
+            indexed_initial_state_layout = cute.select(
+                initial_state_ref_layout, mode=[2, 3, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                initial_state_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_initial_state_t.shape[0]),
-                    stride=(
-                        g_initial_state_t.stride[2],
-                        g_initial_state_t.stride[3],
-                        g_initial_state_t.stride[1],
-                        g_initial_state_t.stride[0],
-                    ),
-                )
+                initial_state_layout = indexed_initial_state_layout
                 gInitialState = cute.make_tensor(
                     g_initial_state_t.iterator, initial_state_layout
                 )
@@ -2672,16 +2711,20 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         else:
             gInitialState = gFixedState
         if cutlass.const_expr(self.store_final_state):
+            output_state_ref_layout = cute.make_layout(
+                (
+                    g_output_state_t.shape[0],
+                    g_output_state_t.shape[1],
+                    self.D,
+                    self.D,
+                ),
+                stride=g_output_state_t.stride,
+            )
+            indexed_output_state_layout = cute.select(
+                output_state_ref_layout, mode=[2, 3, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                output_state_layout = cute.make_layout(
-                    (self.D, self.D, num_heads, g_output_state_t.shape[0]),
-                    stride=(
-                        g_output_state_t.stride[2],
-                        g_output_state_t.stride[3],
-                        g_output_state_t.stride[1],
-                        g_output_state_t.stride[0],
-                    ),
-                )
+                output_state_layout = indexed_output_state_layout
                 gOutputState = cute.make_tensor(
                     g_output_state_t.iterator, output_state_layout
                 )
@@ -2818,11 +2861,11 @@ def cp_delta_rule_fixup_dsl_sm120(
                     f"initial_state must have dtype torch.float32, got {initial_state.dtype}"
                 )
         if use_state_indices and (
-            state_indices.dtype != torch.int32
+            not is_integer_dtype(state_indices.dtype)
             or state_indices.shape != (cu_seqlens.shape[0] - 1,)
         ):
             raise RuntimeError(
-                f"state_indices must have shape {(cu_seqlens.shape[0] - 1,)} and dtype int32"
+                f"state_indices must have shape {(cu_seqlens.shape[0] - 1,)} and an integer dtype"
             )
         for name, tensor in (
             ("local_transfer", local_transfer),
@@ -2834,20 +2877,15 @@ def cp_delta_rule_fixup_dsl_sm120(
             if not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
         if initial_state is not None:
-            if use_state_indices:
-                if initial_state.stride()[1:] != (128 * 128, 128, 1):
-                    raise RuntimeError(
-                        "initial_state inner dimensions must be contiguous when state_indices is used"
-                    )
-            elif not initial_state.is_contiguous():
+            if not use_state_indices and not initial_state.is_contiguous():
                 raise RuntimeError("initial_state must be contiguous")
     total_cp_chunks, num_heads, _, _ = local_transfer.shape
     if not _skip_check:
         if cp_chunk_len <= 0:
             raise RuntimeError(f"cp_chunk_len must be positive, got {cp_chunk_len}")
-        if cu_seqlens.dtype != torch.int64:
+        if not is_integer_dtype(cu_seqlens.dtype):
             raise RuntimeError(
-                f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+                f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
             )
         expected_chunks = workspace_num_chunks_host(
             cu_seqlens, cp_chunk_len, total_seqlen
@@ -2908,18 +2946,51 @@ def cp_delta_rule_fixup_dsl_sm120(
         kernel = CPDeltaRuleFixupSimtSm120(  # type: ignore
             needs_initial_state=needs_initial_state,
             rows_per_cta=4,
+            cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens.dtype),
             use_state_indices=use_state_indices,
+            state_indices_dtype=(
+                integer_dtype_to_cutlass(state_indices.dtype)
+                if use_state_indices
+                else None
+            ),
+            initial_state_inner_strides=(
+                tuple(initial_state.stride()[1:])
+                if use_state_indices and needs_initial_state
+                else None
+            ),
         )
     elif _kernel_kind == "simt_row8":
         kernel = CPDeltaRuleFixupSimtSm120(  # type: ignore
             needs_initial_state=needs_initial_state,
             rows_per_cta=8,
+            cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens.dtype),
             use_state_indices=use_state_indices,
+            state_indices_dtype=(
+                integer_dtype_to_cutlass(state_indices.dtype)
+                if use_state_indices
+                else None
+            ),
+            initial_state_inner_strides=(
+                tuple(initial_state.stride()[1:])
+                if use_state_indices and needs_initial_state
+                else None
+            ),
         )
     elif _kernel_kind == "hmma":
         kernel = CPDeltaRuleFixupHmmaSm120(  # type: ignore
             needs_initial_state=needs_initial_state,
+            cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens.dtype),
             use_state_indices=use_state_indices,
+            state_indices_dtype=(
+                integer_dtype_to_cutlass(state_indices.dtype)
+                if use_state_indices
+                else None
+            ),
+            initial_state_inner_strides=(
+                tuple(initial_state.stride()[1:])
+                if use_state_indices and needs_initial_state
+                else None
+            ),
         )
     else:
         raise ValueError(f"Unsupported fixup kernel kind: {_kernel_kind}")
@@ -2982,6 +3053,11 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         store_final_state: bool = True,
         use_state_indices: bool = False,
         needs_checkpointing: bool = False,
+        cu_seqlens_dtype: torch.dtype = torch.int64,
+        state_indices_dtype: torch.dtype | None = None,
+        checkpoint_cu_starts_dtype: torch.dtype | None = None,
+        state_inner_strides: tuple[int, ...] | None = None,
+        initial_state_inner_strides: tuple[int, ...] | None = None,
     ):
         self.needs_alpha = True
         self.dtype = dtype
@@ -2993,6 +3069,11 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         self.store_final_state = store_final_state
         self.use_state_indices = use_state_indices
         self.needs_checkpointing = needs_checkpointing
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.state_indices_dtype = state_indices_dtype
+        self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
+        self.state_inner_strides = state_inner_strides
+        self.initial_state_inner_strides = initial_state_inner_strides
         self.q_stage = 1
         self.k_stage = 1
         self.v_stage = 1
@@ -3007,6 +3088,11 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
             "store_final_state",
             "use_state_indices",
             "needs_checkpointing",
+            "cu_seqlens_dtype",
+            "state_indices_dtype",
+            "checkpoint_cu_starts_dtype",
+            "state_inner_strides",
+            "initial_state_inner_strides",
             "dtype",
             "acc_dtype",
             "BLK_Q",
@@ -3972,37 +4058,30 @@ class CPDeltaRulePrefillSm120(KeyedCompileMixin):
         packed_state_layout = cute.make_ordered_layout(
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
+        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
+        state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
+        indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
         state_idx = public_seq_idx
         if cutlass.const_expr(self.use_state_indices):
             state_idx = cutlass.Int32(g_state_indices[public_seq_idx])
         output_state_idx = public_seq_idx
         if cutlass.const_expr(self.use_state_indices and self.store_final_state):
             output_state_idx = state_idx
-            state_layout = cute.make_layout(
-                (self.D, self.D, num_sab_heads, g_state.shape[0]),
-                stride=(
-                    g_state.stride[3],
-                    g_state.stride[2],
-                    g_state.stride[1],
-                    g_state.stride[0],
-                ),
-            )
+            state_layout = indexed_state_layout
         else:
             state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
         gStateKV = mState[None, None, o_head_idx, output_state_idx]
         if cutlass.const_expr(self.needs_initial_state):
+            initial_state_ref_layout = cute.make_layout(
+                state_ref_shape, stride=g_initial_state.stride
+            )
+            indexed_initial_state_layout = cute.select(
+                initial_state_ref_layout, mode=[3, 2, 1, 0]
+            )
             if cutlass.const_expr(self.use_state_indices):
-                initial_state_layout = cute.make_layout(
-                    (self.D, self.D, num_sab_heads, g_initial_state.shape[0]),
-                    stride=(
-                        g_initial_state.stride[3],
-                        g_initial_state.stride[2],
-                        g_initial_state.stride[1],
-                        g_initial_state.stride[0],
-                    ),
-                )
+                initial_state_layout = indexed_initial_state_layout
             else:
                 initial_state_layout = packed_state_layout
             mInitialState = cute.make_tensor(
@@ -5075,9 +5154,9 @@ def cp_delta_rule_prefill_dsl_sm120(
             raise RuntimeError(
                 "state_checkpoints and checkpoint_cu_starts are required when checkpointing is enabled"
             )
-        if cu_seqlens.dtype != torch.int64:
+        if not is_integer_dtype(cu_seqlens.dtype):
             raise RuntimeError(
-                f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+                f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
             )
         if not cu_seqlens.is_contiguous():
             raise RuntimeError("cu_seqlens must be contiguous")
@@ -5145,10 +5224,11 @@ def cp_delta_rule_prefill_dsl_sm120(
                 f"got {tuple(initial_state.shape)}"
             )
         if use_state_indices and (
-            state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+            not is_integer_dtype(state_indices.dtype)
+            or state_indices.shape != (num_seqs,)
         ):
             raise RuntimeError(
-                f"state_indices must have shape {(num_seqs,)} and dtype int32"
+                f"state_indices must have shape {(num_seqs,)} and an integer dtype"
             )
         if q.shape[-1] != 128:
             raise RuntimeError(
@@ -5184,12 +5264,11 @@ def cp_delta_rule_prefill_dsl_sm120(
                     "state_checkpoints must have shape "
                     f"[*, {num_sab_heads}, {d}, {d}] and dtype float32"
                 )
-            if (
-                checkpoint_cu_starts.dtype != torch.int64
-                or checkpoint_cu_starts.shape != (num_seqs + 1,)
-            ):
+            if not is_integer_dtype(
+                checkpoint_cu_starts.dtype
+            ) or checkpoint_cu_starts.shape != (num_seqs + 1,):
                 raise RuntimeError(
-                    f"checkpoint_cu_starts must have shape {(num_seqs + 1,)} and dtype int64"
+                    f"checkpoint_cu_starts must have shape {(num_seqs + 1,)} and an integer dtype"
                 )
         for name, tensor in (
             ("q", q),
@@ -5210,12 +5289,7 @@ def cp_delta_rule_prefill_dsl_sm120(
         for name, tensor in (("state", state), ("initial_state", initial_state)):
             if tensor is None:
                 continue
-            if use_state_indices:
-                if tensor.stride()[1:] != (d * d, d, 1):
-                    raise RuntimeError(
-                        f"{name} inner dimensions must be contiguous when state_indices is used"
-                    )
-            elif not tensor.is_contiguous():
+            if not use_state_indices and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
     max_cp_chunks_per_seq = max_num_chunks_host(max_seqlen, cp_chunk_len)
     if total_cp_chunks == 0:
@@ -5294,6 +5368,21 @@ def cp_delta_rule_prefill_dsl_sm120(
         store_final_state=store_final_state,
         use_state_indices=use_state_indices,
         needs_checkpointing=needs_checkpointing,
+        cu_seqlens_dtype=cu_seqlens.dtype,
+        state_indices_dtype=state_indices.dtype if use_state_indices else None,
+        checkpoint_cu_starts_dtype=(
+            checkpoint_cu_starts.dtype if needs_checkpointing else None
+        ),
+        state_inner_strides=(
+            tuple(state.stride()[1:])
+            if use_state_indices and store_final_state
+            else None
+        ),
+        initial_state_inner_strides=(
+            tuple(initial_state.stride()[1:])
+            if use_state_indices and needs_initial_state
+            else None
+        ),
     )
     state_arg = state if store_final_state else fixed_state
     kernel_args = (
@@ -5411,9 +5500,9 @@ def cp_delta_rule_dsl_sm120(
         raise RuntimeError(
             "state_checkpoints and checkpoint_cu_starts are required when checkpointing is enabled"
         )
-    if cu_seqlens.dtype != torch.int64:
+    if not is_integer_dtype(cu_seqlens.dtype):
         raise RuntimeError(
-            f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+            f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
         )
     if not cu_seqlens.is_contiguous():
         raise RuntimeError("cu_seqlens must be contiguous")
@@ -5464,10 +5553,10 @@ def cp_delta_rule_dsl_sm120(
             f"got {tuple(initial_state.shape)}"
         )
     if use_state_indices and (
-        state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+        not is_integer_dtype(state_indices.dtype) or state_indices.shape != (num_seqs,)
     ):
         raise RuntimeError(
-            f"state_indices must have shape {(num_seqs,)} and dtype int32"
+            f"state_indices must have shape {(num_seqs,)} and an integer dtype"
         )
     if q.shape[-1] != 128:
         raise RuntimeError(f"CPDeltaRuleSm120 only supports D=128, got {q.shape[-1]}")
@@ -5496,11 +5585,11 @@ def cp_delta_rule_dsl_sm120(
                 "state_checkpoints must have shape "
                 f"[*, {num_sab_heads}, {d}, {d}] and dtype float32"
             )
-        if checkpoint_cu_starts.dtype != torch.int64 or checkpoint_cu_starts.shape != (
-            num_seqs + 1,
-        ):
+        if not is_integer_dtype(
+            checkpoint_cu_starts.dtype
+        ) or checkpoint_cu_starts.shape != (num_seqs + 1,):
             raise RuntimeError(
-                f"checkpoint_cu_starts must have shape {(num_seqs + 1,)} and dtype int64"
+                f"checkpoint_cu_starts must have shape {(num_seqs + 1,)} and an integer dtype"
             )
     for name, tensor in (
         ("q", q),
@@ -5520,12 +5609,7 @@ def cp_delta_rule_dsl_sm120(
     for name, tensor in (("state", state), ("initial_state", initial_state)):
         if tensor is None:
             continue
-        if use_state_indices:
-            if tensor.stride()[1:] != (d * d, d, 1):
-                raise RuntimeError(
-                    f"{name} inner dimensions must be contiguous when state_indices is used"
-                )
-        elif not tensor.is_contiguous():
+        if not use_state_indices and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
 
     t = cp_delta_rule_t_precompute_dsl_sm120(
