@@ -55,11 +55,21 @@ adapter for the native D512 task graph. The default remains `"cute-dsl"` (Frost)
 selection is explicit, with no `"auto"` route or required opt-in environment
 variable. Plans belong to one backend and cannot cross backends.
 
-The adapter's scope is SM100 / H64 / Sq1 / D512. Prims-TS uses explicit
-`torch.float8_e4m3fn` Q `[B,1,64,512]` and the same dtype of contiguous,
+The adapter's scope is SM100 / H64 / Sq1 / D512. The primary Prims-TS mode uses
+explicit `torch.float8_e4m3fn` Q `[B,1,64,512]` and the same dtype of contiguous,
 unit-scale SWA `[pages,64,1,512]`. This is plain row-major E4M3 without a scale
 plane. `deepseek_v41_quantize_cache(..., format="swa_fp8")` is the optional
 writer. Decode does not silently quantize BF16 Q or accept cross-paired formats.
+
+The separate follow-up adds optional BF16-Q/uint8-MXFP8-SWA compatibility in
+`experimental/deepseek_v41/prims_ts_mxfp8.py`. That explicit input pairing is
+routed by a function-local import; native FP8 calls do not import or compile the
+extension. Its compiler, plan and `deepseek_v41_prims_ts_mxfp8` JIT namespace are
+separate from the primary native `deepseek_v41_prims_ts_fp8` path. Its BK64/BF16
+Keep-AB graph uses fused split-1 finalization. `prims_ts_mxfp8_resources.py` adds
+E8M0 SWA conversion and mixed-source routing, inheriting FP4 stores and all-writer
+publication from the primary FP4-only resource. Plans cannot cross modes, even
+with otherwise matching declarations.
 
 Frost retains BF16 Q and uint8 page64 MXFP8 SWA of width 528, with group32 E8M0
 scales. Both backends may use optional uint8 FP4 compressed caches of width 288.

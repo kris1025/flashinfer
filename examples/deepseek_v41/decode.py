@@ -4,8 +4,9 @@
 """Experimental DS4.1 mixed-cache and window-only decode on SM100.
 
 The existing cute-dsl backend remains the default. The prims-ts backend
-requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler and uses explicit
-E4M3 Q/ordinary FP8 SWA here. The source implementation historically passed the
+requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler and defaults to explicit
+E4M3 Q/ordinary FP8 SWA here. --prims-ts-mode mxfp8 explicitly selects BF16 Q and
+packed MXFP8 SWA instead. The source implementation historically passed the
 expanded 257-case B200 matrix and selected 57-case dense subset with DSL 4.8.0 /
 bundled CUDA 13.4. Those runs predate the native-only source split; they are not
 fresh qualification of this revision, other GPUs/toolchains or full models.
@@ -26,6 +27,12 @@ def build_parser():
         default="cute-dsl",
         help="explicit backend; prims-ts needs CuTe-DSL >= 4.8 with bundled CUDA 13",
     )
+    parser.add_argument(
+        "--prims-ts-mode",
+        choices=("fp8", "mxfp8"),
+        default="fp8",
+        help="prims-ts only: mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA",
+    )
     return parser
 
 
@@ -38,7 +45,7 @@ def main():
     x = torch.randn(128, 512, device="cuda", dtype=torch.bfloat16)
     # Explicit Q quantization belongs to the caller, not decode. Ordinary FP8
     # SWA has unit scale/no side plane; Frost keeps its legacy MXFP8 contract.
-    native_fp8 = opts.backend == "prims-ts"
+    native_fp8 = opts.backend == "prims-ts" and opts.prims_ts_mode == "fp8"
     q = q_source.to(torch.float8_e4m3fn) if native_fp8 else q_source
     swa = ds.deepseek_v41_quantize_cache(
         x, format="swa_fp8" if native_fp8 else "swa_mxfp8"

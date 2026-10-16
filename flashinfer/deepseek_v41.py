@@ -34,12 +34,18 @@ def deepseek_v41_decode(
     ``backend="cute-dsl"`` preserves the Frost implementation (default):
     contiguous BF16 Q[B,1,64,512], uint8 MXFP8 SWA[pages,64,1,528] and optional
     uint8 FP4 global[pages,64,1,288]. Both packed caches use page-plane storage:
-    all payload rows precede all scale rows.
+    all payload rows precede all scale rows. With ``backend="prims-ts"``,
+    explicit BF16 Q with this MXFP8 SWA selects a separate, lazily imported
+    compatibility adapter. E4M3 Q/SWA remains the primary Prims-TS
+    implementation; there is no implicit conversion or public decode-format
+    selector.
 
     Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler.
     Fixed Keep-AB/M64/retained-KV8/split-1/nonpersistent schedules use BK128
-    for native FP8 SWA and BK64 for the optional global FP4 pass. Live selections
-    and valid counts are refreshed on the GPU on every call/replay.
+    for native FP8 SWA and BK64 for the optional global FP4 pass. MXFP8
+    compatibility instead uses BK64 BF16 arithmetic and fused finalization.
+    Live selections are refreshed on the GPU on every call/replay; native
+    FP8 also refreshes true valid counts for its independent source passes.
     Plans cannot cross modes or backends. The native sparse wrapper's
     packed-input restriction is unchanged.
 
@@ -86,7 +92,8 @@ def deepseek_v41_window_decode(
 
     ``backend="prims-ts"`` uses explicit E4M3 Q with typed, unit-scale E4M3
     cache of width 512, without BF16 SWA dequantization or BF16 query scratch.
-    The Frost default retains BF16 Q with uint8 MXFP8 cache of width 528.
+    The Frost default retains BF16 Q with uint8 MXFP8 cache of width 528;
+    that explicit pairing also selects the optional Prims-TS MXFP8 adapter.
     Q is [B,1,64,512], cache is [pages,64,1,width] and
     physical slot IDs are int32[B,1,128]. See deepseek_v41_decode for the
     mode/backend-specific plan, arithmetic, output and sink-exclusive LSE

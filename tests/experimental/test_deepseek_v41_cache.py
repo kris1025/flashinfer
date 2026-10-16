@@ -225,7 +225,7 @@ def test_empty_and_rejected_declarations(fmt):
         torch.cuda.set_sync_debug_mode("default")
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize("compressed_k", [0, 128, 192, 512])
 def test_prepared_cache_feeds_decode(backend, compressed_k):
     from flashinfer.deepseek_v41 import (

@@ -5,10 +5,12 @@
 python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
     --backends cute-dsl prims-ts --context 32768 --output results.json
 
-The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts uses
-explicit E4M3 Q/ordinary FP8 SWA and its native componentwise P-rounding gate;
-these are different represented inputs and arithmetic, not identical-precision
-arms. Both derive from common seeded BF16 sources and share global FP4/indices.
+The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts defaults
+to explicit E4M3 Q/ordinary FP8 SWA and its native componentwise P-rounding gate;
+--prims-ts-mode mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA and legacy gates.
+Native and legacy arms have different represented inputs and arithmetic, not
+identical precision. All derive from common seeded BF16 sources and share the
+global FP4 pool/indices.
 FlashMLA is an optional external legacy BF16-Q/MXFP8 benchmark dependency,
 enabled only by --flashmla, not a shipped decode backend. Quantization,
 allocation, JIT and host overhead are excluded from GPU timing. Each timed
@@ -49,6 +51,16 @@ PRIMS_TS_SOURCES = (
     "attention/prims_ts/kernels/mla_decode/sparse_views.py",
     "attention/prims_ts/kernels/separate_reduction.py",
 )
+PRIMS_TS_MXFP8_SOURCES = (
+    "experimental/deepseek_v41/prims_ts_mxfp8.py",
+    "experimental/deepseek_v41/prims_ts_mxfp8_resources.py",
+)
+
+
+def prims_ts_sources(prims_ts_mode="fp8"):
+    return PRIMS_TS_SOURCES + (
+        PRIMS_TS_MXFP8_SOURCES if prims_ts_mode == "mxfp8" else ()
+    )
 
 
 def selected(pool, indices, fp4, *, round_bf16=True):
@@ -76,7 +88,7 @@ def selected(pool, indices, fp4, *, round_bf16=True):
     return represented.bfloat16().double() if round_bf16 else represented
 
 
-def fixture(batch, context, seed, backends, flashmla=False):
+def fixture(batch, context, seed, backends, flashmla=False, *, prims_ts_mode="fp8"):
     torch.manual_seed(seed + batch)
     q_source = torch.randn(batch, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
     w_source = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16)
@@ -104,7 +116,8 @@ def fixture(batch, context, seed, backends, flashmla=False):
     # second production-sized global pool for the native-FP8 comparison arm.
     shared = main, wi, ci, sink
     arms = {}
-    if "cute-dsl" in backends or flashmla:
+    prims_ts_mxfp8 = "prims-ts" in backends and prims_ts_mode == "mxfp8"
+    if "cute-dsl" in backends or flashmla or prims_ts_mxfp8:
         legacy = (
             q_source,
             deepseek_v41_quantize_cache(w_source, format="swa_mxfp8"),
@@ -114,7 +127,9 @@ def fixture(batch, context, seed, backends, flashmla=False):
             arms["cute-dsl"] = legacy
         if flashmla:
             arms["flashmla"] = legacy
-    if "prims-ts" in backends:
+        if prims_ts_mxfp8:
+            arms["prims-ts"] = legacy
+    if "prims-ts" in backends and not prims_ts_mxfp8:
         arms["prims-ts"] = (
             q_source.to(torch.float8_e4m3fn),
             deepseek_v41_quantize_cache(w_source, format="swa_fp8"),
@@ -194,8 +209,8 @@ def check_legacy(out, stats):
     )
 
 
-def check_arm(name, args, fn, batch, output):
-    native_fp8 = name == "prims-ts"
+def check_arm(name, args, fn, batch, output, *, prims_ts_mode="fp8"):
+    native_fp8 = name == "prims-ts" and prims_ts_mode == "fp8"
     reference = fp8_oracle(*args) if native_fp8 else legacy_reference(*args)
     expected, expected_lse = reference[:2]
     out, lse = fn()
@@ -248,9 +263,9 @@ def check_arm(name, args, fn, batch, output):
     return stats
 
 
-def arm_metadata(name, args):
+def arm_metadata(name, args, *, prims_ts_mode="fp8"):
     q, swa, main, _, _, _ = args
-    native_fp8 = name == "prims-ts"
+    native_fp8 = name == "prims-ts" and prims_ts_mode == "fp8"
     contract = {"reference": "independent FP64 over this arm's represented Q/KV"}
     if native_fp8:
         arithmetic = (
@@ -266,15 +281,22 @@ def arm_metadata(name, args):
             empty="exact zero output, negative-infinity LSE and zero bound",
         )
     else:
-        arithmetic = (
-            "Frost BF16 Q/dequantized MXFP8 SWA and FP4 global"
-            if name == "cute-dsl"
-            else "external FlashMLA legacy BF16-Q/MXFP8-SWA arm, not Prims-TS native FP8"
-        )
+        if name == "prims-ts":
+            arithmetic = (
+                "Prims-TS BF16 Q/dequantized MXFP8 SWA and FP4 global "
+                "(explicit mxfp8 override)"
+            )
+        elif name == "cute-dsl":
+            arithmetic = "Frost BF16 Q/dequantized MXFP8 SWA and FP4 global"
+        else:
+            arithmetic = (
+                "external FlashMLA legacy BF16-Q/MXFP8-SWA arm, not Prims-TS native FP8"
+            )
         contract.update(
             rel_l2_lt=0.005, max_scaled_lt=0.01, sink_exclusive_lse_abs_lt=1e-5
         )
     return {
+        "prims_ts_mode": prims_ts_mode if name == "prims-ts" else None,
         "q_dtype": str(q.dtype),
         "swa_encoding": "swa_fp8" if native_fp8 else "swa_mxfp8",
         "cache_shape": {"swa": list(swa.shape), "global_fp4": list(main.shape)},
@@ -306,7 +328,13 @@ def build_parser():
         nargs="+",
         choices=("cute-dsl", "prims-ts"),
         default=["cute-dsl"],
-        help="prims-ts uses E4M3 Q/ordinary FP8 SWA; cute-dsl retains BF16 Q/MXFP8 SWA",
+        help="prims-ts defaults to E4M3 Q/ordinary FP8 SWA; cute-dsl retains BF16 Q/MXFP8 SWA",
+    )
+    parser.add_argument(
+        "--prims-ts-mode",
+        choices=("fp8", "mxfp8"),
+        default="fp8",
+        help="prims-ts only: mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA",
     )
     parser.add_argument("--flashmla", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -330,9 +358,9 @@ def main():
 
         source_paths[hca_v41.__name__] = Path(hca_v41.__file__)
     if "prims-ts" in opts.backends:
-        # Hash native sources without importing them just for provenance.
+        # Hash sources without importing either mode just for provenance.
         package_root = Path(decode.__file__).resolve().parents[2]
-        for relative in PRIMS_TS_SOURCES:
+        for relative in prims_ts_sources(opts.prims_ts_mode):
             source_paths[f"flashinfer.{relative[:-3].replace('/', '.')}"] = (
                 package_root / relative
             )
@@ -340,6 +368,7 @@ def main():
         "status": "running",
         "implementation": "deepseek_v41",
         "backends": opts.backends,
+        "prims_ts_mode": opts.prims_ts_mode,
         "device": str(torch.cuda.get_device_properties(0)),
         "torch": torch.__version__,
         "toolchain": {
@@ -374,7 +403,12 @@ def main():
         with torch.no_grad():
             for batch in map(int, opts.batches.split(",")):
                 arm_args = fixture(
-                    batch, opts.context, opts.seed, opts.backends, opts.flashmla
+                    batch,
+                    opts.context,
+                    opts.seed,
+                    opts.backends,
+                    opts.flashmla,
+                    prims_ts_mode=opts.prims_ts_mode,
                 )
                 plans, fns = {}, {}
                 for backend in opts.backends:
@@ -416,7 +450,14 @@ def main():
                     fns["flashmla"] = flashmla
                     del flashmla
                 stats = {
-                    name: check_arm(name, arm_args[name], fn, batch, opts.output)
+                    name: check_arm(
+                        name,
+                        arm_args[name],
+                        fn,
+                        batch,
+                        opts.output,
+                        prims_ts_mode=opts.prims_ts_mode,
+                    )
                     for name, fn in fns.items()
                 }
                 graphs = {name: graph(fn) for name, fn in fns.items()}
@@ -435,7 +476,12 @@ def main():
                 row = {
                     "batch": batch,
                     "split": {name: plan.split for name, plan in plans.items()},
-                    "arms": {name: arm_metadata(name, arm_args[name]) for name in fns},
+                    "arms": {
+                        name: arm_metadata(
+                            name, arm_args[name], prims_ts_mode=opts.prims_ts_mode
+                        )
+                        for name in fns
+                    },
                     "correctness": stats,
                     "median_us": {k: statistics.median(v) for k, v in samples.items()},
                     "samples_us": samples,

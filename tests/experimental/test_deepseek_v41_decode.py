@@ -157,7 +157,103 @@ def test_unknown_backend(backend, window_only):
             deepseek_v41_decode(None, None, None, None, None, None, backend=backend)
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("compressed_k", [0, 64])
+def test_prims_ts_does_not_compile_cute_dsl(compressed_k, monkeypatch):
+    gate("prims-ts")
+    from flashinfer.experimental.deepseek_v41 import decode as cute_decode
+
+    def forbidden_compile(*args, **kwargs):
+        raise AssertionError("prims-ts must not invoke the Frost compiler")
+
+    monkeypatch.setattr(cute_decode, "_compile", forbidden_compile)
+    args = make_case(2, compressed_k)
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    assert dataclasses.is_dataclass(plan)
+    assert out is plan.out and lse is plan.lse
+    assert isinstance(plan.signature, tuple)
+    assert plan.split == 1  # Fixed Prims-TS bring-up split.
+    check(args, out, lse)
+    if compressed_k:
+        replay = deepseek_v41_decode(*args, backend="prims-ts", plan=plan)
+    else:
+        replay = deepseek_v41_window_decode(
+            args[0], args[1], args[3], args[5], backend="prims-ts", plan=plan
+        )
+    assert replay[0] is out and replay[1] is lse and replay[2] is plan
+
+
+@pytest.mark.parametrize("compressed_k", [0, 64, 192, 512])
+def test_prims_ts_selection_refresh(compressed_k):
+    gate("prims-ts")
+    args = make_case(2, compressed_k)
+    for pool, indices in ((args[1], args[3]), (args[2], args[4])):
+        if indices is None:
+            continue
+        capacity = pool.shape[0] * 64
+        indices[:, 0, :8] = torch.tensor(
+            [0, 0, capacity - 1, capacity, -1, -(2**31), 2**31 - 1, capacity + 1],
+            device="cuda",
+            dtype=torch.int32,
+        )
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+
+    def check_metadata():
+        for pool, indices, selected in (
+            (args[1], args[3], plan.selected_swa),
+            (args[2], args[4], plan.selected_global),
+        ):
+            if indices is None:
+                assert torch.equal(selected, torch.full_like(selected, -1))
+            else:
+                indices = indices[:, 0]
+                valid = (indices >= 0) & (indices < pool.shape[0] * 64)
+                assert torch.equal(selected, torch.where(valid, indices, -1))
+
+    check_metadata()
+    check(args, out, lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        deepseek_v41_decode(*args, backend="prims-ts", plan=plan)
+    # Poison prior metadata and change which positions are holes, without
+    # changing graph-bound addresses. The global tile can start with a hole.
+    plan.selected_swa.fill_(2**31 - 1)
+    plan.selected_global.fill_(2**31 - 1)
+    for indices in (args[3], args[4]):
+        if indices is not None:
+            indices[:, 0, :8].copy_(indices[:, 0, :8].flip(-1))
+    graph.replay()
+    check_metadata()
+    check(args, out, lse)
+
+
+@pytest.mark.parametrize("compressed_k", [0, 64, 192, 512])
+def test_prims_ts_zero_query_tile_counts(compressed_k):
+    gate("prims-ts")
+    args = make_case(4, compressed_k)
+    args[0].zero_()
+    for indices in (args[3], args[4]):
+        if indices is not None:
+            indices[:, 0, ::64].fill_(-1)
+            indices[3].fill_(-1)
+    args[3][1].fill_(-1)
+    if args[4] is not None:
+        args[4][2].fill_(-1)
+    # With Q=0 every valid selection contributes one to the sink-exclusive
+    # denominator. Cover mixed, global-only, window-only and empty requests;
+    # holes at BK64 boundaries must not truncate the remaining tiles.
+    counts = torch.zeros(4, device="cuda", dtype=torch.float64)
+    for pool, indices in ((args[1], args[3]), (args[2], args[4])):
+        if indices is not None:
+            valid = (indices[:, 0] >= 0) & (indices[:, 0] < pool.shape[0] * 64)
+            counts += valid.sum(-1)
+    out, lse, _ = deepseek_v41_decode(*args, backend="prims-ts")
+    torch.testing.assert_close(
+        lse[..., 0].double(), counts.log()[:, None].expand(-1, 64), rtol=0, atol=1e-5
+    )
+    check(args, out, lse)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 def test_prepare_plan_before_capture(backend, monkeypatch):
     gate(backend)
     args = make_case(1, 64)
@@ -168,12 +264,14 @@ def test_prepare_plan_before_capture(backend, monkeypatch):
 
 @pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize("window_only", [False, True])
-def test_cross_backend_plan_rejected(backend, window_only):
+@pytest.mark.parametrize("prims_ts_mode", ["fp8", "mxfp8"])
+def test_cross_backend_plan_rejected(backend, window_only, prims_ts_mode):
     gate("prims-ts")
     compressed = 0 if window_only else 64
+    prims_case = make_fp8_case if prims_ts_mode == "fp8" else make_case
     cases = {
         "cute-dsl": make_case(1, compressed),
-        "prims-ts": make_fp8_case(1, compressed),
+        "prims-ts": prims_case(1, compressed),
     }
 
     def run(selected_backend, plan=None):
@@ -190,7 +288,7 @@ def test_cross_backend_plan_rejected(backend, window_only):
         run(backend, plan=plan)
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize(
     "batch,compressed_k",
     [
@@ -280,7 +378,7 @@ def test_decode_changed_graph_and_fp64(batch, compressed_k, backend, monkeypatch
         )
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 def test_empty_uninitialized_cache_and_declaration_guards(backend):
     gate(backend)
     args = make_case(2, 512)
@@ -321,7 +419,7 @@ def test_empty_uninitialized_cache_and_declaration_guards(backend):
         deepseek_v41_decode(*args, arithmetic="bf16x3", backend=backend)
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize("batch", [128, 256])
 @pytest.mark.parametrize("pool_index,width,ids_index", [(1, 528, 3), (2, 288, 4)])
 def test_cache_offsets_above_two_gib(batch, backend, pool_index, width, ids_index):
@@ -386,7 +484,7 @@ def test_persistent_metadata_capacity_boundary(
     check(args, out, lse)
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize(
     "levels",
     [
@@ -440,14 +538,19 @@ def test_normalization_anchor_crossings(levels, batch, backend):
     check(args, out, lse)
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 def test_fp4_conversion_fallback(backend):
     gate(backend)
     args = make_case(128, 512)
     _, _, plan = deepseek_v41_decode(*args, backend=backend)
-    from flashinfer.experimental.deepseek_v41.decode import _compile
+    if backend == "cute-dsl":
+        from flashinfer.experimental.deepseek_v41.decode import _compile
 
-    compiled = _compile(args[0].device.index, 512, False, 16, 2, False, False)
+        compiled = _compile(args[0].device.index, 512, False, 16, 2, False, False)
+    else:
+        from flashinfer.experimental.deepseek_v41.prims_ts_mxfp8 import _compile
+
+        compiled = _compile(args[0].device.index, 512, native_fp4=False)
     fallback = dataclasses.replace(plan, kernel=compiled)
     out, lse, _ = deepseek_v41_decode(*args, plan=fallback, backend=backend)
     check(args, out, lse)
@@ -508,7 +611,7 @@ def test_native_fp4_all_finite_codes(conversion_kernels):
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize("scale_code", [0, 1, 127])
 @pytest.mark.parametrize("batch,compressed_k", [(1, 0), (128, 512), (None, 512)])
 def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code, backend):
@@ -643,7 +746,7 @@ def test_mxfp8_all_finite_codes(conversion_kernels):
     )
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl"])
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize(
     "batch,compressed_k",
     [(1, 0), (1, 512), (16, 512), (128, 0), (128, 512), (None, 512)],
@@ -1111,8 +1214,11 @@ def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
         deepseek_v41_decode(*args, plan=frost_plan, backend="prims-ts")
     with pytest.raises(ValueError, match="mismatch"):
         deepseek_v41_decode(*legacy, plan=plan)
-    with pytest.raises(ValueError, match="requires explicit E4M3 Q"):
-        deepseek_v41_decode(*legacy, backend="prims-ts")
+    _, _, packed_plan = deepseek_v41_decode(*legacy, backend="prims-ts")
+    with pytest.raises(ValueError, match="mismatch"):
+        deepseek_v41_decode(*args, plan=packed_plan, backend="prims-ts")
+    with pytest.raises(ValueError, match="mismatch"):
+        deepseek_v41_decode(*legacy, plan=plan, backend="prims-ts")
     with pytest.raises(ValueError, match="mismatch"):
         deepseek_v41_decode(*args, plan=object(), backend="prims-ts")
 

@@ -76,7 +76,7 @@ def test_benchmark_parser_defaults_and_explicit_backend(backend):
     assert opts.output == Path("results.json")
     assert opts.context == 32768 and opts.seed == 7003
     assert opts.batches == "1,4,16,32,64,128,256" and not opts.flashmla
-    assert not hasattr(opts, "prims_ts_mode")
+    assert opts.prims_ts_mode == "fp8"
 
 
 def test_benchmark_parser_multiple_arms_and_required_output():
@@ -91,11 +91,27 @@ def test_benchmark_parser_multiple_arms_and_required_output():
 
 
 @pytest.mark.parametrize("path", [_BENCHMARK, _EXAMPLE])
-def test_native_first_parser_has_no_mxfp8_override(path):
+@pytest.mark.parametrize("mode", [None, "fp8", "mxfp8"])
+@pytest.mark.parametrize("select_prims_ts", [False, True])
+def test_prims_ts_mode_parser_defaults_and_override(path, mode, select_prims_ts):
+    parser = extract(path, "build_parser", argparse=argparse, Path=Path)()
+    argv = ["--output", "results.json"] if path == _BENCHMARK else []
+    if mode:
+        argv += ["--prims-ts-mode", mode]
+    if select_prims_ts:
+        argv += ["--backends" if path == _BENCHMARK else "--backend", "prims-ts"]
+    opts = parser.parse_args(argv)
+    assert opts.prims_ts_mode == (mode or "fp8")
+    backend = "prims-ts" if select_prims_ts else "cute-dsl"
+    assert (opts.backends if path == _BENCHMARK else [opts.backend]) == [backend]
+
+
+@pytest.mark.parametrize("path", [_BENCHMARK, _EXAMPLE])
+def test_prims_ts_mode_parser_rejects_unknown_mode(path):
     parser = extract(path, "build_parser", argparse=argparse, Path=Path)()
     argv = ["--output", "results.json"] if path == _BENCHMARK else []
     with pytest.raises(SystemExit) as error:
-        parser.parse_args(argv + ["--prims-ts-mode", "mxfp8"])
+        parser.parse_args(argv + ["--prims-ts-mode", "bf16"])
     assert error.value.code == 2
 
 
@@ -104,9 +120,10 @@ def test_example_parser_defaults_and_explicit_backend(backend):
     parser = extract(_EXAMPLE, "build_parser", argparse=argparse)()
     opts = parser.parse_args(["--backend", backend] if backend else [])
     assert opts.backend == (backend or "cute-dsl")
-    assert not hasattr(opts, "prims_ts_mode")
+    assert opts.prims_ts_mode == "fp8"
 
 
+@pytest.mark.parametrize("mode", [None, "fp8", "mxfp8"])
 @pytest.mark.parametrize(
     "backends,flashmla",
     [
@@ -117,7 +134,9 @@ def test_example_parser_defaults_and_explicit_backend(backend):
         (["cute-dsl", "prims-ts"], True),
     ],
 )
-def test_benchmark_fixture_common_source_and_shared_global_pool(backends, flashmla):
+def test_benchmark_fixture_common_source_and_shared_global_pool(
+    backends, flashmla, mode
+):
     torch = MagicMock(name="torch_stub")
     q_source, w_source, values, sink = (
         MagicMock(name=name) for name in ("q_source", "w_source", "values", "sink")
@@ -133,7 +152,9 @@ def test_benchmark_fixture_common_source_and_shared_global_pool(backends, flashm
         torch=torch,
         deepseek_v41_quantize_cache=quantize,
     )
-    arms = fixture(1, 512, 7003, backends, flashmla)
+    mode_args = {"prims_ts_mode": mode} if mode else {}
+    native = "prims-ts" in backends and mode != "mxfp8"
+    arms = fixture(1, 512, 7003, backends, flashmla, **mode_args)
     assert set(arms) == set(backends) | ({"flashmla"} if flashmla else set())
     torch.manual_seed.assert_called_once_with(7004)
     assert torch.randn.call_args_list == [
@@ -156,35 +177,42 @@ def test_benchmark_fixture_common_source_and_shared_global_pool(backends, flashm
             actual is expected
             for actual, expected in zip(args[2:], shared, strict=True)
         )
-    if "prims-ts" in backends:
+    if native:
         q_source.to.assert_called_once_with(torch.float8_e4m3fn)
         assert arms["prims-ts"][0] is q_source.to.return_value
         assert arms["prims-ts"][1] is caches["swa_fp8"]
         quantize.assert_any_call(w_source, format="swa_fp8")
     else:
         q_source.to.assert_not_called()
-    for name in ("cute-dsl", "flashmla"):
-        if name in arms:
-            assert arms[name][0] is q_source
-            assert arms[name][1] is caches["swa_mxfp8"]
-            quantize.assert_any_call(w_source, format="swa_mxfp8")
-    if "cute-dsl" in arms and "flashmla" in arms:
-        assert arms["cute-dsl"] is arms["flashmla"]
-    assert {c.kwargs["format"] for c in quantize.call_args_list} == (
+    legacy_names = [name for name in arms if name != "prims-ts" or not native]
+    for name in legacy_names:
+        assert arms[name][0] is q_source
+        assert arms[name][1] is caches["swa_mxfp8"]
+        assert arms[name] is arms[legacy_names[0]]
+        quantize.assert_any_call(w_source, format="swa_mxfp8")
+    formats = [c.kwargs["format"] for c in quantize.call_args_list]
+    assert set(formats) == (
         {"main_kv_fp4"}
-        | ({"swa_fp8"} if "prims-ts" in backends else set())
-        | ({"swa_mxfp8"} if "cute-dsl" in backends or flashmla else set())
+        | ({"swa_fp8"} if native else set())
+        | ({"swa_mxfp8"} if legacy_names else set())
     )
+    assert len(formats) == len(set(formats))
 
 
-def test_example_native_representation_is_explicit():
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
+@pytest.mark.parametrize("mode", ["fp8", "mxfp8"])
+def test_example_representation_is_explicit_and_mode_scoped(backend, mode):
     main = definition(_EXAMPLE, "main")
     assignments = {
         node.targets[0].id: node.value
         for node in main.body
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
     }
-    assert ast.unparse(assignments["native_fp8"]) == "opts.backend == 'prims-ts'"
+    native = eval(
+        compile(ast.Expression(assignments["native_fp8"]), str(_EXAMPLE), "eval"),
+        {"opts": SimpleNamespace(backend=backend, prims_ts_mode=mode)},
+    )
+    assert native == (backend == "prims-ts" and mode == "fp8")
     assert ast.unparse(assignments["q"]) == (
         "q_source.to(torch.float8_e4m3fn) if native_fp8 else q_source"
     )
@@ -292,6 +320,75 @@ def test_native_gate_rejects_each_contract_violation(failure):
         assert torch.equal.call_count == 3
 
 
+@pytest.mark.parametrize("name", ["cute-dsl", "prims-ts", "flashmla"])
+@pytest.mark.parametrize("mode", [None, "fp8", "mxfp8"])
+def test_arm_selects_mode_specific_oracle_and_gate(name, mode):
+    args = tuple(object() for _ in range(6))
+    out, lse, expected, expected_lse, bound = (
+        MagicMock(name=value)
+        for value in ("out", "lse", "expected", "expected_lse", "bound")
+    )
+    native_reference = (expected, expected_lse, bound)
+    legacy_reference = (expected, expected_lse)
+    native_oracle = Mock(return_value=native_reference)
+    legacy_oracle = Mock(return_value=legacy_reference)
+    native_gate, legacy_gate = Mock(), Mock()
+    check = extract(
+        _BENCHMARK,
+        "check_arm",
+        torch=MagicMock(name="torch_stub"),
+        fp8_oracle=native_oracle,
+        legacy_reference=legacy_oracle,
+        check_fp8=native_gate,
+        check_legacy=legacy_gate,
+    )
+    mode_args = {"prims_ts_mode": mode} if mode else {}
+    stats = check(
+        name, args, Mock(return_value=(out, lse)), 1, Path("unused.json"), **mode_args
+    )
+    if name == "prims-ts" and mode != "mxfp8":
+        native_oracle.assert_called_once_with(*args)
+        native_gate.assert_called_once_with(out, lse, native_reference)
+        legacy_oracle.assert_not_called()
+        legacy_gate.assert_not_called()
+        assert "max_bound_fraction" in stats
+    else:
+        legacy_oracle.assert_called_once_with(*args)
+        legacy_gate.assert_called_once_with(out, stats)
+        native_oracle.assert_not_called()
+        native_gate.assert_not_called()
+        assert set(stats) == {"rel_l2", "max_scaled", "lse_abs"}
+
+
+def test_benchmark_threads_mode_to_fixture_gate_and_json():
+    main = definition(_BENCHMARK, "main")
+    for helper in ("fixture", "check_arm", "arm_metadata"):
+        calls = [
+            node
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == helper
+        ]
+        assert calls
+        assert all(
+            any(
+                keyword.arg == "prims_ts_mode"
+                and ast.unparse(keyword.value) == "opts.prims_ts_mode"
+                for keyword in node.keywords
+            )
+            for node in calls
+        )
+    assert any(
+        isinstance(node, ast.Dict)
+        and any(
+            isinstance(key, ast.Constant)
+            and key.value == "prims_ts_mode"
+            and ast.unparse(value) == "opts.prims_ts_mode"
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
+        for node in ast.walk(main)
+    )
+
+
 def test_legacy_metric_formulas_are_unchanged():
     branch = next(
         node
@@ -332,13 +429,18 @@ def test_legacy_gates_keep_strict_original_limits(field, limit):
 
 
 @pytest.mark.parametrize("name", ["cute-dsl", "prims-ts", "flashmla"])
-def test_arm_json_labels_representation_shape_and_accuracy(name):
-    native = name == "prims-ts"
+@pytest.mark.parametrize("mode", [None, "fp8", "mxfp8"])
+def test_arm_json_labels_representation_shape_and_accuracy(name, mode):
+    native = name == "prims-ts" and mode != "mxfp8"
     q = SimpleNamespace(dtype="torch.float8_e4m3fn" if native else "torch.bfloat16")
     swa = SimpleNamespace(shape=(2, 64, 1, 512 if native else 528))
     main = SimpleNamespace(shape=(8, 64, 1, 288))
+    mode_args = {"prims_ts_mode": mode} if mode else {}
     metadata = extract(_BENCHMARK, "arm_metadata")(
-        name, (q, swa, main, None, None, None)
+        name, (q, swa, main, None, None, None), **mode_args
+    )
+    assert metadata["prims_ts_mode"] == (
+        (mode or "fp8") if name == "prims-ts" else None
     )
     assert metadata["q_dtype"] == q.dtype
     assert metadata["swa_encoding"] == ("swa_fp8" if native else "swa_mxfp8")
@@ -357,22 +459,81 @@ def test_arm_json_labels_representation_shape_and_accuracy(name):
         assert contract["rel_l2_lt"] == 0.005
         assert contract["max_scaled_lt"] == 0.01
         assert contract["sink_exclusive_lse_abs_lt"] == 1e-5
-        assert ("Frost" if name == "cute-dsl" else "FlashMLA") in metadata["arithmetic"]
+        label = {
+            "cute-dsl": "Frost",
+            "prims-ts": "Prims-TS BF16",
+            "flashmla": "FlashMLA",
+        }
+        assert label[name] in metadata["arithmetic"]
+        assert "componentwise_bound" not in contract
 
 
-def test_native_source_hash_list_has_fp8_and_shared_resources_only():
-    sources = next(
-        ast.literal_eval(node.value)
+def source_bindings():
+    return {
+        node.targets[0].id: ast.literal_eval(node.value)
         for node in ast.parse(_BENCHMARK.read_text()).body
         if isinstance(node, ast.Assign)
-        and ast.unparse(node.targets[0]) == "PRIMS_TS_SOURCES"
-    )
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"PRIMS_TS_SOURCES", "PRIMS_TS_MXFP8_SOURCES"}
+    }
+
+
+def test_native_source_hash_defaults_stay_native_only():
+    bindings = source_bindings()
+    sources = bindings["PRIMS_TS_SOURCES"]
+    extensions = bindings["PRIMS_TS_MXFP8_SOURCES"]
     assert "experimental/deepseek_v41/prims_ts.py" in sources
     assert "experimental/deepseek_v41/prims_ts_fp8.py" in sources
     assert "experimental/deepseek_v41/prims_ts_resources.py" in sources
     assert not any("mxfp8" in source for source in sources)
-    assert all((_ROOT / "flashinfer" / source).is_file() for source in sources)
-    assert any(
-        isinstance(node, ast.For) and ast.unparse(node.iter) == "PRIMS_TS_SOURCES"
-        for node in ast.walk(definition(_BENCHMARK, "main"))
+    assert extensions == (
+        "experimental/deepseek_v41/prims_ts_mxfp8.py",
+        "experimental/deepseek_v41/prims_ts_mxfp8_resources.py",
     )
+    select_sources = extract(_BENCHMARK, "prims_ts_sources", **bindings)
+    assert select_sources() == sources
+    assert select_sources("fp8") == sources
+    assert select_sources("mxfp8") == sources + extensions
+
+
+@pytest.mark.parametrize(
+    "backends", [["cute-dsl"], ["prims-ts"], ["cute-dsl", "prims-ts"]]
+)
+@pytest.mark.parametrize("mode", [None, "fp8", "mxfp8"])
+def test_mode_specific_source_hashes_without_importing_modules(backends, mode):
+    parser = extract(_BENCHMARK, "build_parser", argparse=argparse, Path=Path)()
+    argv = ["--output", "unused.json", "--backends", *backends]
+    if mode:
+        argv += ["--prims-ts-mode", mode]
+    opts = parser.parse_args(argv)
+    bindings = source_bindings()
+    block = next(
+        node
+        for node in definition(_BENCHMARK, "main").body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "'prims-ts' in opts.backends"
+    )
+    paths = {}
+    namespace = {
+        "opts": opts,
+        "Path": Path,
+        "decode": SimpleNamespace(
+            __file__=str(_ROOT / "flashinfer/experimental/deepseek_v41/decode.py")
+        ),
+        "source_paths": paths,
+        "prims_ts_sources": extract(_BENCHMARK, "prims_ts_sources", **bindings),
+    }
+    exec(
+        compile(ast.Module(body=[block], type_ignores=[]), str(_BENCHMARK), "exec"),
+        namespace,
+    )
+    sources = ()
+    if "prims-ts" in backends:
+        sources = bindings["PRIMS_TS_SOURCES"] + (
+            bindings["PRIMS_TS_MXFP8_SOURCES"] if mode == "mxfp8" else ()
+        )
+    assert paths == {
+        f"flashinfer.{relative[:-3].replace('/', '.')}": _ROOT / "flashinfer" / relative
+        for relative in sources
+    }
+    assert all(path.is_file() for path in paths.values())

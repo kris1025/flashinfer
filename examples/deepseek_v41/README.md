@@ -13,8 +13,11 @@ required. There is no `"auto"` selector. Both backends are JIT-only, and plans
 cannot be shared between backends. The existing `"cute-dsl"` default is unchanged.
 
 The native-FP8 implementation is the first commit in the source reorganization;
-Prims-TS MXFP8 compatibility belongs to a separate follow-up. Historical validation
-records below describe the original pre-reorganization snapshots, not the rebuilt
+optional Prims-TS MXFP8 compatibility is a separate follow-up. Native E4M3 Q/SWA
+remains the primary adapter and the Prims-TS example/benchmark default. Explicit
+BF16 Q with uint8 MXFP8 SWA selects the compatibility extension through a lazy
+import, without a public decode-format argument. Historical validation records
+below describe their original pre-reorganization snapshots, not the rebuilt
 commits. No new GPU or performance qualification is claimed by this split.
 
 ## Native FP8 SWA
@@ -22,9 +25,9 @@ commits. No new GPU or performance qualification is claimed by this split.
 | Mode | Q `[B,1,64,512]` | SWA `[pages,64,1,width]` | Arithmetic |
 |---|---|---|---|
 | Prims-TS | `torch.float8_e4m3fn` | Same typed E4M3, width 512, unit scale, no side plane | Native FP8 TMA/QK/P/PV |
-| Frost (public default) | BF16 | uint8 MXFP8, width 528, group32 E8M0 scale plane | Selected tiles staged as BF16 |
+| Frost (public default), or optional Prims-TS MXFP8 | BF16 | uint8 MXFP8, width 528, group32 E8M0 scale plane | Selected tiles staged as BF16 |
 
-Prims-TS requires **explicit FP8 Q from the caller**; decode does not
+Native FP8 mode requires **explicit FP8 Q from the caller**; decode does not
 implicitly quantize BF16 Q. MXFP8 cannot be reinterpreted by discarding its scales,
 and mixed BF16-Q/ordinary-FP8-SWA or FP8-Q/MXFP8-SWA declarations are rejected.
 The optional writer uses `format="swa_fp8"`: finite BF16/FP32 rows are clamped
@@ -41,6 +44,14 @@ only final O to BF16. Returned FP32 LSE remains natural-log and excludes sinks.
 Window-only omits global attention, global source states and BF16 query scratch.
 Each call/replay refreshes selections, fixed execution lengths and true valid
 counts. Plans cannot cross modes or backends.
+
+Optional BF16-Q/MXFP8-SWA compatibility lives in `prims_ts_mxfp8.py`, with its
+own compiler, plan class and `deepseek_v41_prims_ts_mxfp8` JIT namespace. Its
+BK64/BF16 Keep-AB graph uses fused split-1 finalization, not the native FP8
+source merge. `prims_ts_mxfp8_resources.py` adds E8M0-scaled SWA conversion,
+mixed-source tag routing and the packed launcher; its narrow subclass inherits
+FP4 conversion, retained BF16 stores and all-writer AsyncThread publication from
+the primary FP4-only resource. Native FP8 calls never import this extension.
 
 **Post-repair default full257 and independent dense57 passed on B200 / DSL
 4.8.0 / bundled CUDA 13.4** (job `5008381`). All 50 new ordinary-FP8 cases passed
@@ -106,6 +117,32 @@ MXFP8 adapter; the native global pass uses a concrete FP4-only producer.
 Records are in `/home/scratch.linquanh_gpu/tmp/dsv41-fp8-first.iU3DYW/native-checkpoint.{json,xml}`.
 No GPU, JIT compilation, example or benchmark execution was performed for this
 reorganization. The older records below do not qualify the rewritten sources.
+
+### Optional MXFP8 follow-up acceptance (2026-10-15)
+
+The combined follow-up passed **299 CPU cases**: 126 guarded native
+source-state/adapter/oracle contracts, 37 optional-MXFP8 routing/plan/resource
+contracts, 6 conversion-lifetime regressions, 84 stdlib-only benchmark/example
+contracts, 40 existing native host contracts and 6 unknown-backend rejections.
+The native-only checkpoint's BF16-rejection case is replaced by the optional
+mode's positive routing and both-direction incompatible-plan checks.
+
+The fresh run used the same Python/Torch/DSL 4.8 overlay and strict static-target
+settings above. It reported 376 warnings in 5.03 s, with pytest and strict
+aggregate exit 0, no failures/errors/skips, no intercepted CUDA/JIT calls,
+uninitialized Torch CUDA and unchanged CUDA visibility. All 119 frozen
+source/runner/manifest fingerprints matched through postflight, before these
+validation-note edits. Records are in
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp8-first.iU3DYW/mxfp8-checkpoint.{json,xml}`.
+
+Static comparisons also preserved the original shared kernels, writer/validator
+and conversion-lifetime tests byte-for-byte; native and legacy decode/cache test
+fixture, oracle and gate helpers are AST-identical. The native compiler/source/plan/launch
+bodies match after the explicit naming/FP4-only-class substitutions. The packed
+launcher, all-writer pipeline and conversion/store bodies retain their original
+ASTs. Ruff, formatting, in-memory Python parse/compile and whitespace checks
+passed. These are host/static checks only: no GPU accuracy/graph replay,
+CuTe compilation, example execution or benchmarking was performed.
 
 ### Historical CPU/static acceptance (2026-10-13)
 
@@ -579,6 +616,8 @@ Run the self-contained example with an explicit selector:
 ```bash
 python examples/deepseek_v41/decode.py --backend cute-dsl
 python examples/deepseek_v41/decode.py --backend prims-ts
+# Optional legacy BF16-Q/MXFP8-SWA compatibility mode:
+python examples/deepseek_v41/decode.py --backend prims-ts --prims-ts-mode mxfp8
 ```
 
 The Prims-TS adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13
@@ -611,7 +650,7 @@ in 16-byte units; larger pools retain 64-bit byte offsets. This preserves suppor
 for cache addresses above 2 GiB. This is internal scheduling within
 `backend="cute-dsl"`, unchanged by the new selector.
 
-Prims-TS uses fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
+Native Prims-TS uses fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
 execution: BK128 native FP8 SWA plus an optional BK64/BF16 global FP4 pass and
 FP32 source merge. It does not use Frost's heuristics or the native wrapper's
 automatic policy. There are no measured crossovers or tuned batch thresholds.
@@ -621,9 +660,10 @@ memory; `Fp4KvProducer` is a concrete FP4-only resource, not an MXFP8 SWA loader
 
 Both backends use queries `[B,1,64,512]`, 64-token pages, 128 window positions
 and up to 512 FP4 compressed positions, padded to multiples of 64. The Prims-TS
-example selects `swa_fp8` and caller-converted FP8 Q; the Frost example retains
-BF16 Q/`swa_mxfp8`. Window-only uses the same selector and input mode, with no
-compressed stream.
+example defaults to `swa_fp8` and caller-converted FP8 Q; explicit
+`--prims-ts-mode mxfp8` instead selects BF16 Q/`swa_mxfp8`, as used by Frost.
+The mode option does not affect the Frost backend. Window-only uses the same
+selector and input mode, with no compressed stream.
 
 This model-specific quantized-cache adapter is separate from
 `BatchSparseMLADecodePagedTSWrapper`: that native wrapper still accepts matching
@@ -632,7 +672,8 @@ The adapter does not broaden its input contract.
 Physical slot `-1` and out-of-capacity slots are masked without reading cache
 storage. Every valid cache slot must be initialized and causally visible.
 
-Frost uses BF16 Q/K/V/P and FP32 accumulation/softmax, with independent FP64
+Frost and the optional Prims-TS MXFP8 mode use BF16 Q/K/V/P and FP32
+accumulation/softmax, with independent FP64
 relative-L2 < 0.005, max-scaled error < 0.01 and absolute LSE error < 1e-5.
 Those legacy gates are unchanged. Native FP8 SWA uses the per-component
 rounding bound above, the same strict LSE/empty gates and additional strict BF16
@@ -644,9 +685,9 @@ sink logit or `-inf` is accepted. The sink contributes only to output's
 normalization; an empty row returns zero output and `-inf` LSE. Applying the
 sink at final normalization preserves LSE for very large sink logits.
 
-Prepare once eagerly and reuse the plan with the **same explicit backend** for
-allocation-free CUDA Graph replay. Passing a plan to the other backend is an
-error. Plan-owned output/LSE/workspace are overwritten on every call. Ordinary
+Prepare once eagerly and reuse the plan with the **same explicit backend and
+input mode** for allocation-free CUDA Graph replay. Passing a plan to the other
+backend or Prims-TS input mode is an error. Plan-owned output/LSE/workspace are overwritten on every call. Ordinary
 plan calls may use new input addresses if shape, strides, dtype and device match.
 A captured graph retains the pointers recorded during capture: keep input
 addresses stable and update values in place during replay. Changing addresses
@@ -681,9 +722,10 @@ The caller supplies physical slot IDs. For a logical token ID `t` in request
 entries mapped to `-1`. Slot mapping, RoPE, indexing and GEMM quantization remain
 outside this decode API.
 
-The reproducible GPU benchmark uses **explicit E4M3 Q / ordinary FP8 SWA** when
-Prims-TS is selected. Frost and optional FlashMLA retain **BF16 Q / MXFP8 SWA**
-and their unchanged strict FP64 gates. All arms derive from common seeded inputs
+The reproducible GPU benchmark defaults to **explicit E4M3 Q / ordinary FP8 SWA**
+when Prims-TS is selected. `--prims-ts-mode mxfp8` explicitly selects its optional
+**BF16 Q / MXFP8 SWA** extension and unchanged strict legacy FP64 gates. Frost
+and optional FlashMLA retain that legacy representation and their original gates. All arms derive from common seeded inputs
 and share the global FP4 pool, selections and sink, but each is checked against
 its own represented-value FP64 oracle. The native arm uses the componentwise
 rounding bound and exact empty/strict sink-exclusive LSE gates above. Only selected
@@ -700,6 +742,10 @@ python benchmarks/bench_deepseek_v41_decode.py \
 python benchmarks/bench_deepseek_v41_decode.py \
   --backends cute-dsl prims-ts --batches 1,4,16,32,64,128,256 \
   --context 32768 --output backends.json
+# Explicit packed-mode comparison shares the same BF16 Q/MXFP8 SWA tuple:
+python benchmarks/bench_deepseek_v41_decode.py \
+  --backends cute-dsl prims-ts --prims-ts-mode mxfp8 \
+  --batches 1,4,16,32,64,128,256 --context 32768 --output packed-backends.json
 # Optional comparison requires an externally built FlashMLA installation:
 python benchmarks/bench_deepseek_v41_decode.py \
   --backends cute-dsl prims-ts --batches 1,4,16,32,64,128,256 \
@@ -721,8 +767,9 @@ token latency or throughput.
 
 The prepared semantic and changed-input CUDA Graph tests require
 CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler on SM100 when including the
-Prims-TS adapter. Current cache-writer integration covers ordinary-FP8 Prims-TS
-and legacy Frost, including window-only decode and selected global widths. It
+Prims-TS adapter. Current cache-writer integration covers ordinary-FP8 Prims-TS,
+optional MXFP8 Prims-TS and legacy Frost, including window-only decode and selected
+global widths. It
 captures cache writing and decode together, changes values and selections at fixed
 addresses, and checks poisoned-buffer replay and the transition to empty
 selections. Exact encoded-byte references run before the independent FP64 decode

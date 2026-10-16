@@ -463,13 +463,18 @@ full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/REA
 explicit `backend="cute-dsl"` (existing Frost default) or `backend="prims-ts"`.
 There is no `"auto"` selector. Imports remain function-local; both backends share
 `experimental/deepseek_v41/decode.py::_validate_inputs` and require
-backend-specific plans. Scope is SM100 / H64 / Sq1 / D512. Prims-TS uses explicit
-`torch.float8_e4m3fn` Q `[B,1,64,512]` with typed, contiguous, unit-scale E4M3 SWA
+backend- and mode-specific plans. Scope is SM100 / H64 / Sq1 / D512. The primary
+Prims-TS mode uses explicit `torch.float8_e4m3fn` Q `[B,1,64,512]` with typed,
+contiguous, unit-scale E4M3 SWA
 `[pages,64,1,512]`, without a scale plane. The optional writer uses
 `format="swa_fp8"` (finite clamp to [-448,448], round-to-nearest-even). This is not
 MXFP8 with ignored E8M0 scales; decode never implicitly quantizes BF16 Q.
-Frost retains BF16 Q and uint8 MXFP8 SWA (width 528). Both backends accept optional
-uint8 FP4 global (width 288), using the existing page-plane ABI.
+Frost retains BF16 Q and uint8 MXFP8 SWA (width 528). That explicit pairing also
+selects the optional Prims-TS compatibility adapter in `prims_ts_mxfp8.py`, added
+in a separate follow-up commit and imported only for BF16 Q. Native E4M3 remains
+the primary implementation; no public decode-format argument is added. Both
+backends accept optional uint8 FP4 global (width 288), using the existing
+page-plane ABI.
 
 The separate Prims-TS adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13
 compiler**. Fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
@@ -486,6 +491,12 @@ add a public FP32 native output mode and cannot be combined with output quantiza
 The concrete `Fp4KvProducer` in `prims_ts_resources.py` publishes selected global
 FP4 tiles through retained BF16 stages, with all-writer AsyncThread-to-UMMA
 signaling and per-writer fences; it contains no MXFP8 SWA staging.
+`prims_ts_mxfp8_resources.py` adds only the E8M0 SWA conversion, tagged mixed-source
+routing and packed launcher, reusing the concrete FP4 resource's stores and
+pipeline through a narrow subclass. The compatibility mode uses BF16 Q/K/V/P,
+BK64 and fused split-1 finalization, with its own plan and JIT namespace. Neither
+example nor benchmark selects it unless `--prims-ts-mode mxfp8` is supplied
+alongside the explicit Prims-TS backend; the mode default is `fp8`.
 It does not broaden `BatchSparseMLADecodePagedTSWrapper`: that native wrapper
 still accepts matching native BF16 or E4M3 Q/KV, not packed quantized
 cache inputs. Its existing toolchain contract is unchanged. See
@@ -496,9 +507,14 @@ Native-first reorganization acceptance on 2026-10-15 passed **213 CPU cases**
 benchmark/example, 40 native host and 6 unknown-backend contracts) with the
 existing DSL 4.8 overlay and strict guards. No CUDA/JIT calls were intercepted;
 CUDA visibility and all 114 fingerprints stayed unchanged during the run, before
-these validation-note edits. No GPU execution or benchmark ran. The historical validation
-records below describe their original pre-reorganization snapshots; they do not
-qualify the rebuilt commits.
+these validation-note edits. The optional-MXFP8 follow-up passed **299 CPU cases**,
+including 37 new mode-isolation/resource contracts and 84 benchmark/example
+contracts, with strict aggregate exit 0, no intercepted calls, uninitialized
+Torch CUDA, unchanged visibility and all 119 fingerprints matching postflight.
+See the example README for the exact case breakdown and records. No GPU
+execution or benchmark ran for this split. The historical validation records
+below describe their original pre-reorganization snapshots; they do not qualify
+the rebuilt commits.
 
 Decode tests are in `tests/experimental/test_deepseek_v41_decode.py`; cache-writer
 integration tests are in `tests/experimental/test_deepseek_v41_cache.py`, with guarded

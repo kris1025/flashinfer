@@ -511,17 +511,6 @@ def test_fp8_entry_does_not_import_mxfp8(native, monkeypatch):
     assert not imports
 
 
-def test_prims_ts_requires_explicit_fp8_q(native, monkeypatch):
-    import torch
-    from flashinfer.experimental.deepseek_v41 import prims_ts
-
-    monkeypatch.setattr(prims_ts, "_validate_inputs", lambda *args, **kwargs: ())
-    with pytest.raises(ValueError, match="requires explicit E4M3 Q"):
-        prims_ts.decode(
-            SimpleNamespace(dtype=torch.bfloat16), None, None, None, None, None
-        )
-
-
 @pytest.mark.parametrize("compressed", list(range(0, 513, 64)))
 @pytest.mark.parametrize("native_fp4", (False, True))
 def test_fp8_adapter_builds_native_swa_and_fp4_only_global(

@@ -1,6 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""V4.1 native FP8 SWA adapter for D512 Prims-TS."""
+"""V4.1 native FP8 SWA adapter for D512 Prims-TS.
+
+BF16-Q/MXFP8 compatibility is isolated behind a function-local import.
+"""
 
 from dataclasses import dataclass
 import functools
@@ -225,8 +228,19 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
         sink,
         allow_fp8_swa=True,
     )
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError("prims-ts requires explicit E4M3 Q and unit-scale E4M3 SWA")
+    if q.dtype == torch.bfloat16:
+        from .prims_ts_mxfp8 import decode as decode_mxfp8
+
+        return decode_mxfp8(
+            q,
+            swa_cache,
+            global_cache,
+            swa_indices,
+            global_indices,
+            sink,
+            signature=signature,
+            plan=plan,
+        )
     return _decode_fp8(
         q,
         swa_cache,
