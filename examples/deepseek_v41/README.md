@@ -12,19 +12,23 @@ Calling these experimental APIs is the opt-in; no environment variable is
 required. There is no `"auto"` selector. Both backends are JIT-only, and plans
 cannot be shared between backends. The existing `"cute-dsl"` default is unchanged.
 
-The native-FP8 implementation is the first commit in the source reorganization;
-optional Prims-TS MXFP8 compatibility is a separate follow-up. Native E4M3 Q/SWA
+The native-FP8 implementation was the first commit in the source reorganization;
+optional Prims-TS MXFP8 compatibility was a separate follow-up. Native E4M3 Q/SWA
 remains the primary adapter and the Prims-TS example/benchmark default. Explicit
 BF16 Q with uint8 MXFP8 SWA selects the compatibility extension through a lazy
-import, without a public decode-format argument. Historical validation records
-below describe their original pre-reorganization snapshots, not the rebuilt
-commits. No new GPU or performance qualification is claimed by this split.
+import, without a public decode-format argument. The current native-only change
+also uses E4M3 for main-cache attention while retaining packed FP4 storage.
+The current FP8-main snapshot passed the full **271-case** GPU matrix and selected
+**57-case** dense subset on an allocated B200 / DSL 4.8.0 / bundled compiler 13.4
+(job `5049128`; see below). The historical 257-case GPU and 299-case CPU results
+predate this change and do not qualify it. Examples and benchmarks have not run;
+no performance or checkpoint/full-model qualification is claimed.
 
-## Native FP8 SWA
+## Native E4M3 attention
 
 | Mode | Q `[B,1,64,512]` | SWA `[pages,64,1,width]` | Arithmetic |
 |---|---|---|---|
-| Prims-TS | `torch.float8_e4m3fn` | Same typed E4M3, width 512, unit scale, no side plane | Native FP8 TMA/QK/P/PV |
+| Prims-TS | `torch.float8_e4m3fn` | Same typed E4M3, width 512, unit scale, no side plane | E4M3 Q/K/V/P for SWA and main; main FP4 tiles converted to E4M3 SMEM |
 | Frost (public default), or optional Prims-TS MXFP8 | BF16 | uint8 MXFP8, width 528, group32 E8M0 scale plane | Selected tiles staged as BF16 |
 
 Native FP8 mode requires **explicit FP8 Q from the caller**; decode does not
@@ -35,15 +39,25 @@ to `[-448,448]` then rounded to nearest-even E4M3 in plain row-major storage,
 retaining signed zero and subnormals. The existing `swa_mxfp8` and `main_kv_fp4`
 writers/encoding remain separate and unchanged.
 
-SWA uses fixed Keep-AB/M64/BK128/D128/retained8/V1/split1/nonpersistent execution,
-with no custom packed producer or BF16 SWA dequantization. Optional global FP4
-keeps the width-288 page-plane ABI and selected-tile BK64/BF16 arithmetic; only Q
-is exactly expanded to BF16 for that pass. Both passes export sink-free normalized
-FP32 source O and log2 LSE, then a joint merge applies the sink once and rounds
-only final O to BF16. Returned FP32 LSE remains natural-log and excludes sinks.
-Window-only omits global attention, global source states and BF16 query scratch.
-Each call/replay refreshes selections, fixed execution lengths and true valid
-counts. Plans cannot cross modes or backends.
+Both source passes use fixed
+Keep-AB/M64/BK128/D128/retained8/V1/split1/nonpersistent execution and E4M3
+Q/K/V/P. SWA uses native TMA, with no custom packed producer or BF16
+SWA dequantization. Optional main/global storage remains packed E2M1 plus group16
+E4M3 scales in the width-288 page-plane ABI. On selected main tiles only, the
+producer applies the scales, then converts to unit E4M3 using round-to-nearest-even
+and finite saturation to `[-448,448]`, preserving signed zero, subnormals and
+halfway-even behavior. The conversion is **lossy**: finite FP4-times-scale values
+can reach ±2688. The resulting FP8 shared-memory tiles feed both QK and PV with
+the original FP8 Q; there is no BF16 query expansion, BF16 query scratch or full
+converted cache in either mixed or window-only native mode. For example,
+`1.5 * 1.125 = 1.6875` rounds to `1.75`, `6 * 448 = 2688` saturates to `448`,
+and `±0.5 * 2^-9 = ±2^-10` rounds to signed zero.
+
+Both passes export sink-free normalized FP32 source O and log2 LSE, then a joint
+merge applies the sink once and rounds only final O to BF16. Returned FP32 LSE
+remains natural-log and excludes sinks. Window-only additionally omits global
+attention and global source states. Each call/replay refreshes selections, fixed
+execution lengths and true valid counts. Plans cannot cross modes or backends.
 
 Optional BF16-Q/MXFP8-SWA compatibility lives in `prims_ts_mxfp8.py`, with its
 own compiler, plan class and `deepseek_v41_prims_ts_mxfp8` JIT namespace. Its
@@ -51,20 +65,15 @@ BK64/BF16 Keep-AB graph uses fused split-1 finalization, not the native FP8
 source merge. `prims_ts_mxfp8_resources.py` adds E8M0-scaled SWA conversion,
 mixed-source tag routing and the packed launcher; its narrow subclass inherits
 FP4 conversion, retained BF16 stores and all-writer AsyncThread publication from
-the primary FP4-only resource. Native FP8 calls never import this extension.
+the unchanged BF16 `Fp4KvProducer` / `Fp4SmemKvResource` in
+`prims_ts_resources.py`. Native main attention instead selects
+`Fp4Fp8KvProducer` / `Fp4Fp8SmemKvResource` in that same file. Native FP8 calls
+never import the compatibility extension.
 
-**Post-repair default full257 and independent dense57 passed on B200 / DSL
-4.8.0 / bundled CUDA 13.4** (job `5008381`). All 50 new ordinary-FP8 cases passed
-within the full matrix, including writer/decode graph replay. The previously
-failing legacy Frost capture case also passed in full-suite order. This follows
-a test-local conversion-module lifetime repair, without changing numerical gates
-or default GC/capture settings; see the clean post-repair validation below.
-The added tests cover all
-global widths `0/64/.../512`, source-only/empty/poisoned selections, changed-data
-graph replay, exact query expansion, actual native FP8 configuration and FP32
-source precision (`19/65`, not BF16 partials cast back to FP32). Its independent
-FP64 oracle uses actual stored E4M3 Q/SWA and independently decoded FP4 global.
-Each output component must satisfy the native FP8 rounding bound:
+The independent native FP64 oracle uses actual stored E4M3 Q/SWA and selected
+main rows decoded with their E4M3 scales, then finite-clamped/RTNE to unit E4M3
+**before both logits and V**. Main-only, mixed and window-only native outputs all
+use the existing per-component FP8 probability-rounding bound:
 
 ```text
 (2**-4 + 3*2**-8 + 1e-5) * sensitivity
@@ -73,12 +82,25 @@ Each output component must satisfy the native FP8 rounding bound:
 
 Here `sensitivity = sum(weights * abs(V))` and
 `underflow = exp(max(logits) - normalizer) * sum(abs(V))`, with the sink included
-in `normalizer`. Empty bounds/output are exactly zero; KV LSE retains the strict
-`atol=1e-5, rtol=0` gate and exact `-inf` mask. Global-only still uses the strict
-BF16 relative-L2/max-scaled gates; legacy helpers/tolerances are not changed.
-The historical 207-case BF16-Q/MXFP8 matrix does **not** qualify this new path;
-the post-repair full257 result below does for its tested setup. No benchmark or
-performance claim is made for either mode.
+in `normalizer`. The joint maximum bounds each source's local maximum, so the
+same summed underflow term remains conservative with two FP8 source passes; the
+bound constants are unchanged. Empty bounds/output are exactly zero; KV LSE
+retains the strict `atol=1e-5, rtol=0` gate and exact `-inf` mask. Native main-only
+no longer assumes BF16 arithmetic or strict BF16 relative-error gates. Frost and
+the optional BF16-Q/MXFP8 mode retain their original decoded BF16 values,
+FP64 references and strict relative-L2/max-scaled gates.
+
+**Historical, pre-FP8-main:** post-repair default full257 and independent dense57
+passed on B200 / DSL 4.8.0 / bundled CUDA 13.4 (job `5008381`). All 50 then-new
+ordinary-FP8 cases passed within the full matrix, including writer/decode graph
+replay; the previously failing legacy Frost capture case passed in full-suite
+order after a test-local conversion-module lifetime repair, without numerical-gate
+or default GC/capture changes. That snapshot used FP8 SWA but BF16 main attention.
+Its tests covered all global widths `0/64/.../512`, source-only/empty/poisoned
+selections, changed-data graph replay, exact BF16 query expansion and FP32 source
+precision (`19/65`, not BF16 partials cast back to FP32). These historical results,
+and the later 299-case CPU acceptance, do **not** qualify FP8 main attention. No
+benchmark or performance claim is made for either mode.
 
 The guarded host-only source-store/adapter/oracle suite excludes the root CUDA
 collection probes. Use the thread caps before importing PyTorch:
@@ -101,7 +123,133 @@ target; those calls are blocked, not allowed through. Use DSL 4.8 for clean stri
 host acceptance. An uninitialized Torch flag alone does not prove raw-driver
 isolation.
 
-### Native-first split acceptance (2026-10-15)
+### FP8-main CPU/static acceptance (2026-10-16)
+
+The current native FP8-main change passed **321 CPU cases**: 146 guarded
+source-state/resource/adapter/oracle contracts, 37 optional-MXFP8 contracts,
+7 conversion-lifetime checks, 85 benchmark/example-default contracts, 40 existing
+native host contracts and 6 unknown-backend rejections. This includes independent
+analytic main conversion before both logits and values, FP8 SW128/vector-store
+and real-stage probe-view contracts, the reduced original-Q ABI, and independent
+BF16 compatibility resource configurations.
+
+The fresh process used Python 3.12.3 / Torch 2.11.0+cu128 with the existing DSL
+4.8.0 overlay and bundled compiler metadata 13.4, `-I -B -S` with explicit package
+paths, thread caps of one, static `sm_100`, and disabled plugin autoload/JIT.
+Pytest and strict aggregate exited 0, with no failures/errors/skips or intercepted
+CUDA/JIT calls. Torch CUDA remained uninitialized and visibility unchanged.
+Exact ordered JUnit identities matched the frozen 321-case manifest, and all
+154 source/runner/manifest fingerprints and Git state matched through independent
+postflight, before these validation-note edits. The combined matrix imports
+Torch/CuTe under guards; it is not an accelerator-import-free run.
+The latest rerun includes the probe's flat rank-one tuple-layout regression after
+the GPU failure below. Records are in
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-tuple-cpu.zg51v9kk/`:
+`tuple-acceptance.{json,xml}`, `manifest.json` and `independent-postflight.json`.
+The earlier 321-case records, including failed v1/v2 fixture-setup attempts, remain
+preserved in `/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8.MtsdGo/`.
+
+Focused Ruff formatting/lint (retaining the existing MXFP8 fixture-import `F811`
+exception), in-memory Python syntax compilation and whitespace checks passed.
+These qualify host configuration/plumbing/reference and static contracts only,
+not CuTe lowering, GPU numerical accuracy/graph replay, examples or performance.
+
+### FP8-main GPU validation (2026-10-16)
+
+The corrected FP8-main snapshot passed on one allocated **NVIDIA B200 / 148 SMs**
+in `umb-b200-263` (job `5049128`), using Python 3.12.3 / Torch 2.11.0+cu128 /
+CuTe-DSL 4.8.0 / bundled compiler 13.4:
+
+| Phase | Passed | Pytest duration | Warnings |
+|---|---:|---:|---:|
+| Isolated legacy capture | 1/1 | 4.10 s | 35 |
+| Smoke | 27/27 | 817.02 s | 163 |
+| Full `--full` matrix | 271/271 | 3502.50 s | 1651 |
+| Independent selected dense subset | 57/57 | 1243.21 s | 980 |
+
+There were **zero failures, errors or skips**. Full coverage was **157 decode /
+48 cache / 66 native sparse MLA** cases. Both actual-stage FP4-to-FP8 byte probes
+compiled, launched and passed for native and fallback conversion, including all
+finite codes/scales, signed zero, page-plane addressing, SW128 stores and guards.
+Both analytic rounding/saturation/underflow changed-data graph cases passed,
+as did all global widths `0/64/.../512`, native source-state/sink/empty gates,
+writer/decode replay, legacy Frost and optional MXFP8 cases. The four historical
+plan-isolation IDs expand explicitly to both cache modes, preserving all 207
+original logical cases as 211 mode-expanded identities.
+
+Every Python/timeout, tee, effective phase and job-wrapper exit was 0; Slurm
+root/batch/extern completed with `0:0`. Exact ordered JUnit identities and complete
+passing setup/call/teardown triplets matched the phase manifests. Independent
+corroboration matched all **5871 frozen fingerprints**, Git state and scheduler
+visibility through terminal completion, before these validation-note edits.
+Numerical references, byte expectations, tolerances and actual default
+GC/capture settings were unchanged; `force_cudagraph_gc=False` was retained.
+The independent report has `default_gpu_qualification=true` with no evidence
+errors. The root allocation used **1h36m04s** (5764 GPU-seconds), within the
+three-GPU-hour budget; batch/extern accounting is not added again.
+
+Evidence is preserved in
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200-tuple.l7c2aj9y/`:
+`independent-audit.json`, `terminal-corroboration.json`, `freeze.json`, phase
+`*-results.json`, `*.xml`, `*.log` and shell-exit records. The budget ledger is
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-gpu-budget.3mr2xwkh/budget.json`.
+These results qualify only this frozen B200/4.8/13.4 FP8-main snapshot and the
+selected dense subset, not the entire dense suite, other GPU/toolchain
+combinations or checkpoint/full-model behavior. Examples and benchmarks have not
+run; pytest durations above are validation runtime, not kernel-latency or
+performance measurements.
+
+#### Earlier FP8-main attempts
+
+The allocated B200 attempt on `umb-b200-263` (job `5048418`, DSL 4.8.0 /
+bundled compiler 13.4) passed preflight, the exact **271-case** `--full` collection
+(157 decode / 48 cache / 66 native sparse MLA), and the isolated legacy capture
+regression **1/1**. Its 27-case smoke stopped at the first new
+`test_fp4_fp8_all_finite_codes[False]` during JIT: `cutlass.make_array_view`
+received a scalar CuTe layout shape and failed with
+`TypeError: object of type 'int' has no len()`. No conversion kernel launched or
+byte/numerical check ran. Smoke reported **1 failed**, pytest exited 1 and Slurm
+recorded `FAILED` / `1:0`; full and independent dense phases were skipped by the
+smoke prerequisite gate. All 5772 frozen fingerprints and Git state matched
+through independent terminal corroboration, with the recorded default GC/capture
+settings and scheduler visibility unchanged. Evidence is in
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200-collected.75ea7jn5/`, including
+`smoke.log`, `smoke.xml` and `terminal-corroboration.json`.
+
+The probe now supplies a flat one-element shape tuple, with a host regression
+assertion. This changes only test setup, not conversion arithmetic, byte
+expectations or tolerances; all 321 guarded CPU cases passed again as recorded
+above. The corrected probe and FP8-main attention subsequently passed the
+separate job `5049128` recorded above; the earlier failed evidence is unchanged.
+Two earlier allocations (`5047536`, `5047995`) executed no test cases: their
+wrappers rejected pytest's default `maxfail=None` and an obsolete 266-case
+forecast, respectively. Their records remain in
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200.CeS4DyWZ/` and
+`/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200-retry.sqz58o3d/`.
+The current manifest comes from real allocated collection; four historical
+plan-isolation IDs explicitly expand to both `fp8` and `mxfp8`, preserving all
+207 original logical cases as 211 mode-expanded identities.
+
+On an explicitly allocated SM100/B200 with DSL >= 4.8 and its bundled CUDA 13
+compiler, start with the real-stage byte/conversion probe, analytic main-only
+rounding/saturation/underflow replay, and all-width changed-data replay:
+
+```bash
+python -m pytest --full -v \
+  tests/experimental/test_deepseek_v41_decode.py::test_fp4_fp8_all_finite_codes \
+  tests/experimental/test_deepseek_v41_decode.py::test_fp8_main_rounding_saturation_underflow_changed_graph \
+  tests/experimental/test_deepseek_v41_decode.py::test_fp8_swa_changed_graph
+```
+
+The byte probe covers all finite E2M1 codes × finite E4M3 scales, including signed
+zero, with neighboring group16 scales, permuted page selections, all eight
+retained D128 stages, invalid IDs and shared-memory guards. It uses the real
+inherited page-plane loader and both conversion branches. Both corrected probes
+compiled, launched and passed in smoke and full-suite order in job `5049128`,
+alongside the full decode/cache/native sparse MLA matrix and selected dense
+subset above. The example and reference-checked benchmark remain unrun.
+
+### Historical native-first split acceptance (2026-10-15, pre-FP8-main)
 
 The native-FP8-only checkpoint passed **213 CPU cases**: 127 guarded
 source-state/adapter/oracle contracts, 6 accelerator-free conversion-lifetime
@@ -118,7 +266,7 @@ Records are in `/home/scratch.linquanh_gpu/tmp/dsv41-fp8-first.iU3DYW/native-che
 No GPU, JIT compilation, example or benchmark execution was performed for this
 reorganization. The older records below do not qualify the rewritten sources.
 
-### Optional MXFP8 follow-up acceptance (2026-10-15)
+### Historical optional MXFP8 acceptance (2026-10-15, pre-FP8-main)
 
 The combined follow-up passed **299 CPU cases**: 126 guarded native
 source-state/adapter/oracle contracts, 37 optional-MXFP8 routing/plan/resource
@@ -192,7 +340,7 @@ recorded test-time fingerprints.
 These results qualify CPU configuration/plumbing/reference checks only; they
 predate the source-store Array-interface correction described below.
 
-### Earlier ordinary-FP8 GPU attempts
+### Earlier ordinary-FP8 GPU attempts (pre-FP8-main)
 
 One allocated B200 on `umb-b200-248` (Slurm job `4943022`) used the existing
 DSL package/module 4.8.0 overlay and bundled CUDA 13.4. Preflight passed, and
@@ -258,7 +406,7 @@ or skips and 1707 warnings in 3738.65 s; pytest/runner exited 1 and Slurm record
 through independent terminal corroboration. Dense57 again did not run.
 Records: `/home/scratch.linquanh_gpu/tmp/dsv41-fp8-capture-default.osF1cWGG`.
 
-### Capture diagnosis and test-resource lifetime repair
+### Capture diagnosis and test-resource lifetime repair (pre-FP8-main)
 
 On one allocated B200 in `umb-b200-236` (job `5005300`, DSL 4.8.0 / bundled CUDA
 13.4), default isolated capture **1/1**, smoke **16/16** and independent default
@@ -302,10 +450,12 @@ An AST comparison also confirmed that every pre-existing test statement other
 than the two owner registrations is unchanged.
 Records: `/home/scratch.linquanh_gpu/tmp/dsv41-conversion-lifetime.AqXa1foM`.
 
-### Clean post-repair GPU validation (2026-10-15)
+### Historical post-repair GPU validation (2026-10-15, pre-FP8-main)
 
-One allocated B200 on `umb-b200-260` (Slurm job `5008381`) used CuTe-DSL
-package/module 4.8.0 and its bundled CUDA 13.4 compiler, with fresh scratch/JIT,
+This snapshot used native FP8 SWA with BF16 main attention and exact BF16 Q
+expansion; it predates FP8-main staging/attention. One allocated B200 on
+`umb-b200-260` (Slurm job `5008381`) used CuTe-DSL package/module 4.8.0 and its
+bundled CUDA 13.4 compiler, with fresh scratch/JIT,
 CuTe, Triton and pytest caches and distinct Python processes per phase. Default
 GC/capture settings and all independent references/tolerances were unchanged.
 No tracer was loaded. The complete post-repair run passed:
@@ -363,9 +513,10 @@ Records are in
 `final-corroboration-postrun.json` preserve the strict correction and its evidence.
 Neither the frozen inputs nor the original report was overwritten.
 
-This qualifies the tested post-repair B200/4.8/13.4 full257 matrix and selected
-dense57 subset, not all dense configurations, DSL 4.7 GPU execution, other
-hardware/toolchains or checkpoint/full-model behavior. It is a successful default
+This qualifies only the tested pre-FP8-main, post-repair B200/4.8/13.4 full257
+snapshot and selected dense57 subset, not current FP8-main staging/attention,
+all dense configurations, DSL 4.7 GPU execution, other hardware/toolchains or
+checkpoint/full-model behavior. It is a successful default
 regression of a test-resource lifetime repair, not exhaustive global JIT ownership
 or historical unload-status proof. Earlier failed and diagnostic attempts remain
 as recorded above. Benchmarks have not run; no speedup or measured crossover is
@@ -651,12 +802,17 @@ for cache addresses above 2 GiB. This is internal scheduling within
 `backend="cute-dsl"`, unchanged by the new selector.
 
 Native Prims-TS uses fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
-execution: BK128 native FP8 SWA plus an optional BK64/BF16 global FP4 pass and
-FP32 source merge. It does not use Frost's heuristics or the native wrapper's
-automatic policy. There are no measured crossovers or tuned batch thresholds.
-A compiled callable launches GPU sanitation, attention and merge on the same
-stream. Only selected global FP4 tiles expand directly into retained BF16 shared
-memory; `Fp4KvProducer` is a concrete FP4-only resource, not an MXFP8 SWA loader.
+execution: BK128 E4M3 Q/K/V/P for both SWA and optional main attention, with
+FP32 source merge and the original FP8 Q bound to both passes. It does not use
+Frost's heuristics or the native wrapper's automatic policy. There are no measured
+crossovers or tuned batch thresholds. A compiled callable launches GPU sanitation,
+attention and merge on the same stream. Only selected packed global FP4 tiles
+apply their group16 E4M3 scales and finite-clamped/RTNE unit-E4M3 conversion into
+retained FP8 shared memory. `Fp4Fp8KvProducer` / `Fp4Fp8SmemKvResource` live in
+`prims_ts_resources.py`; each writer fences its stores before all-writer
+AsyncThread-to-UMMA publication. There is no full converted cache or BF16 query
+scratch. The BF16 `Fp4KvProducer` / `Fp4SmemKvResource` remain unchanged for the
+optional MXFP8 compatibility adapter.
 
 Both backends use queries `[B,1,64,512]`, 64-token pages, 128 window positions
 and up to 512 FP4 compressed positions, padded to multiples of 64. The Prims-TS
@@ -675,9 +831,10 @@ storage. Every valid cache slot must be initialized and causally visible.
 Frost and the optional Prims-TS MXFP8 mode use BF16 Q/K/V/P and FP32
 accumulation/softmax, with independent FP64
 relative-L2 < 0.005, max-scaled error < 0.01 and absolute LSE error < 1e-5.
-Those legacy gates are unchanged. Native FP8 SWA uses the per-component
-rounding bound above, the same strict LSE/empty gates and additional strict BF16
-checks when only global is live. Checkpoint accuracy has not been established.
+Those legacy gates and represented BF16 values are unchanged. Native E4M3
+SWA/main attention, including main-only requests, uses the per-component rounding
+bound above and the same strict LSE/exact-empty gates, not BF16 main-only gates.
+Checkpoint accuracy has not been established.
 
 `deepseek_v41_decode` returns `(out, lse, plan)`. Output is BF16 with Q's shape;
 LSE is FP32 `[B,64,1]`, natural-log and **sink-exclusive**. A finite per-head
@@ -728,11 +885,15 @@ when Prims-TS is selected. `--prims-ts-mode mxfp8` explicitly selects its option
 and optional FlashMLA retain that legacy representation and their original gates. All arms derive from common seeded inputs
 and share the global FP4 pool, selections and sink, but each is checked against
 its own represented-value FP64 oracle. The native arm uses the componentwise
-rounding bound and exact empty/strict sink-exclusive LSE gates above. Only selected
-global rows are decoded for that reference, not the entire production-sized pool.
-JSON labels each arm's dtype, SWA encoding, shapes, arithmetic and accuracy
-contract, and distinguishes different-arithmetic comparisons. Native FP8 versus
-MXFP8 timings are **not** a like-for-like backend comparison:
+rounding bound and exact empty/strict sink-exclusive LSE gates above. Its reference
+decodes only selected global rows, applies their scales and finite-clamped/RTNE
+E4M3 conversion before QK and V, not the entire production-sized pool. The legacy
+references retain their decoded BF16 main values. JSON labels each arm's dtype,
+SWA encoding, packed main storage, selected-tile conversion (including lossy clamp),
+shapes, actual attention arithmetic and accuracy contract. Source provenance
+includes the shared FP8 packing helper in `mla_decode/helpers/ops.py`, without
+importing adapter modes merely to hash them. Native FP8 versus MXFP8 timings are
+**not** a like-for-like backend comparison:
 
 ```bash
 # The existing default remains cute-dsl only:
@@ -776,10 +937,14 @@ selections. Exact encoded-byte references run before the independent FP64 decode
 gates. The original legacy integration covered both backends at global widths
 128/192/512; all eight expanded legacy cases passed in the historical full
 matrix on the allocated B200 in Slurm job `4910237`, with CuTe-DSL 4.8.0 /
-bundled CUDA 13.4. The new `swa_fp8` writer/decode integrations use explicit FP8 Q
-at widths 0/128/192/512; all passed within the clean post-repair full257 run on
-`umb-b200-260` (job `5008381`, B200 / DSL 4.8.0 / bundled CUDA 13.4), including
-changed-data CUDA Graph replay and exact encoded-byte references.
+bundled CUDA 13.4. The historical `swa_fp8` writer/decode integrations used
+explicit FP8 Q and BF16 main attention at widths 0/128/192/512; all passed within
+the pre-FP8-main clean post-repair full257 run on `umb-b200-260` (job `5008381`,
+B200 / DSL 4.8.0 / bundled CUDA 13.4), including changed-data CUDA Graph replay
+and exact encoded-byte references. They do not qualify current E4M3 main staging
+or attention. The separate current FP8-main full271 run on `umb-b200-263`
+(job `5049128`, B200 / DSL 4.8.0 / bundled compiler 13.4) passed all **48 cache
+cases**, including native writer/decode graph replay, as recorded above.
 
 ```bash
 pytest tests/experimental/test_deepseek_v41_decode.py \

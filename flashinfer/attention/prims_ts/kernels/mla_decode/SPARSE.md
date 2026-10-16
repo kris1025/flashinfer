@@ -68,8 +68,9 @@ extension. Its compiler, plan and `deepseek_v41_prims_ts_mxfp8` JIT namespace ar
 separate from the primary native `deepseek_v41_prims_ts_fp8` path. Its BK64/BF16
 Keep-AB graph uses fused split-1 finalization. `prims_ts_mxfp8_resources.py` adds
 E8M0 SWA conversion and mixed-source routing, inheriting FP4 stores and all-writer
-publication from the primary FP4-only resource. Plans cannot cross modes, even
-with otherwise matching declarations.
+publication from the unchanged BF16 `Fp4KvProducer` / `Fp4SmemKvResource` in
+`prims_ts_resources.py`, not the native mode's FP8 specialization. Plans cannot
+cross modes, even with otherwise matching declarations.
 
 Frost retains BF16 Q and uint8 page64 MXFP8 SWA of width 528, with group32 E8M0
 scales. Both backends may use optional uint8 FP4 compressed caches of width 288.
@@ -86,9 +87,10 @@ contract.
 
 The V4.1 adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler**;
 a system CUDA 13 toolkit alone is insufficient. Fixed **Keep-AB / M64 /
-retained-KV8 / split 1 / nonpersistent** execution uses BK128 for native FP8 SWA
-and BK64 for optional global FP4, separate from the native scheduling policy
-below. There are no measured backend crossovers or tuned batch thresholds.
+retained-KV8 / split 1 / nonpersistent** execution uses BK128 and E4M3 Q/K/V/P
+for both native source passes, separate from the native scheduling policy below.
+The optional BF16-Q/MXFP8 adapter retains BK64/BF16 arithmetic. There are no
+measured backend crossovers or tuned batch thresholds.
 
 The compiled callable first launches GPU index sanitation, then the native
 sparse attention graph on the same stream. Sanitation maps negative,
@@ -99,21 +101,64 @@ positions; true valid counts and real zero extra lengths are refreshed for the
 independent source passes.
 
 In ordinary-FP8 mode, SWA uses the native typed E4M3 TMA/QK/P/PV path; there
-are no BF16 SWA stages or dequantized KV buffers. Optional global FP4 uses a
-separate BK64/BF16 selected-tile pass with an exact E4M3-to-BF16 expansion of
-current Q. A narrow internal `source_state_store` hook publishes normalized
-FP32 O before native BF16 packing, with sink-free log2 LSE. It permits only
+are no BF16 SWA stages or dequantized KV buffers. Main/global storage remains
+packed E2M1 plus group16 E4M3 scales in width-288 page planes. Only selected main
+tiles apply their scales, then round to unit E4M3 with round-to-nearest-even and
+finite saturation to `[-448,448]`, preserving signed zero, subnormals and
+halfway-even behavior. This is lossy: finite scaled FP4 values can reach ±2688.
+The FP8 shared-memory tiles feed QK and PV in a separate BK128/E4M3 pass using
+the original FP8 Q, not BF16 attention. Neither mixed nor window-only native mode
+expands Q to BF16 or allocates BF16 query scratch or a full converted cache.
+A narrow internal `source_state_store` hook publishes normalized FP32 O before
+native BF16 packing, with sink-free log2 LSE. It permits only
 nonfinalizing, direct-index, sink-free 1CTA Keep/M64/D512/no-RoPE/Sq1/V1,
 split-1/nonpersistent configurations and is mutually exclusive with output
 quantization. It does not add a public `out_dtype="fp32"` mode. The existing
 P448 compensation is retained; source O must not receive another 448 factor.
 `MergeMlaSourceStates` merges the FP32 states, applies the sink once and rounds
-only final O to BF16, returning FP32 natural-log KV LSE. Window-only has no
-global states or BF16 query scratch; unused compiled slots alias the live source.
+only final O to BF16, returning FP32 natural-log KV LSE. Window-only additionally
+omits global source states; unused compiled slots alias the live source.
 
-The validation records below describe the original pre-reorganization source
-snapshots. They do not qualify the rebuilt native-FP8 commit or its later MXFP8
-extension; no new GPU or performance qualification is claimed by the split.
+The independent native FP64 reference applies the main E4M3 clamp/round before
+both logits and V. Main-only, mixed and window-only use the unchanged per-component
+FP8 probability-rounding bound, strict `atol=1e-5, rtol=0` sink-exclusive LSE and
+exact empty gates, not BF16 main-only gates. The joint KV maximum bounds each
+source's local maximum, so the existing summed underflow term covers both FP8
+source passes. Frost and optional BF16-Q/MXFP8 values/references/gates are unchanged.
+
+Current FP8-main CPU/static acceptance (2026-10-16) passed **321/321** cases:
+146 native source-state/resource/adapter/oracle, 37 optional-MXFP8, 7 conversion
+lifetime, 85 benchmark/example defaults, 40 native host and 6 unknown-backend
+contracts. The fresh `-I -B -S` Python 3.12.3 / Torch 2.11.0+cu128 process used the
+existing DSL 4.8.0 overlay / bundled compiler metadata 13.4, static `sm_100`,
+thread caps and disabled plugin autoload/JIT. Pytest/strict exits were 0, with
+zero failures/errors/skips/intercepted calls and uninitialized Torch CUDA.
+The latest rerun includes the real-stage probe's flat rank-one tuple-layout
+regression. Exact ordered JUnit identities, all 154 fingerprints, Git state and
+CUDA visibility matched independent postflight, before validation-note edits.
+These are guarded host/static contracts, not GPU/JIT qualification; see the example
+README for records and runnable allocated-GPU commands.
+
+Current FP8-main GPU validation (2026-10-16) passed on one allocated B200 / 148 SMs
+in `umb-b200-263` (job `5049128`, DSL 4.8.0 / bundled compiler 13.4): isolated
+capture **1/1**, smoke **27/27**, full **271/271** (157 decode / 48 cache / 66 native
+sparse MLA) and independent selected dense **57/57**, with no failures, errors or
+skips. Both real-stage conversion branches and analytic rounding/saturation/
+underflow graph replay passed, as did all global widths `0/64/.../512`.
+Independent corroboration matched exact ordered JUnit identities, setup/call/
+teardown reports, all 5871 frozen fingerprints, Git state and scheduler visibility
+before validation-note edits; numerical gates and default GC/capture settings
+were unchanged. Every phase exited 0 and Slurm root/batch/extern completed `0:0`.
+The allocation used 1h36m04s of the three-GPU-hour budget. This qualifies only the
+tested B200/4.8/13.4 snapshot and selected dense subset, not other hardware/
+toolchains, the entire dense suite or checkpoint/full-model behavior. Examples
+and benchmarks have not run; no performance claim is made. See the example README
+for the independent report and terminal evidence.
+
+The remaining validation records below describe pre-FP8-main source snapshots,
+including the original pre-reorganization GPU runs. The historical 257-case GPU
+and later 299-case CPU acceptances do not qualify current main conversion/staging/
+attention; the separate current GPU run above does.
 
 Post-conversion-lifetime-repair default validation passed on one allocated B200
 in `umb-b200-260` (job `5008381`, DSL 4.8.0 / bundled CUDA 13.4): **257/257** full
@@ -173,14 +218,18 @@ prepend and full interpreter/module command, retaining every other original
 check. Its 166 guarded CPU checks and complete independent corroboration passed;
 no frozen input, original report, numerical gate or default GC/capture setting
 was changed. See the example README for evidence paths and scope. This qualifies
-the tested B200/4.8/13.4 matrix and dense subset, not other hardware/toolchains,
-full dense coverage, checkpoint/full-model behavior or exhaustive JIT ownership.
+only the tested pre-FP8-main B200/4.8/13.4 snapshot and dense subset, not current
+FP8-main staging/attention, other hardware/toolchains, full dense coverage,
+checkpoint/full-model behavior or exhaustive JIT ownership. That snapshot used
+FP8 SWA but BF16 main attention and exact BF16 Q expansion.
 The historical 207/57-case results below belong to the legacy adapter/shared
-infrastructure and do not qualify this new mode. Its independent FP64 oracle uses actual stored E4M3
-values, the native per-component FP8 probability/output bound, unchanged
-`atol=1e-5, rtol=0` LSE gates and exact empty masks/outputs. Global-only retains
-strict BF16 gates. Both SWA/global source-precision regressions require FP32
-`19/65` before final rounding, rejecting BF16-source-to-FP32 casting.
+infrastructure and additionally predate ordinary FP8 SWA. The pre-FP8-main FP64
+oracle used actual stored E4M3 values, the native per-component FP8
+probability/output bound, unchanged `atol=1e-5, rtol=0` LSE gates and exact empty
+masks/outputs; global-only then retained strict BF16 gates. Current native
+main-only uses the E4M3 reference/bound instead. Both SWA/global source-precision
+regressions require FP32 `19/65` before final rounding, rejecting
+BF16-source-to-FP32 casting.
 
 The new host source-store/adapter/oracle suite passed 125 cases with DSL 4.8.0
 and a declared CPU-only `CUTE_DSL_ARCH=sm_100` target, with zero intercepted
@@ -196,14 +245,19 @@ CUDA visibility were preserved within each matrix; packages were not patched.
 See the example README for exact results/provenance. This is CPU/static checking,
 not GPU/JIT qualification or a change to the native wrapper's DSL 4.7 contract.
 
-The concrete `Fp4KvProducer` in `experimental/deepseek_v41/prims_ts_resources.py`
-loads only selected global FP4 tiles into the native BF16 D128 shared-memory
-stages. It contains no MXFP8 SWA staging and does not unpack the whole cache or
-materialize selected dequantized KV in global memory. All 128 loader threads fence their
-stores and arrive at an AsyncThread-to-UMMA pipeline; native TMA byte-completion
-accounting is not used for these thread-written stages. K stays retained through
-QK and delayed PV, using the existing native consumer-release protocol. The
-ordinary native TMA producer is unchanged when no custom producer is selected.
+The native `Fp4Fp8KvProducer` / `Fp4Fp8SmemKvResource` specialization in
+`experimental/deepseek_v41/prims_ts_resources.py` loads only selected global FP4
+tiles, applies their group16 E4M3 scales and finite-clamped/RTNE conversion, then
+stores native D128 FP8 SW128 shared-memory stages. It reuses native dtype-specific
+K/V descriptors and retained-stage lifetime; it does not stage BF16 KV or expand Q.
+The same file's BF16 `Fp4KvProducer` / `Fp4SmemKvResource` remain unchanged for
+optional MXFP8 compatibility. Neither producer stages MXFP8 SWA, unpacks the whole
+cache or materializes selected dequantized KV in global memory. All 128 loader
+threads fence their own stores and arrive at an AsyncThread-to-UMMA pipeline;
+native TMA byte-completion accounting is not used for these thread-written stages.
+K stays retained through QK and delayed PV, using the existing native
+consumer-release protocol. The ordinary native TMA producer is unchanged when no
+custom producer is selected.
 
 Production-source B200 validation on `umbriel-b200-040` with CuTe-DSL 4.8.0 /
 bundled CUDA 13.4 and a fresh scratch workspace passed all 10 targeted tests,

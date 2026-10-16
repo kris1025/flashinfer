@@ -1,9 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Native E4M3 SWA and FP32 source states for the V4.1 adapter.
+"""Native E4M3 attention and FP32 source states for the V4.1 adapter.
 
-Only the optional global FP4 pass expands Q to BF16. SWA stays native FP8
-through TMA, QK, P and PV; neither pass rounds its normalized O before merging.
+SWA stays native FP8 through TMA, QK, P and PV. The optional main pass rounds
+selected scaled FP4 tiles to E4M3 and uses the original FP8 Q. Neither pass
+rounds its normalized O before merging.
 """
 
 from dataclasses import dataclass
@@ -103,23 +104,10 @@ class Fp8SwaDecodeKernel:
             cute.arch.atomic_add(swa_counts.iterator + request, count_s, scope="cta")
             cute.arch.atomic_add(global_counts.iterator + request, count_c, scope="cta")
 
-    @cute.kernel
-    def _expand_query(self, q: cute.Tensor, expanded: cute.Tensor):
-        request, head, _ = cute.arch.block_idx()
-        lane = cute.arch.thread_idx()[0]
-        offset = (
-            cutlass.Int64(request) * 64 + cutlass.Int64(head)
-        ) * 512 + cutlass.Int64(lane) * 4
-        values = cute.make_tensor(q.iterator + offset, cute.make_layout(4)).load()
-        cute.make_tensor(expanded.iterator + offset, cute.make_layout(4)).store(
-            values.to(cutlass.BFloat16)
-        )
-
     @cute.jit
     def __call__(
         self,
         q: cute.Tensor,
-        expanded_q: cute.Tensor,
         swa_cache: cute.Tensor,
         global_cache: cute.Tensor,
         swa_indices: cute.Tensor,
@@ -193,11 +181,6 @@ class Fp8SwaDecodeKernel:
             source_state_store_args=(part_s, swa_counts),
         )
         if cutlass.const_expr(self.compressed_k > 0):
-            self._expand_query(q, expanded_q).launch(
-                grid=(swa_indices.shape[0], 64, 1),
-                block=(128, 1, 1),
-                stream=stream,
-            )
             global_lse = cute.make_tensor(lse_c.iterator, source_lse_layout)
             direct_global = (
                 selected_global,
@@ -211,8 +194,8 @@ class Fp8SwaDecodeKernel:
                 None,
             )
             self.global_attention(
-                expanded_q,
-                expanded_q,
+                q,
+                q,
                 global_cache,
                 global_cache,
                 None,

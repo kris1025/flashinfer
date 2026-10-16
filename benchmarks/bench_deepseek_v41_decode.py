@@ -6,21 +6,26 @@ python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
     --backends cute-dsl prims-ts --context 32768 --output results.json
 
 The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts defaults
-to explicit E4M3 Q/ordinary FP8 SWA and its native componentwise P-rounding gate;
+to explicit E4M3 Q/ordinary FP8 SWA and E4M3 Q/K/V/P attention for both sources.
+Selected packed FP4 main tiles apply group16 E4M3 scales, then round to unit
+E4M3 with RTNE and finite saturation to [-448,448] before QK/PV. This is lossy:
+finite scaled values can reach +/-2688. No BF16 query expansion is used.
 --prims-ts-mode mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA and legacy gates.
 Native and legacy arms have different represented inputs and arithmetic, not
-identical precision. All derive from common seeded BF16 sources and share the
-global FP4 pool/indices.
+identical precision. All derive from common seeded BF16 sources and share one
+packed global FP4 pool/indices, not a full converted cache.
 FlashMLA is an optional external legacy BF16-Q/MXFP8 benchmark dependency,
-enabled only by --flashmla, not a shipped decode backend. Quantization,
-allocation, JIT and host overhead are excluded from GPU timing. Each timed
-invocation includes the full public replay, including GPU metadata and merge.
+enabled only by --flashmla, not a shipped decode backend. Cache-writer
+quantization, allocation, JIT and host overhead are excluded from GPU timing.
+Each timed invocation includes the full public replay, including GPU metadata,
+selected-tile conversion, attention and merge.
 Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
 a nonpersistent schedule. The source implementation historically passed the
 expanded 257-case B200 matrix and selected 57-case dense subset with DSL 4.8.0 /
-bundled CUDA 13.4. Those runs predate the native-only source split and do not
-newly qualify this revision, other GPU/toolchain combinations or full models.
-Benchmarks have not run; performance and backend crossovers are unmeasured.
+bundled CUDA 13.4. Those pre-FP8-main runs used BF16 main attention and predate the
+native-only source split; neither they nor historical 299-case CPU acceptance
+qualify this change. No GPU/JIT or benchmark validation has run for FP8 main
+attention; performance and backend crossovers are unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
@@ -42,6 +47,7 @@ PRIMS_TS_SOURCES = (
     "experimental/deepseek_v41/prims_ts.py",
     "experimental/deepseek_v41/prims_ts_fp8.py",
     "experimental/deepseek_v41/prims_ts_resources.py",
+    "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/config.py",
@@ -112,8 +118,8 @@ def fixture(batch, context, seed, backends, flashmla=False, *, prims_ts_mode="fp
         .contiguous()
     )
     sink = torch.randn(64, device="cuda") * 0.1
-    # Only Q/SWA representation differs. In particular, do not allocate a
-    # second production-sized global pool for the native-FP8 comparison arm.
+    # Q/SWA differ at rest; main arithmetic differs despite shared packed storage.
+    # Do not allocate a second production-sized global pool or converted cache.
     shared = main, wi, ci, sink
     arms = {}
     prims_ts_mxfp8 = "prims-ts" in backends and prims_ts_mode == "mxfp8"
@@ -151,9 +157,11 @@ def legacy_reference(q, swa, main, wi, ci, sink):
 def fp8_oracle(q, swa, global_cache, wi, ci, sink):
     """FP64 represented-input oracle and native componentwise FP8 bound.
 
-    Decode only selected FP4 rows, not the entire production-sized global pool.
-    The attention/bound calculation matches the independent native GPU tests;
-    no adapter query expansion or intermediate source state enters this oracle.
+    Decode only selected FP4 rows, then finite-clamp/RTNE to unit E4M3 for both
+    QK and V, not the entire production-sized global pool. Scaled FP4 values can
+    reach +/-2688, so the [-448,448] conversion is lossy. The attention/bound
+    calculation matches the independent native GPU tests; neither production
+    conversion helpers nor intermediate source states enter this oracle.
     """
     values, masks = [], []
     for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
@@ -166,6 +174,7 @@ def fp8_oracle(q, swa, global_cache, wi, ci, sink):
             gathered = pool.double().reshape(-1, 512)[safe]
         else:
             gathered = selected(pool, safe[:, None], True, round_bf16=False)
+            gathered = gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()
         values.append(torch.where(valid[..., None], gathered, 0))
         masks.append(valid)
     kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
@@ -181,6 +190,8 @@ def fp8_oracle(q, swa, global_cache, wi, ci, sink):
     frame_mass = torch.exp(max_logit - normalizer)
     frame_mass = torch.where(torch.isfinite(kv_lse), frame_mass, 0)
     underflow = frame_mass[..., None] * kv.abs().sum(1)[:, None, :]
+    # The joint maximum bounds each FP8 source's local maximum, so the summed
+    # underflow term remains conservative with two independent FP8 source passes.
     bound = (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6
     bound = torch.where(torch.isfinite(kv_lse)[..., None], bound, 0)
     return expected, kv_lse, bound
@@ -269,9 +280,20 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
     contract = {"reference": "independent FP64 over this arm's represented Q/KV"}
     if native_fp8:
         arithmetic = (
-            "native E4M3 SWA QK/P/PV; FP4 global BF16 pass with exact E4M3 Q expansion"
+            "native E4M3 Q/K/V/P for SWA and main; "
+            "BK128/Keep-AB/M64/retained8/split1/nonpersistent; "
+            "original E4M3 Q, no BF16 query scratch"
+        )
+        global_conversion = (
+            "selected scaled E2M1 -> unit E4M3 SMEM; RTNE + finite saturation "
+            "[-448,448], preserving signed zero/subnormals; lossy (finite products "
+            "reach +/-2688)"
         )
         contract.update(
+            reference=(
+                "independent FP64 over stored E4M3 Q/SWA and selected main KV "
+                "after scaled E2M1 -> finite-clamped/RTNE unit E4M3"
+            ),
             output="componentwise native FP8 P-rounding bound (not legacy relative gates)",
             componentwise_bound=(
                 "(2^-4 + 3*2^-8 + 1e-5)*sensitivity + "
@@ -281,6 +303,7 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
             empty="exact zero output, negative-infinity LSE and zero bound",
         )
     else:
+        global_conversion = "scaled E2M1 -> BF16 (unchanged legacy represented values)"
         if name == "prims-ts":
             arithmetic = (
                 "Prims-TS BF16 Q/dequantized MXFP8 SWA and FP4 global "
@@ -299,6 +322,9 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
         "prims_ts_mode": prims_ts_mode if name == "prims-ts" else None,
         "q_dtype": str(q.dtype),
         "swa_encoding": "swa_fp8" if native_fp8 else "swa_mxfp8",
+        "global_encoding": "main_kv_fp4",
+        "global_storage": "packed E2M1 + group16 E4M3 scales; width288 page-plane",
+        "global_conversion": global_conversion,
         "cache_shape": {"swa": list(swa.shape), "global_fp4": list(main.shape)},
         "arithmetic": arithmetic,
         "accuracy_contract": contract,
@@ -382,10 +408,14 @@ def main():
             "triton": importlib.metadata.version("triton"),
         },
         "context_per_request": opts.context,
-        "shape": "H64/Sq1/D512; SWA128 + selected512 FP4; encodings/shapes per arm",
+        "shape": (
+            "H64/Sq1/D512; SWA128 + selected512 packed FP4; encodings/shapes per arm"
+        ),
         "comparison": (
-            "common seeded BF16 source Q/SWA; shared global FP4 pool and indices; "
-            "arm-specific represented inputs, arithmetic and accuracy contracts"
+            "common seeded BF16 source Q/SWA; one shared packed global FP4 pool "
+            "and indices; native FP8 (when selected) converts main tiles to lossy "
+            "finite-clamped/RTNE E4M3; legacy represented main values remain BF16; "
+            "arm-specific arithmetic and accuracy contracts"
         ),
         "seed": opts.seed,
         "timing": "CUDA Graph/event, 32 calls/replay, symmetric order, 30 samples/arm",
@@ -416,10 +446,10 @@ def main():
                     plans[backend] = deepseek_v41_decode(*args, backend=backend)[2]
                     # Capture the complete public call, not just attention:
                     # Prims-TS also sanitizes live selections on the GPU.
-                    fns[backend] = (
-                        lambda args=args, plan=plans[backend], backend=backend: (
-                            deepseek_v41_decode(*args, plan=plan, backend=backend)[:2]
-                        )
+                    fns[backend] = lambda args=args, plan=plans[
+                        backend
+                    ], backend=backend: (
+                        deepseek_v41_decode(*args, plan=plan, backend=backend)[:2]
                     )
                 del args
                 if opts.flashmla:

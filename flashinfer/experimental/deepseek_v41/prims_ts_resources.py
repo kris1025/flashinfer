@@ -7,9 +7,10 @@
 """Selected FP4-cache tiles for the D512 Prims-TS Keep-AB graph.
 
 The independent global pass consumes the primary pool as page64/group16 FP4.
-This arithmetic resource is BF16: loaders publish thread-written D128 stages
-retained until delayed PV releases K. No selected dequantized KV tensor is
-materialized in global memory.
+Native E4M3 attention rounds scaled FP4 values into FP8 shared-memory stages;
+the BF16 base remains unchanged for optional MXFP8 compatibility. Both retain
+thread-written D128 stages until delayed PV releases K, without materializing
+a dequantized KV tensor in global memory.
 """
 
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import SignalingThreads
 from cutlass.experimental.task_scheduling.resources import PipelineConfig, StageInfo
 
+from ...attention.prims_ts.kernels.mla_decode.helpers.ops import pack_float4_to_fp8_e4m3
 from ...attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
 from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
@@ -154,8 +156,8 @@ class Fp4SmemKvResource(SmemKvResource):
             row = warp * rows_per_warp + local_row
             chunk_idx = lane % chunks_per_row
             raw = cutlass.Int32(0x7FFFFFFF)
-            # Page staging caches one quad in each of lanes 0:4. All writing
-            # lanes recover their row from that cache; no index reread per D.
+            # Page staging caches row quads in this warp. All writing lanes
+            # recover their row from that cache; no index reread per D.
             for entry in cutlass.range_constexpr(4):
                 value = prims.shfl_sync(
                     thread_mask=0xFFFFFFFF,
@@ -225,3 +227,71 @@ class Fp4SmemKvResource(SmemKvResource):
         # Publication is the task graph's AsyncThread producer commit. Each
         # writer fences its own stores; all 128 arrivals precede UMMA's wait.
         cute.arch.fence_view_async_shared()
+
+
+@dataclass(frozen=True)
+class Fp4Fp8KvProducer(Fp4KvProducer):
+    def compile_signature(self):
+        return ("dsv41_page64_fp4_group16_to_e4m3", self.native_fp4)
+
+    def pipeline_config(self, cfg, load_group, umma_group, cta_layout_vmnk):
+        if (
+            cfg.kernel_variant != "keeps_mma_ab"
+            or cfg.qkv_dtype != "e4m3"
+            or cfg.rope_dim != 0
+            or cfg.head_dim_qk != 512
+            or cfg.head_dim_per_stage_kv != 128
+            or cfg.tile_size_q != 64
+            or cfg.tile_size_kv != 128
+            or cfg.kv_stages != 8
+            or cfg.load_num_warps != 4
+            or not cfg.sparse_reuse_kv
+            or not cfg.sparse_direct
+        ):
+            raise ValueError(
+                "V4.1 FP4-to-E4M3 KV requires Keep-AB/M64/BK128/KV8 retained stages"
+            )
+        # The inherited loader fences every writer before the same all-writer
+        # AsyncThread commit as the BF16 resource; these are not TMA stores.
+        return PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=cfg.kv_stages,
+            producer_group=load_group,
+            consumer_group=umma_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            producer_signaling_threads=SignalingThreads.All,
+            consumer_signaling_threads=SignalingThreads.CtaLeader,
+        )
+
+    def make_resource(self, pools, **kwargs):
+        return Fp4Fp8SmemKvResource(
+            fp4_cache=pools[0],
+            native_fp4=self.native_fp4,
+            **kwargs,
+        )
+
+
+@dataclass(kw_only=True)
+class Fp4Fp8SmemKvResource(Fp4SmemKvResource):
+    @cute.jit
+    def _store_fragment(self, fragment, stage_base, row, dim):
+        # Scaled E2M1 is exact in the inherited BF16 registers. Round once to
+        # unit-scale E4M3 (including finite saturation), before both QK and PV.
+        values = fragment.load().to(cutlass.Float32)
+        packed = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.rmem)
+        for word in cutlass.range_constexpr(2):
+            column = word * 4
+            packed[word] = pack_float4_to_fp8_e4m3(
+                values[column],
+                values[column + 1],
+                values[column + 2],
+                values[column + 3],
+            )
+        # Native FP8 D128 descriptors use one SW128 byte plane. Eight values
+        # occupy eight bytes, unlike the BF16 base's split-plane 16-byte store.
+        offset = (row * 128 + dim) ^ ((row & 7) * 16)
+        dst = cutlass.inttoptr(
+            stage_base.data_ptr().toint(cutlass.Int32) + offset,
+            mem_space=3,
+            dtype=cutlass.Int32,
+        )
+        dst.store(packed.load(0, 2), alignment=8)

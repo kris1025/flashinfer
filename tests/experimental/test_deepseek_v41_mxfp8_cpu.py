@@ -32,6 +32,55 @@ def _declaration(args):
     )
 
 
+def _bf16_packed_config(runtime):
+    attention = runtime.kernel.ThroughputLatencyMlaDecodeTs(
+        batch_size=1,
+        num_heads=64,
+        seq_len_q=1,
+        seq_len_k=256,
+        latent_dim=512,
+        rope_dim=0,
+        page_size=1,
+        max_active_clusters=148,
+        qkv_dtype="bf16",
+        out_dtype="bf16",
+        profile=runtime.config.MlaProfile(
+            name="mxfp8_resource_cpu",
+            kernel_variant="keeps_mma_ab",
+            tile_size_q=64,
+            use_persistent_scheduler=0,
+        ),
+        logical_num_heads=64,
+        logical_seq_len_q=1,
+        tile_size_q=64,
+        explicit_split_kv=1,
+        explicit_persistent=False,
+        reduction_mode="gmem_separate",
+        mask_type="dense",
+        sparse_profile=runtime.profile(
+            family="keep",
+            tile_size_q=64,
+            split_kv=1,
+            scheduler="nonpersistent",
+            head_dim_ctas=1,
+            gather_issue_warps=4,
+            direct_inputs=True,
+            reuse_kv=True,
+            reuse_kv_stages=8,
+            kv_tile_size=64,
+            page_pipeline_stages=1,
+        ),
+        finalize_output=True,
+    )
+    attention.direct_sparse = True
+    attention.direct_static_scales = True
+    attention.direct_sparse_capacities = (128, 64)
+    cfg = attention._make_config()
+    assert (cfg.qkv_dtype, cfg.tile_size_kv, cfg.kv_stages) == ("bf16", 64, 8)
+    assert cfg.sparse_direct
+    return cfg
+
+
 def _mxfp8_case(batch=2, compressed=64):
     import torch
 
@@ -338,13 +387,11 @@ def test_packed_resource_inherits_fp4_conversion_stores_and_pipeline(native):
 @pytest.mark.parametrize("native_fp4", (False, True))
 def test_native_primary_and_packed_extra_fp4_pool_bindings(native, native_fp4):
     from flashinfer.experimental.deepseek_v41 import (
-        prims_ts,
         prims_ts_mxfp8_resources as packed,
         prims_ts_resources as fp4,
     )
 
-    _, attention = prims_ts._make_fp8_sources(64, 148, native_fp4)
-    cfg = attention._make_config()
+    cfg = _bf16_packed_config(native)
     primary, extra = object(), object()
     plain = fp4.Fp4KvProducer(native_fp4=native_fp4).make_resource(
         (primary, extra), name="native_fp4", cfg=cfg
@@ -363,13 +410,11 @@ def test_native_primary_and_packed_extra_fp4_pool_bindings(native, native_fp4):
 
 def test_packed_pipeline_inherits_all_writer_async_signaling(native, monkeypatch):
     from flashinfer.experimental.deepseek_v41 import (
-        prims_ts,
         prims_ts_mxfp8_resources as packed,
         prims_ts_resources as fp4,
     )
 
-    _, attention = prims_ts._make_fp8_sources(64, 148, True)
-    cfg = attention._make_config()
+    cfg = _bf16_packed_config(native)
     calls, pipeline = [], object()
     load_group, umma_group, layout = object(), object(), object()
 

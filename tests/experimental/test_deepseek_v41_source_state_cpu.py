@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 import importlib
 import inspect
 import os
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -539,17 +540,19 @@ def test_fp8_adapter_builds_native_swa_and_fp4_only_global(
     )
     if compressed:
         cfg = main._make_config()
-        assert (cfg.qkv_dtype, cfg.tile_size_kv, cfg.kv_stages) == ("bf16", 64, 8)
+        assert (cfg.qkv_dtype, cfg.tile_size_kv, cfg.kv_stages) == ("e4m3", 128, 8)
+        assert cfg.is_fp8_qkv() and cfg.head_dim_per_stage_kv == 128
         assert main.direct_sparse_capacities == (compressed, 0)
+        assert main.seq_len_k == max(256, ((compressed + 127) // 128) * 128)
         from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
-            Fp4KvProducer,
+            Fp4Fp8KvProducer,
         )
 
-        assert type(main.kv_producer) is Fp4KvProducer
+        assert type(main.kv_producer) is Fp4Fp8KvProducer
         assert main.kv_producer.native_fp4 == native_fp4
         assert (
             main.kv_producer.compile_signature()[0]
-            == "dsv41_page64_fp4_group16_primary"
+            == "dsv41_page64_fp4_group16_to_e4m3"
         )
         assert (
             main.source_state_store.compile_signature()
@@ -560,6 +563,226 @@ def test_fp8_adapter_builds_native_swa_and_fp4_only_global(
         assert main is None
     swa.source_state_store = _SourceStateStore(variant="changed_source_store")
     assert swa.compile_signature() != signature
+
+
+@pytest.mark.parametrize("native_fp4", (False, True))
+def test_fp4_fp8_resource_reuses_exact_conversion_and_all_writer_publication(
+    native, monkeypatch, native_fp4
+):
+    from flashinfer.experimental.deepseek_v41 import prims_ts, prims_ts_resources as fp4
+
+    _, main = prims_ts._make_fp8_sources(192, 148, native_fp4)
+    cfg = main._make_config()
+    producer = main.kv_producer
+    assert producer.compile_signature() == (
+        "dsv41_page64_fp4_group16_to_e4m3",
+        native_fp4,
+    )
+    assert (
+        producer.compile_signature()
+        != fp4.Fp4KvProducer(native_fp4).compile_signature()
+    )
+    primary, unused = object(), object()
+    resource = producer.make_resource((primary, unused), name="fp4_fp8", cfg=cfg)
+    assert type(resource) is fp4.Fp4Fp8SmemKvResource
+    assert resource.fp4_cache is primary and resource.native_fp4 is native_fp4
+    assert resource.cfg is cfg and cfg.kv_smem_tile_bytes == 128 * 128
+    assert cfg.kv_smem_tile_bytes * cfg.kv_stages == 128 * 1024
+    for method in (
+        "_store_fp4_chunk",
+        "_load_fp4_stage",
+        "_producer_load_kv_stage",
+        "_stage_base",
+        "_init_smem_state",
+    ):
+        assert inspect.getattr_static(fp4.Fp4Fp8SmemKvResource, method) is (
+            inspect.getattr_static(fp4.Fp4SmemKvResource, method)
+        )
+    assert inspect.getattr_static(fp4.Fp4Fp8SmemKvResource, "_store_fragment") is not (
+        inspect.getattr_static(fp4.Fp4SmemKvResource, "_store_fragment")
+    )
+    calls, pipeline = [], object()
+    load_group, umma_group, layout = object(), object(), object()
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return pipeline
+
+    monkeypatch.setattr(
+        fp4.PipelineConfig, "create_async_umma_pipeline_cfg", staticmethod(create)
+    )
+    assert producer.pipeline_config(cfg, load_group, umma_group, layout) is pipeline
+    assert calls == [
+        dict(
+            num_stages=8,
+            producer_group=load_group,
+            consumer_group=umma_group,
+            cta_layout_vmnk=layout,
+            producer_signaling_threads=fp4.SignalingThreads.All,
+            consumer_signaling_threads=fp4.SignalingThreads.CtaLeader,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("kernel_variant", "swaps_mma_ab"),
+        ("qkv_dtype", "bf16"),
+        ("rope_dim", 64),
+        ("head_dim_qk", 576),
+        ("head_dim_per_stage_kv", 64),
+        ("tile_size_q", 32),
+        ("tile_size_kv", 64),
+        ("kv_stages", 10),
+        ("load_num_warps", 2),
+        ("sparse_reuse_kv", False),
+        ("sparse_direct", False),
+    ),
+)
+def test_fp4_fp8_producer_rejects_other_staging_topologies(native, field, value):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    cfg = replace(main._make_config(), **{field: value})
+    with pytest.raises(ValueError, match="FP4-to-E4M3 KV requires"):
+        main.kv_producer.pipeline_config(cfg, None, None, None)
+
+
+def test_fp4_fp8_stage_is_one_sw128_plane_with_eight_byte_stores(native):
+    from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
+        Fp4Fp8SmemKvResource,
+        pack_float4_to_fp8_e4m3,
+    )
+
+    function = ast.parse(
+        textwrap.dedent(inspect.getsource(Fp4Fp8SmemKvResource._store_fragment))
+    ).body[0]
+    offset = next(
+        node.value
+        for node in function.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "offset"
+    )
+    assert ast.unparse(offset) == "row * 128 + dim ^ (row & 7) * 16"
+    expression = compile(ast.Expression(offset), "<fp8-stage-offset>", "eval")
+    offsets = [
+        eval(expression, {"__builtins__": {}}, {"row": row, "dim": dim})
+        for row in range(128)
+        for dim in range(128)
+    ]
+    assert sorted(offsets) == list(range(128 * 128))
+    for start in range(0, len(offsets), 8):
+        assert offsets[start] % 8 == 0
+        assert offsets[start : start + 8] == list(
+            range(offsets[start], offsets[start] + 8)
+        )
+    pointer = next(
+        node.value
+        for node in function.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "dst"
+    )
+    # CuTe Pointer.store is scalar-only; use the DSL pointer's vector/alignment API.
+    assert ast.unparse(pointer.func) == "cutlass.inttoptr"
+    assert [(kw.arg, ast.unparse(kw.value)) for kw in pointer.keywords] == [
+        ("mem_space", "3"),
+        ("dtype", "cutlass.Int32"),
+    ]
+    store = function.body[-1].value
+    assert ast.unparse(store.func) == "dst.store"
+    assert ast.unparse(store.args[0]) == "packed.load(0, 2)"
+    assert [(kw.arg, ast.literal_eval(kw.value)) for kw in store.keywords] == [
+        ("alignment", 8)
+    ]
+    assert "cvt.rn.satfinite.e4m3x2.f32" in inspect.getsource(pack_float4_to_fp8_e4m3)
+
+    from .test_deepseek_v41_decode import test_fp4_fp8_all_finite_codes
+
+    probe = ast.parse(textwrap.dedent(inspect.getsource(test_fp4_fp8_all_finite_codes)))
+    staging = next(
+        node.value
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "staging"
+    )
+    assert ast.unparse(staging) == "cutlass.make_array_view(smem)"
+    smem = next(
+        node.value
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "smem"
+    )
+    # Array views require flat shape/stride tuples, including a rank-one layout.
+    layout = smem.args[1]
+    assert ast.unparse(layout.func) == "cute.make_layout"
+    assert isinstance(layout.args[0], ast.Tuple) and len(layout.args[0].elts) == 1
+    assert ast.unparse(layout.args[0].elts[0]) == "8 * stage_bytes + 256"
+    stage_loads = [
+        node
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "resource._load_fp4_stage"
+    ]
+    assert len(stage_loads) == 1
+    assert ast.unparse(stage_loads[0].args[1]) == (
+        "staging.subview(128 + (page_slot * 4 + stage_idx) * stage_bytes)"
+    )
+
+
+def test_fp8_native_compiled_abi_and_both_source_queries_are_fp8(native):
+    from flashinfer.experimental.deepseek_v41 import prims_ts, prims_ts_fp8
+
+    function = ast.parse(
+        textwrap.dedent(inspect.getsource(prims_ts_fp8.Fp8SwaDecodeKernel.__call__))
+    ).body[0]
+    assert len(function.args.args[1:-1]) == 19
+    assert function.args.args[-1].arg == "stream"
+    assert "expanded_q" not in prims_ts._Plan.__dataclass_fields__
+    assert not hasattr(prims_ts_fp8.Fp8SwaDecodeKernel, "_expand_query")
+    source_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) in ("self.swa_attention", "self.global_attention")
+    ]
+    assert len(source_calls) == 2
+    assert all(
+        [ast.unparse(arg) for arg in node.args[:2]] == ["q", "q"]
+        for node in source_calls
+    )
+    compiled = ast.parse(
+        textwrap.dedent(inspect.getsource(inspect.unwrap(prims_ts._compile)))
+    ).body[0]
+    calls = [
+        node
+        for node in ast.walk(compiled)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "cute.compile[cute.FrontendNext]"
+    ]
+    assert len(calls) == 1
+    assert [ast.unparse(arg) for arg in calls[0].args] == [
+        "decode_kernel",
+        "q",
+        "swa",
+        "global_cache",
+        "wi",
+        "ci",
+        "selected_swa",
+        "selected_global",
+        "swa_lengths",
+        "global_lengths",
+        "empty_lengths",
+        "swa_counts",
+        "global_counts",
+        "part_s",
+        "part_c",
+        "lse_s",
+        "lse_c",
+        "sink",
+        "out",
+        "lse",
+        "stream",
+    ]
+    source = inspect.getsource(inspect.unwrap(prims_ts._compile))
+    assert "dsv41_unit_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v2" in source
+    assert "globalbk128" in source and "globalbk64" not in source
 
 
 @pytest.mark.parametrize("compressed", (0, 64, 192, 512))
@@ -574,29 +797,31 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
     assert plan.empty_lengths.dtype == torch.int32 and plan.empty_lengths.shape == (2,)
     assert adapter.compilations == [(None, compressed)]
     call = adapter.launches[-1]
-    assert len(call) == 20
-    assert call[0].shape == (64, 512, 1, 2)
-    assert call[2].shape == (1, 512, 128) and call[2].stride() == (512, 1, 512)
-    assert call[10] is plan.empty_lengths
-    assert call[11] is plan.swa_counts and call[12] is plan.global_counts
-    assert call[13] is plan.part_s and call[15] is plan.lse_s
+    assert len(call) == 19
+    assert call[0].shape == (64, 512, 1, 2) and call[0].dtype == args[0].dtype
+    assert call[0].data_ptr() == args[0].data_ptr()
+    assert call[1].shape == (1, 512, 128) and call[1].stride() == (512, 1, 512)
+    assert call[9] is plan.empty_lengths
+    assert call[10] is plan.swa_counts and call[11] is plan.global_counts
+    assert call[12] is plan.part_s and call[14] is plan.lse_s
     assert (
-        call[18].data_ptr() == out.data_ptr() and call[19].data_ptr() == lse.data_ptr()
+        call[17].data_ptr() == out.data_ptr() and call[18].data_ptr() == lse.data_ptr()
     )
+    assert not hasattr(plan, "expanded_q")
+    assert [
+        name
+        for name, value in vars(plan).items()
+        if getattr(value, "dtype", None) == torch.bfloat16
+    ] == ["out"]
+    assert plan.selected_global.shape == (2, max(64, compressed))
     if compressed:
-        assert (
-            plan.expanded_q.dtype == torch.bfloat16
-            and plan.expanded_q.shape == args[0].shape
-        )
         assert plan.part_c.dtype == torch.float32 and plan.lse_c.dtype == torch.float32
-        assert call[1].data_ptr() == plan.expanded_q.data_ptr()
-        assert call[14] is plan.part_c and call[16] is plan.lse_c
+        assert call[13] is plan.part_c and call[15] is plan.lse_c
     else:
-        assert plan.expanded_q is None and plan.part_c is None and plan.lse_c is None
-        assert call[1].data_ptr() == out.data_ptr()
-        assert call[14] is plan.part_s and call[16] is plan.lse_s
-        assert call[3].data_ptr() == plan.empty_cache.data_ptr()
-        assert call[5].data_ptr() == plan.empty_indices.data_ptr()
+        assert plan.part_c is None and plan.lse_c is None
+        assert call[13] is plan.part_s and call[15] is plan.lse_s
+        assert call[2].data_ptr() == plan.empty_cache.data_ptr()
+        assert call[4].data_ptr() == plan.empty_indices.data_ptr()
     replacement = tuple(None if x is None else x.clone() for x in args)
     replay = adapter.run(replacement, plan)
     assert replay[0] is out and replay[1] is lse and replay[2] is plan
@@ -620,7 +845,6 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
         "part_c",
         "lse_s",
         "lse_c",
-        "expanded_q",
         "empty_cache",
         "empty_indices",
     ),
@@ -633,9 +857,7 @@ def test_fp8_adapter_checks_every_owned_buffer_for_input_overlap(adapter, field)
     assert len(adapter.launches) == 1
 
 
-@pytest.mark.parametrize(
-    "field", ("out", "lse", "part_s", "part_c", "lse_s", "lse_c", "expanded_q")
-)
+@pytest.mark.parametrize("field", ("out", "lse", "part_s", "part_c", "lse_s", "lse_c"))
 def test_fp8_adapter_checks_floating_scratch_for_autograd(adapter, field):
     args = _host_case()
     _, _, plan = adapter.run(args)
@@ -851,6 +1073,60 @@ def test_fp8_oracle_independent_page_planes_duplicates_and_bound(native):
         check_fp8(wrong, public_lse, (expected, lse, bound))
     with pytest.raises(AssertionError):
         check_fp8(out, public_lse + 1e-3, (expected, lse, bound))
+
+
+@pytest.mark.parametrize(
+    "code,scale,represented",
+    (
+        (3, 1.125, 1.75),
+        (11, 1.125, -1.75),
+        (7, 448.0, 448.0),
+        (15, 448.0, -448.0),
+        (1, 2**-9, 0.0),
+        (9, 2**-9, -0.0),
+        (1, 3 * 2**-9, 2**-8),
+    ),
+)
+def test_fp8_oracle_converts_main_before_both_logits_and_values(
+    native, code, scale, represented
+):
+    import math
+    import torch
+    from .test_deepseek_v41_decode import fp8_oracle
+
+    q, swa, main, wi, ci, sink = _host_case(batch=1)
+    q.view(torch.uint8)[..., 0] = torch.tensor(0.5).to(q.dtype).view(torch.uint8)
+    pages = main.view(2, -1)
+    pages[0, :256].fill_(code | (code << 4))
+    scale_byte = torch.tensor(scale).to(q.dtype).view(torch.uint8).item()
+    pages[0, 64 * 256 : 64 * 256 + 32].fill_(scale_byte)
+    pages[1, :256].fill_(0x22)
+    pages[1, 64 * 256 : 64 * 256 + 32].fill_(0x38)
+    ci[..., :2] = torch.tensor([0, 64], dtype=torch.int32)
+    sink.fill_(0.125)
+    expected, lse, bound = fp8_oracle(q, swa, main, wi, ci, sink)
+    logits = torch.tensor(
+        [0.5 * represented / math.sqrt(512), 0.5 / math.sqrt(512), 0.125],
+        dtype=torch.float64,
+    )
+    weights = logits.softmax(0)[:2]
+    answer = weights[0] * represented + weights[1]
+    sensitivity = weights[0] * abs(represented) + weights[1]
+    underflow = torch.exp(logits[:2].max() - logits.logsumexp(0)) * (
+        abs(represented) + 1
+    )
+    analytic_bound = (
+        (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6
+    )
+    torch.testing.assert_close(
+        expected, torch.full_like(expected, answer.item()), rtol=0, atol=1e-12
+    )
+    torch.testing.assert_close(
+        lse, torch.full_like(lse, logits[:2].logsumexp(0).item()), rtol=0, atol=1e-14
+    )
+    torch.testing.assert_close(
+        bound, torch.full_like(bound, analytic_bound.item()), rtol=0, atol=1e-12
+    )
 
 
 def test_fp8_oracle_uses_stored_query_and_sink_in_bound(native):

@@ -249,6 +249,7 @@ def test_native_oracle_uses_stored_values_and_only_selected_global_rows():
     assert gathered == [
         "pool.double().reshape(-1, 512)[safe]",
         "selected(pool, safe[:, None], True, round_bf16=False)",
+        "gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()",
     ]
     valid = next(
         node for node in assignments if ast.unparse(node.targets[0]) == "valid"
@@ -256,8 +257,8 @@ def test_native_oracle_uses_stored_values_and_only_selected_global_rows():
     assert ast.unparse(valid.value) == (
         "(index >= 0) & (index < pool.shape[0] * 64) & (index != 2147483647)"
     )
-    # The legacy decoder still rounds represented values to BF16 by default;
-    # the native reference explicitly bypasses that rounding for FP4 values.
+    # Legacy decoding retains BF16 values. Native main decoding bypasses that
+    # rounding, then applies its own finite-clamped/RTNE unit-E4M3 conversion.
     decoder = definition(_BENCHMARK, "selected")
     assert [ast.literal_eval(value) for value in decoder.args.kw_defaults] == [True]
     result = next(node.value for node in decoder.body if isinstance(node, ast.Return))
@@ -268,6 +269,50 @@ def test_native_oracle_uses_stored_values_and_only_selected_global_rows():
             {"represented": represented, "round_bf16": rounded},
         )
         assert value is (represented.bfloat16().double() if rounded else represented)
+
+
+def test_native_main_conversion_precedes_shared_qk_and_v_inputs():
+    oracle = definition(_BENCHMARK, "fp8_oracle")
+    loop = next(node for node in oracle.body if isinstance(node, ast.For))
+    branch = next(
+        node
+        for node in loop.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "not fp4"
+    )
+    assert [ast.unparse(node) for node in branch.orelse] == [
+        "gathered = selected(pool, safe[:, None], True, round_bf16=False)",
+        "gathered = gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()",
+    ]
+    represented = MagicMock(name="scaled_fp4")
+    dtype = object()
+    converted = eval(
+        compile(ast.Expression(branch.orelse[1].value), str(_BENCHMARK), "eval"),
+        {"gathered": represented, "torch": SimpleNamespace(float8_e4m3fn=dtype)},
+    )
+    assert represented.mock_calls == [
+        call.clamp(-448, 448),
+        call.clamp().to(dtype),
+        call.clamp().to().double(),
+    ]
+    assert (
+        converted is represented.clamp.return_value.to.return_value.double.return_value
+    )
+    assert ast.unparse(loop.body[-2]) == (
+        "values.append(torch.where(valid[..., None], gathered, 0))"
+    )
+    inputs = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in oracle.body
+        if isinstance(node, ast.Assign)
+    }
+    assert inputs["logits"] == (
+        "torch.einsum('bhd,bkd->bhk', q[:, 0].double(), kv) * 512 ** (-0.5)"
+    )
+    assert inputs["expected"] == "torch.einsum('bhk,bkd->bhd', weights, kv)"
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "bfloat16"
+        for node in ast.walk(oracle)
+    )
 
 
 @pytest.mark.parametrize(
@@ -444,18 +489,38 @@ def test_arm_json_labels_representation_shape_and_accuracy(name, mode):
     )
     assert metadata["q_dtype"] == q.dtype
     assert metadata["swa_encoding"] == ("swa_fp8" if native else "swa_mxfp8")
+    assert metadata["global_encoding"] == "main_kv_fp4"
+    assert metadata["global_storage"] == (
+        "packed E2M1 + group16 E4M3 scales; width288 page-plane"
+    )
     assert metadata["cache_shape"] == {
         "swa": [2, 64, 1, 512 if native else 528],
         "global_fp4": [8, 64, 1, 288],
     }
     contract = metadata["accuracy_contract"]
     if native:
-        assert "native E4M3" in metadata["arithmetic"]
+        assert "native E4M3 Q/K/V/P for SWA and main" in metadata["arithmetic"]
+        assert (
+            "BK128/Keep-AB/M64/retained8/split1/nonpersistent" in metadata["arithmetic"]
+        )
+        assert "original E4M3 Q, no BF16 query scratch" in metadata["arithmetic"]
+        assert metadata["global_conversion"] == (
+            "selected scaled E2M1 -> unit E4M3 SMEM; RTNE + finite saturation "
+            "[-448,448], preserving signed zero/subnormals; lossy (finite products "
+            "reach +/-2688)"
+        )
+        assert "finite-clamped/RTNE unit E4M3" in contract["reference"]
         assert "componentwise" in contract["output"]
         assert contract["lse"] == "sink-exclusive; rtol=0, atol=1e-5"
         assert "exact zero" in contract["empty"]
         assert "rel_l2_lt" not in contract
     else:
+        assert metadata["global_conversion"] == (
+            "scaled E2M1 -> BF16 (unchanged legacy represented values)"
+        )
+        assert (
+            contract["reference"] == "independent FP64 over this arm's represented Q/KV"
+        )
         assert contract["rel_l2_lt"] == 0.005
         assert contract["max_scaled_lt"] == 0.01
         assert contract["sink_exclusive_lse_abs_lt"] == 1e-5
@@ -485,6 +550,7 @@ def test_native_source_hash_defaults_stay_native_only():
     assert "experimental/deepseek_v41/prims_ts.py" in sources
     assert "experimental/deepseek_v41/prims_ts_fp8.py" in sources
     assert "experimental/deepseek_v41/prims_ts_resources.py" in sources
+    assert "attention/prims_ts/kernels/mla_decode/helpers/ops.py" in sources
     assert not any("mxfp8" in source for source in sources)
     assert extensions == (
         "experimental/deepseek_v41/prims_ts_mxfp8.py",

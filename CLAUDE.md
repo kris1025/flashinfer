@@ -478,23 +478,29 @@ page-plane ABI.
 
 The separate Prims-TS adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13
 compiler**. Fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
-execution uses BK128 for native FP8 SWA and BK64 for optional global FP4, not
-measured crossover heuristics. Each call refreshes live selections, execution
-lengths and valid counts on the GPU. Ordinary FP8 SWA uses native TMA/QK/P/PV;
-it is not dequantized to BF16. Optional global FP4 uses the existing selected-tile
-BF16 producer with an exact FP8-to-BF16 expansion of Q only. Sink-free normalized
-FP32 source O and log2 LSE are jointly merged; the sink is applied once before
-public BF16 O / FP32 natural-log LSE publication. Window-only allocates neither
-global source states nor BF16 query scratch. The internal `source_state_store`
-hook is restricted to this nonfinalizing 1CTA direct-index topology; it does not
-add a public FP32 native output mode and cannot be combined with output quantization.
-The concrete `Fp4KvProducer` in `prims_ts_resources.py` publishes selected global
-FP4 tiles through retained BF16 stages, with all-writer AsyncThread-to-UMMA
-signaling and per-writer fences; it contains no MXFP8 SWA staging.
+execution uses BK128 and E4M3 Q/K/V/P for both native source passes, not measured
+crossover heuristics. Each call refreshes live selections, execution lengths and
+valid counts on the GPU. Ordinary FP8 SWA uses native TMA/QK/P/PV; it is not
+dequantized to BF16. Main/global storage remains packed E2M1 with group16 E4M3
+scales, width 288 and the existing page-plane ABI. Only selected main tiles apply
+the scales, then round to unit E4M3 with round-to-nearest-even and finite saturation
+to [-448,448], preserving signed zero/subnormals. This is lossy: finite scaled FP4
+values can reach ±2688. FP8 shared-memory tiles feed both QK and PV with the
+original FP8 Q, with no BF16 query expansion/scratch in mixed or window-only mode
+and no full converted cache. Sink-free normalized FP32 source O and log2 LSE are
+jointly merged; the sink is applied once before public BF16 O / FP32 natural-log
+LSE publication. Window-only additionally omits global source states. The internal
+`source_state_store` hook is restricted to this nonfinalizing 1CTA direct-index
+topology; it does not add a public FP32 native output mode and cannot be combined
+with output quantization. The concrete `Fp4Fp8KvProducer` /
+`Fp4Fp8SmemKvResource` in `prims_ts_resources.py` publish selected main tiles
+through retained FP8 stages, with all-writer AsyncThread-to-UMMA signaling and
+per-writer fences. The same file's BF16 `Fp4KvProducer` / `Fp4SmemKvResource`
+remain unchanged for compatibility; neither producer contains MXFP8 SWA staging.
 `prims_ts_mxfp8_resources.py` adds only the E8M0 SWA conversion, tagged mixed-source
-routing and packed launcher, reusing the concrete FP4 resource's stores and
-pipeline through a narrow subclass. The compatibility mode uses BF16 Q/K/V/P,
-BK64 and fused split-1 finalization, with its own plan and JIT namespace. Neither
+routing and packed launcher, reusing the BF16 FP4 resource's stores and pipeline
+through a narrow subclass. The compatibility mode retains BF16 Q/K/V/P, BK64 and
+fused split-1 finalization, with its own plan and JIT namespace. Neither
 example nor benchmark selects it unless `--prims-ts-mode mxfp8` is supplied
 alongside the explicit Prims-TS backend; the mode default is `fp8`.
 It does not broaden `BatchSparseMLADecodePagedTSWrapper`: that native wrapper
@@ -502,6 +508,65 @@ still accepts matching native BF16 or E4M3 Q/KV, not packed quantized
 cache inputs. Its existing toolchain contract is unchanged. See
 [`SPARSE.md`](flashinfer/attention/prims_ts/kernels/mla_decode/SPARSE.md).
 
+Current native FP64 references apply the selected-main E4M3 clamp/round before
+both logits and V. All native modes, including main-only, use the unchanged
+componentwise FP8 probability-rounding bound, strict sink-exclusive LSE and exact
+empty gates, not BF16 main-only gates. The joint KV maximum bounds both FP8 source
+passes' local maxima, so the existing summed underflow bound remains conservative.
+Frost and optional BF16-Q/MXFP8 references, BF16 values and gates are unchanged.
+The current FP8-main snapshot passed the B200/4.8/13.4 GPU matrices recorded
+below. Examples and benchmarks have not run; no performance or checkpoint/
+full-model qualification is claimed.
+
+Current FP8-main CPU/static acceptance on 2026-10-16 passed **321 cases**
+(146 source-state/resource/adapter/oracle, 37 optional-MXFP8, 7 conversion-lifetime,
+85 benchmark/example-default, 40 native host and 6 unknown-backend contracts).
+The fresh `-I -B -S` process used the existing Python 3.12.3 / Torch 2.11.0+cu128 /
+DSL 4.8.0 overlay / bundled compiler metadata 13.4, static `sm_100`, thread caps
+and disabled plugin autoload/JIT. Pytest/strict exits were 0, with no failures,
+errors, skips or intercepted CUDA/JIT calls and uninitialized Torch CUDA.
+The latest rerun includes the probe's flat rank-one tuple-layout regression after
+the GPU failure below. Exact ordered JUnit identities, all 154 fingerprints, Git
+state and CUDA visibility matched through independent postflight, before these
+validation-note edits. This guarded Torch/CuTe matrix is host-only, not GPU/JIT
+qualification. See the example README for records and runnable GPU commands.
+
+Current FP8-main GPU validation on 2026-10-16 passed on one allocated B200 /
+148 SMs in `umb-b200-263` (job `5049128`, DSL 4.8.0 / bundled compiler 13.4):
+isolated capture **1/1**, smoke **27/27**, full **271/271** (157 decode / 48 cache /
+66 native sparse MLA) and independent selected dense **57/57**, with no failures,
+errors or skips. Both real-stage conversion branches and analytic rounding/
+saturation/underflow graph replay passed. Separate changed-data replay covered
+all global widths `0/64/.../512`. Full reported 1651 warnings in 3502.50 seconds;
+dense reported 980 in 1243.21 seconds. Every phase exited 0; Slurm root/batch/extern completed
+with `0:0`. Independent corroboration matched exact ordered JUnit identities,
+complete setup/call/teardown reports, all 5871 frozen fingerprints, Git state and
+scheduler visibility before these validation-note edits. Numerical gates and
+default GC/capture settings were unchanged. The independent report has
+`default_gpu_qualification=true`, with no evidence errors. The allocation used
+1h36m04s of the three-GPU-hour budget. This qualifies only the tested B200/4.8/13.4
+snapshot and selected dense subset, not the entire dense suite, other hardware/
+toolchains or checkpoint/full-model behavior. Examples and benchmarks have not
+run; no performance claim is made. See the example README for records.
+
+The earlier allocated B200 attempt on `umb-b200-263` (job `5048418`, DSL 4.8.0 / bundled
+compiler 13.4) passed the exact 271-case collection and isolated legacy capture
+1/1, then failed the first new FP4-to-FP8 byte probe during JIT: a scalar CuTe
+layout shape reached `cutlass.make_array_view`, raising `TypeError: object of
+type 'int' has no len()`. No conversion kernel launched or accuracy check ran;
+smoke reported 1 failed, pytest exited 1 and Slurm recorded `FAILED` / `1:0`.
+Full and dense phases were skipped by the smoke prerequisite gate. All 5772
+frozen fingerprints and Git state matched through independent terminal
+corroboration, with recorded default GC/capture settings and visibility unchanged.
+The probe now uses a flat one-element shape tuple; arithmetic, byte expectations
+and gates are unchanged. The corrected probe and FP8-main attention subsequently
+passed job `5049128` above; the earlier failed evidence is unchanged. Earlier
+jobs `5047536` and `5047995` executed no cases because
+of wrapper-only maxfail/forecast defects. See the example README for all records.
+
+**Historical validation (pre-FP8-main):** the 257-case GPU and 299-case CPU results
+below do not qualify current main conversion/staging/attention. The native FP8
+snapshots used BF16 main attention and exact BF16 query expansion.
 Native-first reorganization acceptance on 2026-10-15 passed **213 CPU cases**
 (127 source-state/adapter/oracle, 6 conversion-lifetime, 34 stdlib-only
 benchmark/example, 40 native host and 6 unknown-backend contracts) with the
@@ -600,12 +665,13 @@ no evidence errors and no nonpassing phases; neither frozen inputs nor the
 original report was rewritten. See the README for report paths and coverage
 limits. This successful regression does not establish exhaustive JIT ownership
 or historical runtime-unload return-status attribution.
-The tests include all global widths 0/64/.../512, source precision, exact query
-expansion and changed-data graph replay.
-Their independent FP64 oracle uses the native per-component FP8 rounding bound,
-strict sink-exclusive LSE and exact empty gates; global-only retains strict BF16
-checks. Legacy helpers/tolerances are unchanged. The following 207/57-case B200
-results predate this ordinary-FP8 change and do not qualify the new path.
+Those pre-FP8-main tests included all global widths 0/64/.../512, source precision,
+exact BF16 query expansion and changed-data graph replay. Their independent FP64
+oracle used the native per-component FP8 rounding bound, strict sink-exclusive
+LSE and exact empty gates; global-only then retained strict BF16 checks. Current
+native main-only uses the E4M3 reference/bound instead. Legacy helpers/tolerances
+are unchanged. The following 207/57-case B200 results additionally predate ordinary
+FP8 SWA and do not qualify current FP8-main staging/attention.
 Historical writer/decode integration covers both backends, window-only and global
 widths 128/192/512, with CUDA Graph replay and exact encoded-byte references;
 all eight expanded legacy integration cases passed in the full B200 run below.
@@ -662,9 +728,10 @@ pytest exited 0 and Slurm completed with exit `0:0`. All three preceding smoke
 cases passed and belong to the same 57-case manifest. Exact case identities and
 all 111 source fingerprints matched through final postflight, before validation
 notes changed; GPU visibility and independent accuracy gates were unchanged.
-These runs qualify the tested B200/4.8/13.4 matrix and selected dense subset,
-not the entire dense GPU suite, DSL 4.7 GPU execution, other GPU/toolchain
-combinations or checkpoint/full-model behavior.
+These runs qualify only their tested pre-FP8-main B200/4.8/13.4 snapshots and
+selected dense subset, not current native main conversion/attention, the entire
+dense GPU suite, DSL 4.7 GPU execution, other GPU/toolchain combinations or
+checkpoint/full-model behavior.
 A follow-up static implementation review found no confirmed correctness defects
 in the reviewed adapter/shared-kernel/API/test-harness scope; this is not new GPU
 qualification. Six unknown-backend CPU cases passed separately with each of DSL

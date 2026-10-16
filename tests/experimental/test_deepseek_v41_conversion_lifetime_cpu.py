@@ -72,7 +72,12 @@ def test_conversion_module_teardown_does_not_hide_errors():
 
 
 @pytest.mark.parametrize(
-    "name", ["test_native_fp4_all_finite_codes", "test_mxfp8_all_finite_codes"]
+    "name",
+    [
+        "test_native_fp4_all_finite_codes",
+        "test_fp4_fp8_all_finite_codes",
+        "test_mxfp8_all_finite_codes",
+    ],
 )
 def test_conversion_probe_registers_owner_before_launch(name):
     tree = ast.parse(_SOURCE.read_text())

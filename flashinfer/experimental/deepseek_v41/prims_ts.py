@@ -25,9 +25,9 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
         MlaProfile,
     )
     from .prims_ts_fp8 import Fp32SourceStore
-    from .prims_ts_resources import Fp4KvProducer
+    from .prims_ts_resources import Fp4Fp8KvProducer
 
-    def source(dtype, capacity, tile_k, producer=None):
+    def source(name, capacity, producer=None):
         attention = ThroughputLatencyMlaDecodeTs(
             batch_size=1,
             num_heads=64,
@@ -37,10 +37,10 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
             rope_dim=0,
             page_size=1,
             max_active_clusters=sm_count,
-            qkv_dtype=dtype,
+            qkv_dtype="e4m3",
             out_dtype="bf16",
             profile=MlaProfile(
-                name="dsv41_fp8_swa_source" if dtype == "e4m3" else "dsv41_fp4_source",
+                name=name,
                 kernel_variant="keeps_mma_ab",
                 tile_size_q=64,
                 use_persistent_scheduler=0,
@@ -62,7 +62,7 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
                 direct_inputs=True,
                 reuse_kv=True,
                 reuse_kv_stages=8,
-                kv_tile_size=tile_k,
+                kv_tile_size=128,
                 page_pipeline_stages=1,
             ),
             finalize_output=False,
@@ -73,15 +73,14 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
         attention.direct_sparse_capacities = (capacity, 0)
         return attention
 
-    # FP8 requires BK128 and four D128 stages. Eight stages retain two full
-    # tiles; the independent global FP4 producer keeps its BK64 topology.
-    swa = source("e4m3", 128, 128)
+    # Both sources use native FP8 BK128 with four D128 stages per tile.
+    # The main producer rounds selected scaled FP4 tiles into E4M3 SMEM.
+    swa = source("dsv41_fp8_swa_source", 128)
     main = (
         source(
-            "bf16",
+            "dsv41_fp4_fp8_source",
             compressed_k,
-            64,
-            Fp4KvProducer(native_fp4=native_fp4),
+            Fp4Fp8KvProducer(native_fp4=native_fp4),
         )
         if compressed_k
         else None
@@ -128,7 +127,6 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
         )
 
     q = query(cutlass.Float8E4M3FN)
-    expanded_q = query(cutlass.BFloat16)
     out = query(cutlass.BFloat16)
     swa = cute.runtime.make_fake_tensor(
         cutlass.Float8E4M3FN,
@@ -168,7 +166,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     sink = f(cutlass.Float32, (64,), assumed_align=16)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     signature = (
-        "dsv41_unit_e4m3_q_swa512_fp32_sources_v1",
+        "dsv41_unit_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v2",
         swa_attention.compile_signature(),
         global_attention.compile_signature() if global_attention is not None else None,
         "source_o_fp32",
@@ -181,12 +179,11 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     native_root = Path(kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
-        f"h64_d512_swa128_c{compressed_k}_keep_bk128_globalbk64_kv8_split1_i64"
-        f"_fp32src_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
+        f"h64_d512_swa128_c{compressed_k}_keep_bk128_globalbk128_kv8_split1_i64"
+        f"_fp4e4m3_fp32src_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
             decode_kernel,
             q,
-            expanded_q,
             swa,
             global_cache,
             wi,
@@ -271,7 +268,6 @@ class _Plan:
     part_c: object
     lse_s: torch.Tensor
     lse_c: object
-    expanded_q: object
     empty_cache: torch.Tensor
     empty_indices: torch.Tensor
 
@@ -315,7 +311,6 @@ def _decode_fp8(
                 part_c=allocate((batch, 64, 512), torch.float32) if ck else None,
                 lse_s=allocate((batch, 64), torch.float32),
                 lse_c=allocate((batch, 64), torch.float32) if ck else None,
-                expanded_q=allocate(q.shape, torch.bfloat16) if ck else None,
                 empty_cache=allocate((1, 64, 1, 288), torch.uint8),
                 empty_indices=torch.full(
                     (batch, 64), -1, device=q.device, dtype=torch.int32
@@ -337,7 +332,6 @@ def _decode_fp8(
                 plan.part_c,
                 plan.lse_s,
                 plan.lse_c,
-                plan.expanded_q,
                 plan.empty_cache,
                 plan.empty_indices,
             )
@@ -349,15 +343,13 @@ def _decode_fp8(
             raise ValueError("DS4.1 decode is inference-only")
         main = plan.empty_cache if global_cache is None else global_cache
         ids = plan.empty_indices if global_indices is None else global_indices
-        # Window-only has no BF16 query scratch or global states. The unused
-        # tensor ABI slots alias existing buffers; its compiled branch cannot
-        # read them. Final O always has the public BF16 dtype, independent of Q.
-        expanded_q = plan.out if plan.expanded_q is None else plan.expanded_q
+        # Window-only omits global states. Unused source-state ABI slots alias
+        # existing buffers; its compiled branch cannot read them. Both passes
+        # consume the original FP8 Q; only public O is rounded to BF16.
         part_c = plan.part_s if plan.part_c is None else plan.part_c
         lse_c = plan.lse_s if plan.lse_c is None else plan.lse_c
         plan.kernel(
             q.permute(2, 3, 1, 0),
-            expanded_q.permute(2, 3, 1, 0),
             swa_cache.view(-1, 1, 512).permute(1, 2, 0),
             main.view(-1),
             swa_indices.view(batch, 128),
