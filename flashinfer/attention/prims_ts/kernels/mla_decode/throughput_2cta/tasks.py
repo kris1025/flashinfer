@@ -39,6 +39,7 @@ The BF16 register roles are:
 """
 
 from collections.abc import Callable
+import inspect
 
 import cutlass
 import cutlass.cute as cute
@@ -76,6 +77,22 @@ from ..helpers.schedule import (
     staged_qk_mma,
     staged_qk_mma_k_tile,
     work_queue_tail,
+)
+
+
+# DSL 4.8 stores the resource context on Task instead of forwarding it through
+# these execution methods. Keep the installed 4.7 calling convention intact.
+_PRE_WORK_LOOP_ACCEPTS_CONTEXT = (
+    "context" in inspect.signature(Task._run_pre_work_loop_entries).parameters
+)
+_POST_WORK_LOOP_ACCEPTS_CONTEXT = (
+    "context" in inspect.signature(Task._run_post_work_loop_entries).parameters
+)
+_TASK_BODY_ACCEPTS_CONTEXT = (
+    "context" in inspect.signature(Task._run_task_body_impl).parameters
+)
+_STAGE_INFO_ACCEPTS_CONTEXT = (
+    "context" in inspect.signature(Task._create_stage_info).parameters
 )
 
 
@@ -162,7 +179,10 @@ class MlaTask(Task):
         # Keep task bodies on that cached value so page-offset/TMA/MMA/softmax
         # paths do not each rebuild the same split-KV arithmetic.
         self.domain = work_tile.k_tile_count
-        self._run_task_body_impl(work_tile, context=context)
+        if cutlass.const_expr(_TASK_BODY_ACCEPTS_CONTEXT):
+            self._run_task_body_impl(work_tile, context=context)
+        else:
+            self._run_task_body_impl(work_tile)
 
     @cute.jit
     def _drain_mla_work_tile_tails(self) -> None:
@@ -205,13 +225,19 @@ class MlaTask(Task):
         if cutlass.const_expr(not params.is_persistent):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-            self._run_pre_work_loop_entries(work_tile, context)
+            if cutlass.const_expr(_PRE_WORK_LOOP_ACCEPTS_CONTEXT):
+                self._run_pre_work_loop_entries(work_tile, context)
+            else:
+                self._run_pre_work_loop_entries(work_tile)
             # Runtime K/Q metadata can make a statically launched split empty.
             # Keep the CTA on the ordinary initialized-pipeline path, but skip
             # its captured HEAD/LOOP/TAIL data work when the domain is zero.
             if work_tile.k_tile_count > cutlass.Int32(0):
                 self._run_one_mla_work_tile(work_tile, context)
-            self._run_post_work_loop_entries(work_tile, context)
+            if cutlass.const_expr(_POST_WORK_LOOP_ACCEPTS_CONTEXT):
+                self._run_post_work_loop_entries(work_tile, context)
+            else:
+                self._run_post_work_loop_entries(work_tile)
             self._drain_mla_work_tile_tails()
             return
 
@@ -225,7 +251,10 @@ class MlaTask(Task):
         work_tile = self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile, context)
+        if cutlass.const_expr(_PRE_WORK_LOOP_ACCEPTS_CONTEXT):
+            self._run_pre_work_loop_entries(work_tile, context)
+        else:
+            self._run_pre_work_loop_entries(work_tile)
         while current_work_linear_idx < num_blocks:
             work_tile.update_from(
                 self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
@@ -248,7 +277,10 @@ class MlaTask(Task):
             self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         )
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_post_work_loop_entries(work_tile, context)
+        if cutlass.const_expr(_POST_WORK_LOOP_ACCEPTS_CONTEXT):
+            self._run_post_work_loop_entries(work_tile, context)
+        else:
+            self._run_post_work_loop_entries(work_tile)
         self._drain_mla_work_tile_tails()
 
 
@@ -282,7 +314,10 @@ class MlaInterleavedTask(MlaTask):
         ) // cutlass.Int32(2)
         self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
         self.domain = self._fixed_loop_end
-        self._run_task_body_impl(work_tile, context=context)
+        if cutlass.const_expr(_TASK_BODY_ACCEPTS_CONTEXT):
+            self._run_task_body_impl(work_tile, context=context)
+        else:
+            self._run_task_body_impl(work_tile)
         self._cumulative_k_parity = (
             self._cumulative_k_parity + self._actual_domain
         ) % cutlass.Int32(2)
@@ -302,18 +337,31 @@ class MlaInterleavedTask(MlaTask):
     ) -> StageInfo:
         """Return base pipeline state with the work tile's actual K offset."""
 
-        base_info = Task._create_stage_info(
-            self,
-            resource,
-            idx,
-            work_tile,
-            is_producer,
-            resolved_domain,
-            label,
-            schedule_stage,
-            routing_slot,
-            context=context,
-        )
+        if cutlass.const_expr(_STAGE_INFO_ACCEPTS_CONTEXT):
+            base_info = Task._create_stage_info(
+                self,
+                resource,
+                idx,
+                work_tile,
+                is_producer,
+                resolved_domain,
+                label,
+                schedule_stage,
+                routing_slot,
+                context=context,
+            )
+        else:
+            base_info = Task._create_stage_info(
+                self,
+                resource,
+                idx,
+                work_tile,
+                is_producer,
+                resolved_domain,
+                label,
+                schedule_stage,
+                routing_slot,
+            )
         actual_loop_offset = self._mapped_domain_start + (
             cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)
         )

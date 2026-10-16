@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Independent FP64 oracle and changed-input replay for CuTe DS4.1 decode."""
+"""Independent FP64 oracle and changed-input replay for both DS4.1 backends."""
 
 import builtins
 import dataclasses
@@ -12,10 +12,31 @@ import torch
 from flashinfer.deepseek_v41 import deepseek_v41_decode, deepseek_v41_window_decode
 
 
-def gate():
+def gate(backend="cute-dsl"):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("CuTe DS4.1 decode validation targets SM100")
+        pytest.skip("DS4.1 decode validation targets SM100")
     pytest.importorskip("cutlass.experimental.primitives")
+    if backend == "prims-ts":
+        import cutlass
+        from packaging.version import Version
+
+        if Version(cutlass.__version__) < Version("4.8.0"):
+            pytest.skip("Prims-TS requires CuTe-DSL >= 4.8.0")
+        if cutlass.CUDA_VERSION.major < 13:
+            pytest.skip("Prims-TS requires the bundled CUDA 13 compiler")
+
+
+@pytest.fixture
+def conversion_kernels():
+    # CuTe's standalone executor has a bound-method cycle. Unload these local
+    # probe modules at teardown, not during a later test's CUDA Graph capture.
+    kernels = []
+    try:
+        yield kernels
+    finally:
+        for compiled in kernels:
+            if compiled.jit_module is not None:
+                compiled.jit_module.unload()
 
 
 def pack(data, scales, width):
@@ -125,6 +146,51 @@ def check(args, out, lse):
     assert torch.equal(out[:, 0][empty], torch.zeros_like(out[:, 0][empty]))
 
 
+@pytest.mark.parametrize("backend", ["auto", "unknown", None])
+@pytest.mark.parametrize("window_only", [False, True])
+def test_unknown_backend(backend, window_only):
+    # Reject selectors before importing a kernel or checking CUDA inputs.
+    with pytest.raises(ValueError, match="backend must"):
+        if window_only:
+            deepseek_v41_window_decode(None, None, None, None, backend=backend)
+        else:
+            deepseek_v41_decode(None, None, None, None, None, None, backend=backend)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl"])
+def test_prepare_plan_before_capture(backend, monkeypatch):
+    gate(backend)
+    args = make_case(1, 64)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(ValueError, match="prepare a decode plan before CUDA Graph"):
+        deepseek_v41_decode(*args, backend=backend)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
+@pytest.mark.parametrize("window_only", [False, True])
+def test_cross_backend_plan_rejected(backend, window_only):
+    gate("prims-ts")
+    compressed = 0 if window_only else 64
+    cases = {
+        "cute-dsl": make_case(1, compressed),
+        "prims-ts": make_fp8_case(1, compressed),
+    }
+
+    def run(selected_backend, plan=None):
+        args = cases[selected_backend]
+        if window_only:
+            return deepseek_v41_window_decode(
+                args[0], args[1], args[3], args[5], backend=selected_backend, plan=plan
+            )
+        return deepseek_v41_decode(*args, backend=selected_backend, plan=plan)
+
+    other_backend = "prims-ts" if backend == "cute-dsl" else "cute-dsl"
+    _, _, plan = run(other_backend)
+    with pytest.raises(ValueError, match="mismatch"):
+        run(backend, plan=plan)
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize(
     "batch,compressed_k",
     [
@@ -133,7 +199,7 @@ def check(args, out, lse):
         (64, 512),
         (128, 512),
         (129, 512),
-        pytest.param(None, 512, id="uneven-persistent"),
+        pytest.param(None, 512, id="sm-count-plus-one"),
         (256, 512),
         (512, 512),
         (4, 0),
@@ -142,10 +208,10 @@ def check(args, out, lse):
         (8, 192),
     ],
 )
-def test_decode_changed_graph_and_fp64(batch, compressed_k, monkeypatch):
-    gate()
+def test_decode_changed_graph_and_fp64(batch, compressed_k, backend, monkeypatch):
+    gate(backend)
     if batch is None:
-        # Exercise CTAs with unequal request counts on the current GPU.
+        # Span more than one SM wave; Frost also covers uneven persistent work.
         batch = torch.cuda.get_device_properties("cuda").multi_processor_count + 1
     original_import = builtins.__import__
 
@@ -156,12 +222,14 @@ def test_decode_changed_graph_and_fp64(batch, compressed_k, monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", no_old_decode)
     args = make_case(batch, compressed_k)
-    out, lse, plan = deepseek_v41_decode(*args)
+    out, lse, plan = deepseek_v41_decode(*args, backend=backend)
 
     def run():
         if compressed_k:
-            return deepseek_v41_decode(*args, plan=plan)
-        return deepseek_v41_window_decode(args[0], args[1], args[3], args[5], plan=plan)
+            return deepseek_v41_decode(*args, plan=plan, backend=backend)
+        return deepseek_v41_window_decode(
+            args[0], args[1], args[3], args[5], plan=plan, backend=backend
+        )
 
     check(args, out, lse)
     stream = torch.cuda.Stream()
@@ -201,50 +269,79 @@ def test_decode_changed_graph_and_fp64(batch, compressed_k, monkeypatch):
     with pytest.raises(AssertionError):
         check(args, out, torch.zeros_like(lse))
     with pytest.raises(ValueError, match="overlap"):
-        deepseek_v41_decode(*args, plan=dataclasses.replace(plan, out=args[0]))
+        deepseek_v41_decode(
+            *args, plan=dataclasses.replace(plan, out=args[0]), backend=backend
+        )
     with pytest.raises(ValueError, match="mismatch"):
-        deepseek_v41_decode(*args, plan=object())
+        deepseek_v41_decode(*args, plan=object(), backend=backend)
     with pytest.raises(ValueError, match="inference"):
-        deepseek_v41_decode(args[0].requires_grad_(), *args[1:], plan=plan)
+        deepseek_v41_decode(
+            args[0].requires_grad_(), *args[1:], plan=plan, backend=backend
+        )
 
 
-def test_empty_uninitialized_cache_and_declaration_guards():
-    gate()
+@pytest.mark.parametrize("backend", ["cute-dsl"])
+def test_empty_uninitialized_cache_and_declaration_guards(backend):
+    gate(backend)
     args = make_case(2, 512)
     args[1].fill_(255)
     args[2].fill_(255)
     args[3].fill_(-1)
     args[4].fill_(2**31 - 1)
     args[5].fill_(-float("inf"))
-    out, lse, _ = deepseek_v41_decode(*args)
+    out, lse, _ = deepseek_v41_decode(*args, backend=backend)
     assert torch.equal(out, torch.zeros_like(out))
     assert torch.isneginf(lse).all()
     with pytest.raises(ValueError, match="Q must"):
-        deepseek_v41_decode(args[0].expand(-1, 2, -1, -1).contiguous(), *args[1:])
+        deepseek_v41_decode(
+            args[0].expand(-1, 2, -1, -1).contiguous(), *args[1:], backend=backend
+        )
     with pytest.raises(ValueError, match="page size"):
-        deepseek_v41_decode(args[0], args[1].view(-1, 32, 1, 528), *args[2:])
+        deepseek_v41_decode(
+            args[0], args[1].view(-1, 32, 1, 528), *args[2:], backend=backend
+        )
+    with pytest.raises(ValueError, match="both be present"):
+        deepseek_v41_decode(
+            args[0], args[1], None, args[3], args[4], args[5], backend=backend
+        )
+    with pytest.raises(ValueError, match="SWA indices"):
+        deepseek_v41_decode(*args[:3], args[3].long(), *args[4:], backend=backend)
+    with pytest.raises(ValueError, match="global indices"):
+        deepseek_v41_decode(
+            *args[:4], args[4][..., :63].contiguous(), args[5], backend=backend
+        )
+    with pytest.raises(ValueError, match="sink must"):
+        deepseek_v41_decode(*args[:5], args[5].double(), backend=backend)
+    misaligned = torch.empty(
+        args[0].numel() + 1, device=args[0].device, dtype=args[0].dtype
+    )[1:].view_as(args[0])
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        deepseek_v41_decode(misaligned, *args[1:], backend=backend)
     with pytest.raises(TypeError):
-        deepseek_v41_decode(*args, arithmetic="bf16x3")
+        deepseek_v41_decode(*args, arithmetic="bf16x3", backend=backend)
 
 
+@pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize("batch", [128, 256])
-def test_cache_offsets_above_two_gib(batch):
-    gate()
+@pytest.mark.parametrize("pool_index,width,ids_index", [(1, 528, 3), (2, 288, 4)])
+def test_cache_offsets_above_two_gib(batch, backend, pool_index, width, ids_index):
+    gate(backend)
     args = make_case(batch, 512)
-    main = args[2]
+    small = args[pool_index]
     # Leave the prefix uninitialized: only the copied tail is a valid slot.
     # The independent oracle still reads the original small encoded pool.
-    first_page = (2**31 + 64 * 288 - 1) // (64 * 288)
+    page_bytes = 64 * width
+    first_page = (2**31 + page_bytes - 1) // page_bytes
     large = torch.empty(
-        (first_page + main.shape[0], 64, 1, 288),
+        (first_page + small.shape[0], 64, 1, width),
         device="cuda",
         dtype=torch.uint8,
     )
-    large[first_page:].copy_(main)
-    shifted = args[4] + first_page * 64
-    out, lse, _ = deepseek_v41_decode(
-        args[0], args[1], large, args[3], shifted, args[5]
-    )
+    large[first_page:].copy_(small)
+    actual = list(args)
+    actual[pool_index] = large
+    actual[ids_index] = args[ids_index] + first_page * 64
+    out, lse, _ = deepseek_v41_decode(*actual, backend=backend)
     check(args, out, lse)
 
 
@@ -275,11 +372,11 @@ def test_persistent_metadata_capacity_boundary(
     actual = list(args)
     actual[pool_index] = large
     actual[ids_index] = args[ids_index] + first_page * 64
-    out, lse, plan = deepseek_v41_decode(*actual)
+    out, lse, plan = deepseek_v41_decode(*actual, backend="cute-dsl")
     check(args, out, lse)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_decode(*actual, plan=plan)
+        deepseek_v41_decode(*actual, plan=plan, backend="cute-dsl")
     args[0].mul_(0.75)
     args[ids_index].copy_(args[ids_index].flip(-1))
     actual[ids_index].copy_(actual[ids_index].flip(-1))
@@ -289,6 +386,7 @@ def test_persistent_metadata_capacity_boundary(
     check(args, out, lse)
 
 
+@pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize(
     "levels",
     [
@@ -298,16 +396,16 @@ def test_persistent_metadata_capacity_boundary(
     ],
 )
 @pytest.mark.parametrize("batch", [16, 128, 256])
-def test_normalization_anchor_crossings(levels, batch):
-    gate()
+def test_normalization_anchor_crossings(levels, batch, backend):
+    gate(backend)
     q, swa, main, wi, ci, sink = make_case(batch, 512)
     # Exact scalar products with head-dependent signs exercise differing
     # rescale decisions in the same warp. Last tile introduces a new maximum.
     head_scale = torch.linspace(-0.75, 1.25, 64, device=q.device).bfloat16()
     q.copy_(head_scale[None, None, :, None].expand_as(q))
     if batch > 128:
-        # Persistent CTAs must reset row statistics and O when their next
-        # request reverses which heads need normalization-anchor changes.
+        # Reverse normalization-anchor patterns across requests. Frost's
+        # persistent CTAs must reset row statistics and O between requests.
         q[batch // 2 :].mul_(-0.5)
     wd = (
         torch.zeros((128, 512), device=q.device)
@@ -338,25 +436,24 @@ def test_normalization_anchor_crossings(levels, batch):
     )
     sink.fill_(-float("inf"))
     args = (q, swa, main, wi, ci, sink)
-    out, lse, _ = deepseek_v41_decode(*args)
+    out, lse, _ = deepseek_v41_decode(*args, backend=backend)
     check(args, out, lse)
 
 
-def test_fp4_conversion_fallback():
-    gate()
+@pytest.mark.parametrize("backend", ["cute-dsl"])
+def test_fp4_conversion_fallback(backend):
+    gate(backend)
+    args = make_case(128, 512)
+    _, _, plan = deepseek_v41_decode(*args, backend=backend)
     from flashinfer.experimental.deepseek_v41.decode import _compile
 
-    args = make_case(128, 512)
-    _, _, plan = deepseek_v41_decode(*args)
-    fallback = dataclasses.replace(
-        plan,
-        kernel=_compile(args[0].device.index, 512, False, 16, 2, False, False),
-    )
-    out, lse, _ = deepseek_v41_decode(*args, plan=fallback)
+    compiled = _compile(args[0].device.index, 512, False, 16, 2, False, False)
+    fallback = dataclasses.replace(plan, kernel=compiled)
+    out, lse, _ = deepseek_v41_decode(*args, plan=fallback, backend=backend)
     check(args, out, lse)
 
 
-def test_native_fp4_all_finite_codes():
+def test_native_fp4_all_finite_codes(conversion_kernels):
     gate()
     import cuda.bindings.driver as cuda
     import cutlass
@@ -398,6 +495,7 @@ def test_native_fp4_all_finite_codes():
     tensors = [from_dlpack(x) for x in (words, scales, out)]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(launch, *tensors, stream)
+    conversion_kernels.append(compiled)
     compiled(*tensors, stream)
     lut = torch.tensor(
         [0.0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
@@ -410,10 +508,11 @@ def test_native_fp4_all_finite_codes():
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize("scale_code", [0, 1, 127])
 @pytest.mark.parametrize("batch,compressed_k", [(1, 0), (128, 512), (None, 512)])
-def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code):
-    gate()
+def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code, backend):
+    gate(backend)
     if batch is None:
         batch = torch.cuda.get_device_properties(0).multi_processor_count + 1
     # 256 * E8M0(code) is normal BF16 even for code 0. Choose Q so every
@@ -440,17 +539,17 @@ def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code):
     )
     sink = torch.full((64,), -math.inf, device="cuda")
     args = q, swa, main, wi, ci, sink
-    out, lse, plan = deepseek_v41_decode(*args)
+    out, lse, plan = deepseek_v41_decode(*args, backend=backend)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_decode(*args, plan=plan)
+        deepseek_v41_decode(*args, plan=plan, backend=backend)
     expected_value = 256.0 * 2.0 ** (scale_code - 127)
     for replay in range(2):
         if replay:
             q.mul_(0.5)
         out.fill_(math.nan)
         lse.fill_(math.nan)
-        if plan.workspace is not None:
+        if backend == "cute-dsl" and plan.workspace is not None:
             plan.workspace.fill_(-1)
         graph.replay()
         # Absolute tolerance would hide the original all-zero output bug.
@@ -469,7 +568,7 @@ def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code):
         )
 
 
-def test_mxfp8_all_finite_codes():
+def test_mxfp8_all_finite_codes(conversion_kernels):
     gate()
     import cuda.bindings.driver as cuda
     import cutlass
@@ -530,6 +629,7 @@ def test_mxfp8_all_finite_codes():
     tensors = [from_dlpack(x) for x in (words, scales, out)]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(launch, *tensors, stream)
+    conversion_kernels.append(compiled)
     compiled(*tensors, stream)
     expected = (
         data.view(torch.float8_e4m3fn).double()
@@ -543,12 +643,13 @@ def test_mxfp8_all_finite_codes():
     )
 
 
+@pytest.mark.parametrize("backend", ["cute-dsl"])
 @pytest.mark.parametrize(
     "batch,compressed_k",
     [(1, 0), (1, 512), (16, 512), (128, 0), (128, 512), (None, 512)],
 )
-def test_finite_sink_overflow_changed_graph(batch, compressed_k):
-    gate()
+def test_finite_sink_overflow_changed_graph(batch, compressed_k, backend):
+    gate(backend)
     if batch is None:
         batch = max(128, torch.cuda.get_device_properties(0).multi_processor_count + 1)
     q_values = (torch.arange(64, device="cuda") - 32).to(torch.bfloat16) / 64
@@ -597,12 +698,12 @@ def test_finite_sink_overflow_changed_graph(batch, compressed_k):
         dtype=torch.float32,
     ).repeat(4)
     args = q, swa, main, wi, ci, sink
-    out, lse, plan = deepseek_v41_decode(*args)
+    out, lse, plan = deepseek_v41_decode(*args, backend=backend)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        deepseek_v41_decode(*args, plan=plan)
+        deepseek_v41_decode(*args, plan=plan, backend=backend)
     torch.cuda.current_stream().wait_stream(stream)
     for replay in range(3):
         if replay:
@@ -612,7 +713,7 @@ def test_finite_sink_overflow_changed_graph(batch, compressed_k):
             wi[0].fill_(-1)
         out.fill_(math.nan)
         lse.fill_(math.nan)
-        if plan.workspace is not None:
+        if backend == "cute-dsl" and plan.workspace is not None:
             plan.workspace.fill_(-1)
         graph.replay()
         # All real values are exactly one, so the output is their probability
@@ -634,3 +735,460 @@ def test_finite_sink_overflow_changed_graph(batch, compressed_k):
             rtol=0,
             atol=1e-5,
         )
+
+
+def make_fp8_case(batch, compressed):
+    q, _, main, wi, ci, sink = make_case(batch, compressed, seed=9175)
+    q = (q.float() * 0.5).to(torch.float8_e4m3fn)
+    swa = (torch.randn(8, 64, 1, 512, device=q.device) * 0.5).to(torch.float8_e4m3fn)
+    return q, swa, main, wi, ci, sink
+
+
+def fp8_oracle(q, swa, global_cache, wi, ci, sink):
+    """FP64 attention and the native componentwise FP8 rounding bound.
+
+    Use actual stored E4M3 Q/SWA and independent E2M1/E4M3 global decoding;
+    neither the adapter nor its query expansion/source states enter the oracle.
+    """
+    values, masks = [], []
+    for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
+        if pool is None:
+            continue
+        if not fp4:
+            decoded = pool.double().reshape(-1, 512)
+        else:
+            pages = pool.view(pool.shape[0], -1)
+            payload = pages[:, : 64 * 256].reshape(-1, 256)
+            codes = torch.stack((payload & 15, payload >> 4), dim=-1).reshape(-1, 512)
+            lut = torch.tensor(
+                [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+                device=q.device,
+                dtype=torch.float64,
+            )
+            scales = (
+                pages[:, 64 * 256 :]
+                .contiguous()
+                .view(torch.float8_e4m3fn)
+                .reshape(-1, 32)
+                .double()
+            )
+            decoded = lut[codes.long()] * scales.repeat_interleave(16, -1)
+        index = ids[:, 0].long()
+        valid = (index >= 0) & (index < decoded.shape[0]) & (index != 0x7FFFFFFF)
+        gathered = decoded[index.clamp(0, decoded.shape[0] - 1)]
+        values.append(torch.where(valid[..., None], gathered, 0))
+        masks.append(valid)
+    kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
+    logits = torch.einsum("bhd,bkd->bhk", q[:, 0].double(), kv) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -math.inf)
+    kv_lse = logits.logsumexp(-1)
+    normalizer = torch.logaddexp(kv_lse, sink.double()[None, :])
+    weights = torch.exp(logits - normalizer[..., None])
+    weights = torch.where(torch.isfinite(normalizer)[..., None], weights, 0)
+    expected = torch.einsum("bhk,bkd->bhd", weights, kv)
+    sensitivity = torch.einsum("bhk,bkd->bhd", weights, kv.abs())
+    max_logit = logits.max(-1).values
+    frame_mass = torch.exp(max_logit - normalizer)
+    frame_mass = torch.where(torch.isfinite(kv_lse), frame_mass, 0)
+    underflow = frame_mass[..., None] * kv.abs().sum(1)[:, None, :]
+    bound = (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6
+    bound = torch.where(torch.isfinite(kv_lse)[..., None], bound, 0)
+    return expected, kv_lse, bound
+
+
+def check_fp8(out, lse, reference):
+    expected, expected_lse, bound = reference
+    assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert ((out[:, 0].double() - expected).abs() <= bound).all()
+    empty = torch.isneginf(expected_lse)
+    assert torch.equal(torch.isneginf(lse[..., 0]), empty)
+    torch.testing.assert_close(
+        lse[..., 0].double()[~empty], expected_lse[~empty], rtol=0, atol=1e-5
+    )
+    assert torch.equal(out[:, 0][empty], torch.zeros_like(out[:, 0][empty]))
+    assert torch.equal(bound[empty], torch.zeros_like(bound[empty]))
+
+
+def check_fp8_global_only(out, reference, wi, ci):
+    # This source still uses BF16 arithmetic: the FP8 componentwise bound must
+    # not hide a regression in the independent packed-FP4 global pass.
+    expected = reference[0]
+    global_only = (wi[:, 0] < 0).all(-1) & (ci[:, 0] >= 0).any(-1)
+    if global_only.any():
+        difference = out[:, 0].double()[global_only] - expected[global_only]
+        assert difference.norm() / expected[global_only].norm().clamp_min(1e-30) < 0.005
+        assert (
+            difference.abs().max() / expected[global_only].abs().max().clamp_min(1e-30)
+            < 0.01
+        )
+
+
+@pytest.mark.parametrize("compressed", list(range(0, 513, 64)))
+@pytest.mark.parametrize("batch", [1, 4])
+def test_fp8_swa_fp64_and_selection_counts(batch, compressed):
+    gate("prims-ts")
+    args = make_fp8_case(batch, compressed)
+    q, swa, main, wi, ci, sink = args
+    wi[..., ::11] = -1
+    wi[..., 1::17] = 0x7FFFFFFF
+    wi[..., 2::23] = swa.shape[0] * 64
+    wi[..., 3::29] = -17
+    wi[..., 4:8] = torch.tensor([63, 64, 64, 127], device=q.device, dtype=torch.int32)
+    if compressed:
+        ci[..., ::7] = -1
+        ci[..., 1::19] = 0x7FFFFFFF
+        ci[..., 2::31] = main.shape[0] * 64
+        ci[..., 3:7] = torch.tensor(
+            [63, 64, 64, 127], device=q.device, dtype=torch.int32
+        )
+    if batch > 1:
+        wi[0].fill_(-1)
+        wi[1].fill_(-1)
+        if compressed:
+            ci[0].fill_(-1)
+            ci[2].fill_(-1)
+    reference = fp8_oracle(*args)
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    check_fp8(out, lse, reference)
+    assert plan.part_s.dtype == torch.float32 and plan.lse_s.dtype == torch.float32
+    expected_counts = ((wi >= 0) & (wi < swa.shape[0] * 64)).sum((1, 2)).int()
+    torch.testing.assert_close(plan.swa_counts, expected_counts, rtol=0, atol=0)
+    assert (plan.swa_lengths == 128).all() and (plan.empty_lengths == 0).all()
+    if compressed:
+        expected_global = ((ci >= 0) & (ci < main.shape[0] * 64)).sum((1, 2)).int()
+        torch.testing.assert_close(plan.global_counts, expected_global, rtol=0, atol=0)
+        assert (plan.global_lengths == compressed).all()
+        assert plan.part_c.dtype == torch.float32 and plan.lse_c.dtype == torch.float32
+        torch.testing.assert_close(plan.expanded_q, q.bfloat16(), rtol=0, atol=0)
+        check_fp8_global_only(out, reference, wi, ci)
+    else:
+        assert plan.expanded_q is None and plan.part_c is None and plan.lse_c is None
+        assert (plan.global_counts == 0).all() and (plan.global_lengths == 0).all()
+        window_out, window_lse, _ = deepseek_v41_window_decode(
+            q, swa, wi, sink, plan=plan, backend="prims-ts"
+        )
+        check_fp8(window_out, window_lse, reference)
+
+
+@pytest.mark.parametrize("compressed", [0, 64, 192, 512])
+def test_fp8_swa_changed_graph(compressed):
+    gate("prims-ts")
+    args = make_fp8_case(4, compressed)
+    q, swa, main, wi, ci, sink = args
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    check_fp8(out, lse, fp8_oracle(*args))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        deepseek_v41_decode(*args, plan=plan, backend="prims-ts")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        deepseek_v41_decode(*args, plan=plan, backend="prims-ts")
+    torch.cuda.current_stream().wait_stream(stream)
+    for step in range(3):
+        q.copy_((torch.randn(q.shape, device=q.device) * 0.5).to(q.dtype))
+        wi.random_(0, swa.shape[0] * 64)
+        wi[..., step::4] = -1
+        wi[..., 1] = 0x7FFFFFFF
+        wi[..., 2] = swa.shape[0] * 64
+        if compressed:
+            ci.random_(0, main.shape[0] * 64)
+            ci[..., step::3] = -1
+            ci[..., 1] = 0x7FFFFFFF
+            ci[..., 2] = main.shape[0] * 64
+        sink.normal_()
+        sink[0], sink[1], sink[2] = 1000, -1000, -math.inf
+        if step == 1:
+            replacement = make_fp8_case(4, compressed)
+            swa.copy_(replacement[1])
+            if compressed:
+                main.copy_(replacement[2])
+        if step == 2:
+            wi[0].fill_(-1)
+            wi[1].fill_(-1)
+            if compressed:
+                ci[0].fill_(-1)
+                ci[2].fill_(-1)
+        for state in (plan.part_s, plan.part_c, plan.lse_s, plan.lse_c):
+            if state is not None:
+                state.fill_(math.nan)
+        for metadata in (
+            plan.selected_swa,
+            plan.selected_global,
+            plan.swa_counts,
+            plan.global_counts,
+            plan.swa_lengths,
+            plan.global_lengths,
+            plan.empty_lengths,
+        ):
+            metadata.fill_(0x7FFFFFFF)
+        if plan.expanded_q is not None:
+            plan.expanded_q.fill_(math.nan)
+        out.fill_(math.nan)
+        lse.fill_(math.nan)
+        graph.replay()
+        reference = fp8_oracle(*args)
+        check_fp8(out, lse, reference)
+        if compressed:
+            torch.testing.assert_close(plan.expanded_q, q.bfloat16(), rtol=0, atol=0)
+            check_fp8_global_only(out, reference, wi, ci)
+    # Eager calls may change addresses but retain the declaration and ownership.
+    replacement_args = tuple(None if x is None else x.clone() for x in args)
+    new_out, new_lse, _ = deepseek_v41_decode(
+        *replacement_args, plan=plan, backend="prims-ts"
+    )
+    assert new_out is out and new_lse is lse
+    check_fp8(out, lse, fp8_oracle(*replacement_args))
+    with pytest.raises(AssertionError):
+        check_fp8(torch.ones_like(out), lse, fp8_oracle(*replacement_args))
+    with pytest.raises(ValueError, match="overlap"):
+        deepseek_v41_decode(
+            *args, plan=dataclasses.replace(plan, out=q), backend="prims-ts"
+        )
+    aliased_q = plan.part_s.view(torch.float8_e4m3fn).flatten()[: q.numel()].view_as(q)
+    with pytest.raises(ValueError, match="overlap"):
+        deepseek_v41_decode(aliased_q, *args[1:], plan=plan, backend="prims-ts")
+
+
+@pytest.mark.parametrize("source", ["swa", "global"])
+def test_fp8_source_state_retains_fp32_precision(source):
+    gate("prims-ts")
+    q, swa, main, wi, ci, sink = make_fp8_case(1, 128 if source == "global" else 0)
+    q.view(torch.uint8).zero_()
+    swa.view(torch.uint8).zero_()
+    wi.fill_(-1)
+    sink.fill_(-math.inf)
+    if source == "swa":
+        swa.view(torch.uint8).reshape(-1, 512)[:19].fill_(0x38)  # exact E4M3 one
+        wi[..., :65] = torch.arange(65, device=q.device, dtype=torch.int32)
+    else:
+        # Do not assume the writer maps BF16 one to exact one. Construct
+        # independent E2M1=1 nibbles and E4M3=1 scale bytes in page-plane ABI.
+        data = torch.zeros(128, 256, device=q.device, dtype=torch.uint8)
+        data[:19].fill_(0x22)
+        scales = torch.full((128, 32), 0x38, device=q.device, dtype=torch.uint8)
+        main = pack(data, scales, 288)
+        ci.fill_(-1)
+        ci[..., :65] = torch.arange(65, device=q.device, dtype=torch.int32)
+    args = q, swa, main, wi, ci, sink
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    expected = torch.full((1, 64, 512), 19 / 65, device=q.device, dtype=torch.float64)
+    state = plan.part_s if source == "swa" else plan.part_c
+    torch.testing.assert_close(state.double(), expected, rtol=0, atol=1e-7)
+    assert (expected.bfloat16().double() - expected).abs().max() > 1e-7
+    source_lse = plan.lse_s if source == "swa" else plan.lse_c
+    torch.testing.assert_close(
+        source_lse.double(),
+        torch.full_like(source_lse, math.log2(65), dtype=torch.float64),
+        rtol=0,
+        atol=1e-6,
+    )
+    check_fp8(out, lse, fp8_oracle(*args))
+    torch.testing.assert_close(out[:, 0], expected.bfloat16(), rtol=0, atol=0)
+    if source == "global":
+        check_fp8_global_only(out, fp8_oracle(*args), wi, ci)
+
+
+@pytest.mark.parametrize("compressed", [0, 128])
+def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
+    gate("prims-ts")
+    from flashinfer.experimental.deepseek_v41 import decode as frost
+    from flashinfer.experimental.deepseek_v41 import prims_ts
+
+    recorded = []
+    factory = prims_ts._make_fp8_sources
+
+    def record(*args):
+        sources = factory(*args)
+        recorded.append(sources)
+        return sources
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ordinary FP8 must not compile Frost")
+
+    monkeypatch.setattr(prims_ts, "_make_fp8_sources", record)
+    monkeypatch.setattr(frost, "_compile", forbidden)
+    prims_ts._compile.cache_clear()
+    args = make_fp8_case(1, compressed)
+    out, lse, _ = deepseek_v41_decode(*args, backend="prims-ts")
+    check_fp8(out, lse, fp8_oracle(*args))
+    assert len(recorded) == 1
+    swa, main = recorded[0]
+    cfg = swa._make_config()
+    assert cfg.qkv_dtype == "e4m3" and cfg.is_fp8_qkv()
+    assert cfg.tile_size_q == 64 and cfg.tile_size_kv == 128
+    assert cfg.head_dim_per_stage_kv == 128 and cfg.kv_stages == 8
+    assert cfg.sparse_reuse_kv and cfg.sparse_direct and not cfg.fuse_sparse_epilogue
+    assert cfg.use_persistent_scheduler == 0 and cfg.num_ctas_per_seq_kv == 1
+    assert swa.kv_producer is None and swa.source_state_store is not None
+    assert (
+        swa.source_state_store.compile_signature()[0]
+        == "dsv41_fp32_normalized_source_v1"
+    )
+    assert swa.direct_sparse_capacities == (128, 0)
+    if compressed:
+        cfg = main._make_config()
+        assert cfg.qkv_dtype == "bf16" and cfg.tile_size_kv == 64
+        assert cfg.head_dim_per_stage_kv == 128 and cfg.kv_stages == 8
+        from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
+            Fp4KvProducer,
+        )
+
+        assert type(main.kv_producer) is Fp4KvProducer
+        assert main.source_state_store is not None
+        assert not cfg.fuse_sparse_epilogue and main.direct_sparse_capacities == (
+            compressed,
+            0,
+        )
+    else:
+        assert main is None
+
+
+def test_fp8_swa_fp4_conversion_fallback():
+    gate("prims-ts")
+    from flashinfer.experimental.deepseek_v41.prims_ts import _compile
+
+    args = make_fp8_case(4, 512)
+    args[3][0].fill_(-1)
+    _, _, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    fallback = dataclasses.replace(
+        plan, kernel=_compile(args[0].device.index, 512, native_fp4=False)
+    )
+    out, lse, _ = deepseek_v41_decode(*args, plan=fallback, backend="prims-ts")
+    reference = fp8_oracle(*args)
+    check_fp8(out, lse, reference)
+    check_fp8_global_only(out, reference, args[3], args[4])
+
+
+def test_fp8_swa_sink_applied_once():
+    gate("prims-ts")
+    q, swa, main, wi, ci, sink = make_fp8_case(1, 512)
+    q.view(torch.uint8).zero_()
+    swa.view(torch.uint8).fill_(0x38)
+    main = pack(
+        torch.full((512, 256), 0x22, device=q.device, dtype=torch.uint8),
+        torch.full((512, 32), 0x38, device=q.device, dtype=torch.uint8),
+        288,
+    )
+    wi.copy_(torch.arange(128, device=q.device, dtype=torch.int32).view(1, 1, 128))
+    ci.copy_(torch.arange(512, device=q.device, dtype=torch.int32).view(1, 1, 512))
+    sink.fill_(math.log(640))
+    out, lse, plan = deepseek_v41_decode(q, swa, main, wi, ci, sink, backend="prims-ts")
+    torch.testing.assert_close(
+        plan.part_s, torch.ones_like(plan.part_s), rtol=0, atol=1e-7
+    )
+    torch.testing.assert_close(
+        plan.part_c, torch.ones_like(plan.part_c), rtol=0, atol=1e-7
+    )
+    torch.testing.assert_close(out, torch.full_like(out, 0.5), rtol=0, atol=0)
+    check_fp8(out, lse, fp8_oracle(q, swa, main, wi, ci, sink))
+
+
+def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
+    gate("prims-ts")
+    from flashinfer.experimental.deepseek_v41 import prims_ts
+
+    args = make_fp8_case(2, 64)
+    args[1].view(torch.uint8).fill_(127)
+    args[2].fill_(255)
+    args[3].fill_(-1)
+    args[4].fill_(0x7FFFFFFF)
+    args[5].fill_(-math.inf)
+    out, lse, plan = deepseek_v41_decode(*args, backend="prims-ts")
+    check_fp8(out, lse, fp8_oracle(*args))
+    assert torch.equal(plan.part_s, torch.zeros_like(plan.part_s))
+    assert torch.equal(plan.part_c, torch.zeros_like(plan.part_c))
+    with pytest.raises(ValueError, match="Q must be BF16"):
+        deepseek_v41_decode(*args)
+    with pytest.raises(ValueError, match="page size"):
+        deepseek_v41_decode(args[0].bfloat16(), *args[1:], backend="prims-ts")
+    legacy = make_case(2, 64)
+    with pytest.raises(ValueError, match="E4M3 SWA"):
+        deepseek_v41_decode(args[0], legacy[1], *args[2:], backend="prims-ts")
+    _, _, frost_plan = deepseek_v41_decode(*legacy)
+    with pytest.raises(ValueError, match="mismatch"):
+        deepseek_v41_decode(*args, plan=frost_plan, backend="prims-ts")
+    with pytest.raises(ValueError, match="mismatch"):
+        deepseek_v41_decode(*legacy, plan=plan)
+    with pytest.raises(ValueError, match="requires explicit E4M3 Q"):
+        deepseek_v41_decode(*legacy, backend="prims-ts")
+    with pytest.raises(ValueError, match="mismatch"):
+        deepseek_v41_decode(*args, plan=object(), backend="prims-ts")
+
+    def no_compile(*args, **kwargs):
+        raise AssertionError("unprepared capture must reject before compilation")
+
+    monkeypatch.setattr(prims_ts, "_compile", no_compile)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.graph(graph),
+        pytest.raises(ValueError, match="before CUDA Graph capture"),
+    ):
+        deepseek_v41_decode(*args, backend="prims-ts")
+
+
+@pytest.mark.parametrize("source", ["swa", "global"])
+def test_fp8_swa_cache_offsets_above_two_gib(source):
+    gate("prims-ts")
+    args = make_fp8_case(1, 64)
+    index, width, ids_index = (1, 512, 3) if source == "swa" else (2, 288, 4)
+    small = args[index]
+    page_bytes = 64 * width
+    first_page = (2**31 + page_bytes - 1) // page_bytes
+    large = torch.empty(
+        (first_page + small.shape[0], 64, 1, width),
+        device=small.device,
+        dtype=small.dtype,
+    )
+    large[first_page:].copy_(small)
+    actual = list(args)
+    actual[index] = large
+    actual[ids_index] = args[ids_index] + first_page * 64
+    out, lse, _ = deepseek_v41_decode(*actual, backend="prims-ts")
+    # Reference the small pool: uninitialized large prefixes must never be read.
+    check_fp8(out, lse, fp8_oracle(*args))
+
+
+def test_fp8_swa_source_anchor_crossings_and_extreme_finite_sinks():
+    gate("prims-ts")
+    q, swa, _, wi, ci, sink = make_fp8_case(4, 512)
+    q.copy_(torch.full(q.shape, 0.5, device=q.device).to(q.dtype))
+    window_levels = torch.tensor([0.0625, 0.5], device=q.device).repeat_interleave(64)
+    swa.view(torch.uint8).zero_()
+    swa.view(-1, 512)[:128].copy_(window_levels[:, None].expand(-1, 512).to(swa.dtype))
+    levels = torch.tensor([0.0625, 0.25, 0.5, 1, 4, 0.125, 8, 0.5], device=q.device)
+    scales = (
+        levels.repeat_interleave(64)[:, None]
+        .expand(-1, 32)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    data = torch.full((512, 256), 0x22, device=q.device, dtype=torch.uint8)
+    main = pack(data, scales, 288)
+    wi.copy_(
+        torch.arange(128, device=q.device, dtype=torch.int32)
+        .view(1, 1, 128)
+        .expand(4, -1, -1)
+    )
+    ci.copy_(
+        torch.arange(512, device=q.device, dtype=torch.int32)
+        .view(1, 1, 512)
+        .expand(4, -1, -1)
+    )
+    wi[1].fill_(-1)
+    ci[2].fill_(-1)
+    wi[3].fill_(-1)
+    ci[3].fill_(-1)
+    sink[0], sink[1], sink[2], sink[3] = (
+        -math.inf,
+        torch.finfo(torch.float32).max,
+        -torch.finfo(torch.float32).max,
+        1000,
+    )
+    args = q, swa, main, wi, ci, sink
+    out, lse, _ = deepseek_v41_decode(*args, backend="prims-ts")
+    reference = fp8_oracle(*args)
+    check_fp8(out, lse, reference)
+    check_fp8_global_only(out, reference, wi, ci)

@@ -14,6 +14,8 @@
 
 """Captured task schedules for the throughput-latency 1CTA MLA TS path."""
 
+import inspect
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
@@ -52,6 +54,9 @@ from ..helpers.tile import (
 )
 
 
+_RUN_BODY_ACCEPTS_CONTEXT = "context" in inspect.signature(Task.run_body).parameters
+
+
 class MlaDecodeTask(Task):
     """MLA decode task with cached thread state and Q-aware KV domain logic."""
 
@@ -67,6 +72,21 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = Int32(0)
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
+        self._runtime_body_active = None
+
+    @cute.jit
+    def run_body(self, context=None):
+        """Guard data work only, after TaskManager initializes every task."""
+        if cutlass.const_expr(self._runtime_body_active is not None):
+            if self._runtime_body_active:
+                if cutlass.const_expr(_RUN_BODY_ACCEPTS_CONTEXT):
+                    super().run_body(context)
+                else:
+                    super().run_body()
+        elif cutlass.const_expr(_RUN_BODY_ACCEPTS_CONTEXT):
+            super().run_body(context)
+        else:
+            super().run_body()
 
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
@@ -106,9 +126,10 @@ class MlaDecodeTask(Task):
         else:
             return Int32(pointer.load())
 
-    @cute.jit
     def make_task_cache(self):
-        """Return the compact tuple of cached per-task thread values."""
+        """Snapshot the compact task state at the tracing call site."""
+        # get_domain updates _seq_len_kv in Python; under FrontendNext a jitted
+        # getter can read the old staged slot before that mutation is committed.
         return (
             self._tmem_base_offset,
             self._warp_grp_thread_idx,

@@ -1,18 +1,32 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Quantized-cache FP64 gate and paired CUDA Graph timing of Frost DS4.1 decode.
+"""Quantized-cache FP64 gates and paired CUDA Graph timing of DS4.1 backends.
 
 python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
-    --context 32768 --flashmla --output results.json
+    --backends cute-dsl prims-ts --context 32768 --output results.json
 
-FlashMLA is an optional external benchmark dependency, not a shipped decode
-backend. Quantization, allocation, JIT and host overhead are excluded from GPU
-timing. The timed Frost invocation includes the public plan replay and merge.
+The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts uses
+explicit E4M3 Q/ordinary FP8 SWA and its native componentwise P-rounding gate;
+these are different represented inputs and arithmetic, not identical-precision
+arms. Both derive from common seeded BF16 sources and share global FP4/indices.
+FlashMLA is an optional external legacy BF16-Q/MXFP8 benchmark dependency,
+enabled only by --flashmla, not a shipped decode backend. Quantization,
+allocation, JIT and host overhead are excluded from GPU timing. Each timed
+invocation includes the full public replay, including GPU metadata and merge.
+Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
+a nonpersistent schedule. The source implementation historically passed the
+expanded 257-case B200 matrix and selected 57-case dense subset with DSL 4.8.0 /
+bundled CUDA 13.4. Those runs predate the native-only source split and do not
+newly qualify this revision, other GPU/toolchain combinations or full models.
+Benchmarks have not run; performance and backend crossovers are unmeasured.
+See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import math
 from pathlib import Path
 import statistics
 import traceback
@@ -22,7 +36,22 @@ import torch
 from flashinfer.deepseek_v41 import deepseek_v41_decode, deepseek_v41_quantize_cache
 
 
-def selected(pool, indices, fp4):
+PRIMS_TS_SOURCES = (
+    "experimental/deepseek_v41/prims_ts.py",
+    "experimental/deepseek_v41/prims_ts_fp8.py",
+    "experimental/deepseek_v41/prims_ts_resources.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/config.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/smem_resources.py",
+    "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/resources/tmem_corr.py",
+    "attention/prims_ts/kernels/mla_decode/sparse_views.py",
+    "attention/prims_ts/kernels/separate_reduction.py",
+)
+
+
+def selected(pool, indices, fp4, *, round_bf16=True):
     pages = pool.view(pool.shape[0], -1)
     ids = indices[:, 0].long()
     page, row = ids // 64, ids % 64
@@ -43,14 +72,14 @@ def selected(pool, indices, fp4):
         data = data.contiguous().view(torch.float8_e4m3fn).double()
         scale = pages[page[..., None], 64 * 512 + row[..., None] * 16 + column // 32]
         scale = torch.exp2(scale.double() - 127)
-    return (data * scale).bfloat16().double()
+    represented = data * scale
+    return represented.bfloat16().double() if round_bf16 else represented
 
 
-def fixture(batch, context, seed):
+def fixture(batch, context, seed, backends, flashmla=False):
     torch.manual_seed(seed + batch)
-    q = torch.randn(batch, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16)
-    swa = deepseek_v41_quantize_cache(w, format="swa_mxfp8")
+    q_source = torch.randn(batch, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
+    w_source = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16)
     main = torch.empty(
         batch * context // 64, 64, 1, 288, device="cuda", dtype=torch.uint8
     )
@@ -71,11 +100,187 @@ def fixture(batch, context, seed):
         .contiguous()
     )
     sink = torch.randn(64, device="cuda") * 0.1
+    # Only Q/SWA representation differs. In particular, do not allocate a
+    # second production-sized global pool for the native-FP8 comparison arm.
+    shared = main, wi, ci, sink
+    arms = {}
+    if "cute-dsl" in backends or flashmla:
+        legacy = (
+            q_source,
+            deepseek_v41_quantize_cache(w_source, format="swa_mxfp8"),
+            *shared,
+        )
+        if "cute-dsl" in backends:
+            arms["cute-dsl"] = legacy
+        if flashmla:
+            arms["flashmla"] = legacy
+    if "prims-ts" in backends:
+        arms["prims-ts"] = (
+            q_source.to(torch.float8_e4m3fn),
+            deepseek_v41_quantize_cache(w_source, format="swa_fp8"),
+            *shared,
+        )
+    return arms
+
+
+def legacy_reference(q, swa, main, wi, ci, sink):
     kv = torch.cat((selected(swa, wi, False), selected(main, ci, True)), dim=1)
     scores = torch.einsum("bhd,bkd->bhk", q[:, 0].double(), kv) * 512**-0.5
-    aug = torch.cat((scores, sink.double()[None, :, None].expand(batch, -1, 1)), dim=-1)
+    aug = torch.cat(
+        (scores, sink.double()[None, :, None].expand(q.shape[0], -1, 1)), dim=-1
+    )
     expected = torch.einsum("bhk,bkd->bhd", aug.softmax(-1)[..., :-1], kv)
-    return (q, swa, main, wi, ci, sink), expected, scores.logsumexp(-1)
+    return expected, scores.logsumexp(-1)
+
+
+def fp8_oracle(q, swa, global_cache, wi, ci, sink):
+    """FP64 represented-input oracle and native componentwise FP8 bound.
+
+    Decode only selected FP4 rows, not the entire production-sized global pool.
+    The attention/bound calculation matches the independent native GPU tests;
+    no adapter query expansion or intermediate source state enters this oracle.
+    """
+    values, masks = [], []
+    for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
+        if pool is None:
+            continue
+        index = ids[:, 0].long()
+        valid = (index >= 0) & (index < pool.shape[0] * 64) & (index != 0x7FFFFFFF)
+        safe = index.clamp(0, pool.shape[0] * 64 - 1)
+        if not fp4:
+            gathered = pool.double().reshape(-1, 512)[safe]
+        else:
+            gathered = selected(pool, safe[:, None], True, round_bf16=False)
+        values.append(torch.where(valid[..., None], gathered, 0))
+        masks.append(valid)
+    kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
+    logits = torch.einsum("bhd,bkd->bhk", q[:, 0].double(), kv) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -math.inf)
+    kv_lse = logits.logsumexp(-1)
+    normalizer = torch.logaddexp(kv_lse, sink.double()[None, :])
+    weights = torch.exp(logits - normalizer[..., None])
+    weights = torch.where(torch.isfinite(normalizer)[..., None], weights, 0)
+    expected = torch.einsum("bhk,bkd->bhd", weights, kv)
+    sensitivity = torch.einsum("bhk,bkd->bhd", weights, kv.abs())
+    max_logit = logits.max(-1).values
+    frame_mass = torch.exp(max_logit - normalizer)
+    frame_mass = torch.where(torch.isfinite(kv_lse), frame_mass, 0)
+    underflow = frame_mass[..., None] * kv.abs().sum(1)[:, None, :]
+    bound = (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6
+    bound = torch.where(torch.isfinite(kv_lse)[..., None], bound, 0)
+    return expected, kv_lse, bound
+
+
+def check_fp8(out, lse, reference):
+    expected, expected_lse, bound = reference
+    assert out.dtype == torch.bfloat16 and lse.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert ((out[:, 0].double() - expected).abs() <= bound).all()
+    empty = torch.isneginf(expected_lse)
+    assert torch.equal(torch.isneginf(lse[..., 0]), empty)
+    torch.testing.assert_close(
+        lse[..., 0].double()[~empty], expected_lse[~empty], rtol=0, atol=1e-5
+    )
+    assert torch.equal(out[:, 0][empty], torch.zeros_like(out[:, 0][empty]))
+    assert torch.equal(bound[empty], torch.zeros_like(bound[empty]))
+
+
+def check_legacy(out, stats):
+    assert (
+        torch.isfinite(out).all()
+        and stats["rel_l2"] < 0.005
+        and stats["max_scaled"] < 0.01
+        and stats["lse_abs"] < 1e-5
+    )
+
+
+def check_arm(name, args, fn, batch, output):
+    native_fp8 = name == "prims-ts"
+    reference = fp8_oracle(*args) if native_fp8 else legacy_reference(*args)
+    expected, expected_lse = reference[:2]
+    out, lse = fn()
+    difference = out[:, 0].double() - expected
+    if native_fp8:
+        nonempty = ~torch.isneginf(expected_lse)
+        stats = {
+            # Ratios are diagnostic only; the native gate is componentwise.
+            "rel_l2": float(difference.norm() / expected.norm().clamp_min(1e-30)),
+            "max_scaled": float(
+                difference.abs().max() / expected.abs().max().clamp_min(1e-30)
+            ),
+            "lse_abs": (
+                float(
+                    (lse[..., 0].double()[nonempty] - expected_lse[nonempty])
+                    .abs()
+                    .max()
+                )
+                if nonempty.any()
+                else 0.0
+            ),
+            "max_bound_fraction": float(
+                (difference.abs() / reference[2].clamp_min(1e-30)).max()
+            ),
+        }
+    else:
+        # Preserve the original legacy metrics as well as their strict limits.
+        stats = {
+            "rel_l2": float(difference.norm() / expected.norm()),
+            "max_scaled": float(difference.abs().max() / expected.abs().max()),
+            "lse_abs": float((lse[..., 0].double() - expected_lse).abs().max()),
+        }
+    try:
+        if native_fp8:
+            check_fp8(out, lse, reference)
+        else:
+            check_legacy(out, stats)
+    except AssertionError as error:
+        torch.save(
+            {
+                "out": out.cpu(),
+                "lse": lse.cpu(),
+                "expected": expected.cpu(),
+                "expected_lse": expected_lse.cpu(),
+                "bound": reference[2].cpu() if native_fp8 else None,
+            },
+            output.with_suffix(".failure.pt"),
+        )
+        raise AssertionError((batch, name, stats)) from error
+    return stats
+
+
+def arm_metadata(name, args):
+    q, swa, main, _, _, _ = args
+    native_fp8 = name == "prims-ts"
+    contract = {"reference": "independent FP64 over this arm's represented Q/KV"}
+    if native_fp8:
+        arithmetic = (
+            "native E4M3 SWA QK/P/PV; FP4 global BF16 pass with exact E4M3 Q expansion"
+        )
+        contract.update(
+            output="componentwise native FP8 P-rounding bound (not legacy relative gates)",
+            componentwise_bound=(
+                "(2^-4 + 3*2^-8 + 1e-5)*sensitivity + "
+                "(2^-10/448)*underflow + 1e-6; exactly zero for empty rows"
+            ),
+            lse="sink-exclusive; rtol=0, atol=1e-5",
+            empty="exact zero output, negative-infinity LSE and zero bound",
+        )
+    else:
+        arithmetic = (
+            "Frost BF16 Q/dequantized MXFP8 SWA and FP4 global"
+            if name == "cute-dsl"
+            else "external FlashMLA legacy BF16-Q/MXFP8-SWA arm, not Prims-TS native FP8"
+        )
+        contract.update(
+            rel_l2_lt=0.005, max_scaled_lt=0.01, sink_exclusive_lse_abs_lt=1e-5
+        )
+    return {
+        "q_dtype": str(q.dtype),
+        "swa_encoding": "swa_fp8" if native_fp8 else "swa_mxfp8",
+        "cache_shape": {"swa": list(swa.shape), "global_fp4": list(main.shape)},
+        "arithmetic": arithmetic,
+        "accuracy_contract": contract,
+    }
 
 
 def graph(fn):
@@ -91,53 +296,98 @@ def graph(fn):
     return g
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batches", default="1,4,16,32,64,128,256")
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=7003)
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        choices=("cute-dsl", "prims-ts"),
+        default=["cute-dsl"],
+        help="prims-ts uses E4M3 Q/ordinary FP8 SWA; cute-dsl retains BF16 Q/MXFP8 SWA",
+    )
     parser.add_argument("--flashmla", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
-    opts = parser.parse_args()
+    return parser
+
+
+def main():
+    opts = build_parser().parse_args()
     if opts.output.exists():
         raise FileExistsError(opts.output)
     if opts.context < 512 or opts.context % 64:
         raise ValueError("context must be a multiple of64 >=512")
-    from flashinfer.experimental.deepseek_v41 import (
-        cache,
-        decode,
-        hca_v41,
-        hca_v41_primitives,
-    )
+    import cutlass
+    from flashinfer.experimental.deepseek_v41 import cache, decode, hca_v41_primitives
 
+    source_paths = {
+        m.__name__: Path(m.__file__) for m in (cache, decode, hca_v41_primitives)
+    }
+    if "cute-dsl" in opts.backends:
+        from flashinfer.experimental.deepseek_v41 import hca_v41
+
+        source_paths[hca_v41.__name__] = Path(hca_v41.__file__)
+    if "prims-ts" in opts.backends:
+        # Hash native sources without importing them just for provenance.
+        package_root = Path(decode.__file__).resolve().parents[2]
+        for relative in PRIMS_TS_SOURCES:
+            source_paths[f"flashinfer.{relative[:-3].replace('/', '.')}"] = (
+                package_root / relative
+            )
     report = {
         "status": "running",
-        "implementation": "frost",
+        "implementation": "deepseek_v41",
+        "backends": opts.backends,
         "device": str(torch.cuda.get_device_properties(0)),
         "torch": torch.__version__,
+        "toolchain": {
+            "cutlass_dsl": cutlass.__version__,
+            "cutlass_dsl_package": importlib.metadata.version("nvidia-cutlass-dsl"),
+            "cutlass_module": str(Path(cutlass.__file__).resolve()),
+            "cute_bundled_cuda": (
+                f"{cutlass.CUDA_VERSION.major}.{cutlass.CUDA_VERSION.minor}"
+            ),
+            "torch_cuda": torch.version.cuda,
+            "triton": importlib.metadata.version("triton"),
+        },
         "context_per_request": opts.context,
-        "shape": "H64/Sq1/D512; SWA128 MXFP8 + selected512 FP4",
+        "shape": "H64/Sq1/D512; SWA128 + selected512 FP4; encodings/shapes per arm",
+        "comparison": (
+            "common seeded BF16 source Q/SWA; shared global FP4 pool and indices; "
+            "arm-specific represented inputs, arithmetic and accuracy contracts"
+        ),
         "seed": opts.seed,
         "timing": "CUDA Graph/event, 32 calls/replay, symmetric order, 30 samples/arm",
-        "scope": "decode+merge GPU latency; excludes preparation/JIT/capture/host time",
+        "scope": (
+            "full public replay GPU latency, including metadata+decode+merge; "
+            "excludes cache preparation/JIT/allocation/capture/host time"
+        ),
         "sha256": {
-            Path(m.__file__).name: hashlib.sha256(
-                Path(m.__file__).read_bytes()
-            ).hexdigest()
-            for m in (cache, decode, hca_v41, hca_v41_primitives)
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in source_paths.items()
         },
         "rows": [],
     }
     try:
         with torch.no_grad():
             for batch in map(int, opts.batches.split(",")):
-                args, expected, expected_lse = fixture(batch, opts.context, opts.seed)
-                out, lse, plan = deepseek_v41_decode(*args)
-                fns = {
-                    "frost": lambda args=args, plan=plan: deepseek_v41_decode(
-                        *args, plan=plan
-                    )[:2]
-                }
+                arm_args = fixture(
+                    batch, opts.context, opts.seed, opts.backends, opts.flashmla
+                )
+                plans, fns = {}, {}
+                for backend in opts.backends:
+                    args = arm_args[backend]
+                    plans[backend] = deepseek_v41_decode(*args, backend=backend)[2]
+                    # Capture the complete public call, not just attention:
+                    # Prims-TS also sanitizes live selections on the GPU.
+                    fns[backend] = (
+                        lambda args=args, plan=plans[backend], backend=backend: (
+                            deepseek_v41_decode(*args, plan=plan, backend=backend)[:2]
+                        )
+                    )
+                del args
                 if opts.flashmla:
                     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -146,7 +396,7 @@ def main():
                     # The second return value is a None compatibility placeholder.
                     meta, _ = get_mla_metadata()
 
-                    def flashmla(args=args, meta=meta):
+                    def flashmla(args=arm_args["flashmla"], meta=meta):
                         q, w, c, wi, ci, sink = args
                         return flash_mla_with_kvcache(
                             q,
@@ -164,36 +414,11 @@ def main():
                         )
 
                     fns["flashmla"] = flashmla
-                stats = {}
-                for name, fn in fns.items():
-                    o, l = fn()
-                    difference = o[:, 0].double() - expected
-                    stats[name] = {
-                        "rel_l2": float(difference.norm() / expected.norm()),
-                        "max_scaled": float(
-                            difference.abs().max() / expected.abs().max()
-                        ),
-                        "lse_abs": float(
-                            (l[..., 0].double() - expected_lse).abs().max()
-                        ),
-                    }
-                    st = stats[name]
-                    if not (
-                        torch.isfinite(o).all()
-                        and st["rel_l2"] < 0.005
-                        and st["max_scaled"] < 0.01
-                        and st["lse_abs"] < 1e-5
-                    ):
-                        torch.save(
-                            {
-                                "out": o.cpu(),
-                                "lse": l.cpu(),
-                                "expected": expected.cpu(),
-                                "expected_lse": expected_lse.cpu(),
-                            },
-                            opts.output.with_suffix(".failure.pt"),
-                        )
-                        raise AssertionError((batch, name, st))
+                    del flashmla
+                stats = {
+                    name: check_arm(name, arm_args[name], fn, batch, opts.output)
+                    for name, fn in fns.items()
+                }
                 graphs = {name: graph(fn) for name, fn in fns.items()}
                 samples = {name: [] for name in fns}
                 for _ in range(15):
@@ -209,7 +434,8 @@ def main():
                         samples[name].append(start.elapsed_time(end) * 1000 / 32)
                 row = {
                     "batch": batch,
-                    "split": plan.split,
+                    "split": {name: plan.split for name, plan in plans.items()},
+                    "arms": {name: arm_metadata(name, arm_args[name]) for name in fns},
                     "correctness": stats,
                     "median_us": {k: statistics.median(v) for k, v in samples.items()},
                     "samples_us": samples,
@@ -217,7 +443,9 @@ def main():
                 report["rows"].append(row)
                 opts.output.write_text(json.dumps(report, indent=2))
                 print({k: row[k] for k in ("batch", "split", "median_us")}, flush=True)
-                del graphs, fns, args, plan, expected, expected_lse, out, lse
+                del graphs, fns, plans, arm_args
+                if opts.flashmla:
+                    del meta
             report["status"] = "pass"
     except BaseException:
         report["status"] = "fail"

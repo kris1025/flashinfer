@@ -241,15 +241,15 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     if warp_idx < Int32(rows_per_slice):
         stats_row = warp_idx
         stats_element = slice_element_base + stats_row * Int32(cfg.head_dim_per_cta_v)
-        head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
+        stats_head_idx = stats_element // Int32(cfg.head_dim_per_cta_v)
         (
-            storage_flat_query_row,
-            logical_head_idx,
+            stats_storage_flat_query_row,
+            stats_logical_head_idx,
             _,
             _,
-            valid_output_row,
+            valid_stats_row,
         ) = flat_query_row_state(
-            head_idx,
+            stats_head_idx,
             q_idx,
             cfg.tile_size_q,
             cfg.logical_num_heads_q,
@@ -257,8 +257,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             cu_seqlens_q=cu_seqlens_q,
             batch_idx=batch_idx,
         )
-        if head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-            row_lse = acc_lse[head_idx, None, q_idx, batch_idx]
+        if stats_head_idx < Int32(cfg.num_heads_q) and valid_stats_row:
+            row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
                 cfg.num_ctas_per_seq_kv,
                 GMEM_REDUCTION_WARP_LANES,
@@ -270,10 +270,12 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             )
             lse_max = Float32(-Float32.inf)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
                 lane_lse[lane_slot_i] = (
-                    Float32(row_lse[split_idx])
-                    if split_idx < Int32(cfg.num_ctas_per_seq_kv)
+                    Float32(row_lse[stats_split_idx])
+                    if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv)
                     else Float32(-Float32.inf)
                 )
                 lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
@@ -291,31 +293,33 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             sink_scale = Float32(1)
             if cutlass.const_expr(finalize_attention and atten_sinks is not None):
                 sink_scale = attention_sink_scale(
-                    global_lse, Float32(atten_sinks[logical_head_idx])
+                    global_lse, Float32(atten_sinks[stats_logical_head_idx])
                 )
             if (
                 lane_idx == Int32(0)
                 and head_dim_cta_idx == Int32(0)
                 and stats_element % Int32(cfg.head_dim_per_cta_v) == Int32(0)
             ):
-                output_query_row = public_query_flat_row(
+                stats_output_query_row = public_query_flat_row(
                     cfg,
-                    storage_flat_query_row,
+                    stats_storage_flat_query_row,
                     batch_idx,
                     cu_seqlens_q,
                 )
-                (lse.iterator.raw_ptr() + output_query_row).store(
+                (lse.iterator.raw_ptr() + stats_output_query_row).store(
                     global_lse * Float32(LN_2) if finalize_attention else global_lse
                 )
 
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
-                if split_idx < Int32(cfg.num_ctas_per_seq_kv):
+                stats_split_idx = lane_idx + Int32(
+                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                )
+                if stats_split_idx < Int32(cfg.num_ctas_per_seq_kv):
                     weight = normalized_lse_weight(lane_lse[lane_slot_i], global_lse)
                     if cutlass.const_expr(finalize_attention):
                         weight *= sink_scale
                     smem_scale[
-                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
                     ] = weight
 
     prims.barrier_cta_sync(

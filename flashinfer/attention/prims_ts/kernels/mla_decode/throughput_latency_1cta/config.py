@@ -1717,6 +1717,37 @@ def make_throughput_latency_mla_config(
     return cfg
 
 
+def validate_source_state_store_config(cfg: MlaConfig) -> None:
+    """Keep internal FP32 source publication on its single-owner native path."""
+    if (
+        cfg.kernel_variant != "keeps_mma_ab"
+        or cfg.tile_size_q != 64
+        or cfg.head_dim_qk != 512
+        or cfg.head_dim_v != 512
+        or cfg.rope_dim != 0
+        or cfg.num_tokens_per_page != 1
+        or cfg.logical_num_heads_q != 64
+        or cfg.logical_seq_len_q != 1
+        or cfg.num_ctas_per_head_dim != 1
+        or cfg.num_ctas_per_seq_kv != 1
+        or cfg.use_multi_ctas_kv
+        or cfg.use_cluster_reduction
+        or cfg.use_persistent_scheduler
+        or cfg.use_clc_dynamic_persistent_scheduler
+        or cfg.use_attention_sinks
+        or cfg.fuse_sparse_epilogue
+        or cfg.fuse_sparse_cluster_epilogue
+        or cfg.fuse_sparse_reduction
+        or not cfg.sparse_direct
+        or not cfg.single_kv_pipe
+        or cfg.qkv_dtype not in ("bf16", "e4m3")
+    ):
+        raise ValueError(
+            "FP32 source states require direct native Keep-AB/M64, D512, "
+            "Sq1/H64, V1/split1, nonpersistent and sink-free non-finalizing output"
+        )
+
+
 def configure_sparse_mla(
     cfg: MlaConfig,
     profile,
@@ -1725,6 +1756,7 @@ def configure_sparse_mla(
     direct_inputs=False,
     static_scales=False,
     source_capacities=(0, 0),
+    source_state_store=False,
 ) -> MlaConfig:
     """Resolve one selected sparse profile without order-dependent overrides.
 
@@ -1788,7 +1820,12 @@ def configure_sparse_mla(
         raise ValueError("cluster finishing requires native Swap-AB M16/M32")
     if direct_finish and cfg.logical_seq_len_q != 1:
         raise ValueError("fused output requires one logical query per virtual request")
-    if direct_inputs and (not finalize_output or cfg.qkv_dtype not in ("bf16", "e4m3")):
+    if source_state_store and finalize_output:
+        raise ValueError("FP32 source states cannot finalize output")
+    if direct_inputs and (
+        not (finalize_output or source_state_store)
+        or cfg.qkv_dtype not in ("bf16", "e4m3")
+    ):
         raise ValueError("separate sparse indices require native BF16/FP8 final output")
     cfg = dataclass_replace(
         cfg,
@@ -1807,6 +1844,8 @@ def configure_sparse_mla(
         fuse_sparse_reduction=separate_finish,
         load_num_warps=issuers,
     )
+    if source_state_store:
+        validate_source_state_store_config(cfg)
     short = cfg.short_merged_softmax
     if (
         issuers == 8

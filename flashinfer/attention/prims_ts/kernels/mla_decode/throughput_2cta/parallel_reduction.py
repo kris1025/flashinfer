@@ -289,6 +289,8 @@ def run_parallel_reduction_kernel(
     # One warp computes the rank-local softmax state for this row.  All output
     # threads consume the same scales, so repeating LSE loads and SFU work in
     # every vector lane only adds instructions and register pressure.
+    # Keep warp-only statistics locals distinct from the all-thread output
+    # locals below so FrontendNext does not merge partially initialized values.
     if warp_idx == Int32(0):
         lane_lse = cutlass.Array(
             Float32,
@@ -298,19 +300,19 @@ def run_parallel_reduction_kernel(
         local_lse_max = neg_inf
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
             local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
-            split_idx = cluster_rank * Int32(slots_per_rank) + local_slot_idx
-            active_slot = (
+            stats_split_idx = cluster_rank * Int32(slots_per_rank) + local_slot_idx
+            active_stats_slot = (
                 query_is_valid
                 & (local_slot_idx < Int32(slots_per_rank))
-                & (split_idx < Int32(actual_splits))
-                & (split_idx < active_split_kv)
+                & (stats_split_idx < Int32(actual_splits))
+                & (stats_split_idx < active_split_kv)
             )
             lane_lse[lane_slot_i] = neg_inf
             # Keep the workspace access inside the dynamic predicate. Padded
             # ranks must not form a load from the unpadded producer allocation.
-            if active_slot:
+            if active_stats_slot:
                 lane_lse[lane_slot_i] = Float32(
-                    acc_lse[row_in_tile, split_idx, query_tile_idx, batch_idx]
+                    acc_lse[row_in_tile, stats_split_idx, query_tile_idx, batch_idx]
                 )
             local_lse_max = fmax_f32(
                 local_lse_max,
@@ -334,21 +336,21 @@ def run_parallel_reduction_kernel(
             )
             local_sum_lse += lane_exp[lane_slot_i]
         local_sum_lse = warp_reduce_sum_f32(local_sum_lse)
-        local_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
+        stats_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
         sink_scale = Float32(1)
         if cutlass.const_expr(finalize_attention and atten_sinks is not None):
             sink_scale = Float32(0)
             if query_is_valid:
                 sink_scale = attention_sink_scale(
-                    local_lse_value, Float32(atten_sinks[logical_head_idx])
+                    stats_lse_value, Float32(atten_sinks[logical_head_idx])
                 )
         if lane_idx == Int32(0):
-            smem_local_lse[0] = local_lse_value
+            smem_local_lse[0] = stats_lse_value
 
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
             local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
             if local_slot_idx < Int32(slots_per_rank):
-                weight = normalized_lse_weight(lane_lse[lane_slot_i], local_lse_value)
+                weight = normalized_lse_weight(lane_lse[lane_slot_i], stats_lse_value)
                 if cutlass.const_expr(finalize_attention):
                     weight *= sink_scale
                 smem_local_scale[local_slot_idx] = weight

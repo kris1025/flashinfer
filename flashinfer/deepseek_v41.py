@@ -1,37 +1,77 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Experimental Frost DS4.1 decode and optional cache preparation on SM100."""
+"""Experimental DS4.1 decode backends and optional cache preparation on SM100."""
 
 from .api_logging import flashinfer_experimental_api
 
 
 @flashinfer_experimental_api
 def deepseek_v41_decode(
-    q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None
+    q,
+    swa_cache,
+    global_cache,
+    swa_indices,
+    global_indices,
+    sink,
+    *,
+    plan=None,
+    backend="cute-dsl",
 ):
-    """Frost mixed MXFP8/FP4 decode using CuTe DSL primitives on SM100.
+    """Mixed SWA/FP4 decode using CuTe DSL primitives on SM100.
 
-    Q is contiguous BF16[B,1,64,512]. Caches are opaque uint8 page pools
-    [pages,64,1,528] (SWA) and [pages,64,1,288] (global). SWA indices are
-    int32[B,1,128]; global indices int32[B,1,K], K a positive multiple of64
-    up to512. Slots -1 and out-of-capacity slots are masked. The caller owns
-    causal visibility and initialization of every valid cache slot. Sink is
-    FP32[64], with finite logits or -inf (disabled). Inputs must be finite
-    after dequantization; no checkpoint or backward parity is claimed.
+    ``backend="prims-ts"`` uses explicit torch.float8_e4m3fn Q[B,1,64,512]
+    with the same dtype of contiguous, unit-scale SWA[pages,64,1,512], without
+    a scale plane. This is ordinary E4M3, not MXFP8 with ignored scales.
+    Decode never implicitly quantizes BF16 Q. SWA uses native FP8 Q/K/V/P
+    and TMA, not BF16 dequantization. When optional uint8 FP4
+    global[pages,64,1,288] is present, Q is exactly expanded to BF16 for that
+    separate selected-tile pass. Sink-free normalized FP32 source outputs
+    and log2 LSE are merged before the sole final BF16 rounding; the sink
+    contributes denominator mass once. Window-only omits the global pass
+    and BF16 query scratch.
 
-    Returns (out,lse,plan): BF16 output shaped like Q and FP32 natural-log
-    LSE [B,64,1] excluding the sink. Empty rows give zero output and -inf LSE.
-    Multiplications use BF16 Q/K/V/P; accumulation and softmax use FP32.
-    Prepare once before capture, then reuse plan with identical declarations
-    on its device. Replay overwrites plan-owned output/LSE/workspace; the
-    captured graph keeps fixed input addresses: update values in place, or
-    recapture/update the graph when addresses change. Ordinary plan calls
-    may use new addresses with matching declarations. The same plan must
-    not execute concurrently on different streams. Single
-    token decode only; MTP and SM103 are not part of this initial scope.
+    ``backend="cute-dsl"`` preserves the Frost implementation (default):
+    contiguous BF16 Q[B,1,64,512], uint8 MXFP8 SWA[pages,64,1,528] and optional
+    uint8 FP4 global[pages,64,1,288]. Both packed caches use page-plane storage:
+    all payload rows precede all scale rows.
+
+    Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler.
+    Fixed Keep-AB/M64/retained-KV8/split-1/nonpersistent schedules use BK128
+    for native FP8 SWA and BK64 for the optional global FP4 pass. Live selections
+    and valid counts are refreshed on the GPU on every call/replay.
+    Plans cannot cross modes or backends. The native sparse wrapper's
+    packed-input restriction is unchanged.
+
+    SWA indices are int32[B,1,128]; global indices int32[B,1,K], K a positive
+    multiple of64 up to512. Negative, reserved-sentinel and out-of-capacity
+    slots are masked; duplicate positions retain their multiplicity. The
+    caller owns causal visibility and initialization of every valid slot.
+    Sink is FP32[64], finite or -inf (disabled). Effective Q/K/V must be
+    finite. Accumulation and softmax use FP32; no backward parity is claimed.
+
+    Returns (out,lse,plan): BF16 output shaped like Q, even for FP8 Q, and
+    FP32 natural-log LSE [B,64,1] excluding the sink. Empty rows give exact
+    zero output and -inf LSE. Prepare before capture and reuse a plan with
+    matching shape, strides, dtype and device. Replay overwrites owned
+    outputs/scratch and retains captured input addresses; update values in
+    place or recapture when addresses change. Eager calls may change input
+    addresses. One plan must not execute concurrently on different streams.
+
+    The original pre-reorganization snapshot passed the full 257-case matrix
+    (including native FP8) and selected 57-case dense subset on
+    B200/DSL 4.8.0/bundled CUDA 13.4. Those historical results do not qualify
+    this reorganized source tree. Performance, crossovers and
+    checkpoint/full-model behavior are unmeasured.
+    See examples/deepseek_v41/README.md for scope and commands. Single-token
+    decode only; MTP and SM103 are outside this adapter's scope.
     """
-    from .experimental.deepseek_v41.decode import decode
+    if backend == "cute-dsl":
+        from .experimental.deepseek_v41.decode import decode
+    elif backend == "prims-ts":
+        from .experimental.deepseek_v41.prims_ts import decode
+    else:
+        raise ValueError(f"backend must be 'cute-dsl' or 'prims-ts', got {backend!r}")
 
     return decode(
         q, swa_cache, global_cache, swa_indices, global_indices, sink, plan=plan
@@ -39,21 +79,32 @@ def deepseek_v41_decode(
 
 
 @flashinfer_experimental_api
-def deepseek_v41_window_decode(q, cache, indices, sink, *, plan=None):
-    """Window-only variant of deepseek_v41_decode, using the same Frost kernel.
+def deepseek_v41_window_decode(
+    q, cache, indices, sink, *, plan=None, backend="cute-dsl"
+):
+    """Window-only variant of deepseek_v41_decode, with explicit backend selection.
 
-    Accepts BF16[B,1,64,512] Q, uint8[pages,64,1,528] cache and
-    int32[B,1,128] physical slot IDs. See deepseek_v41_decode for the plan,
-    arithmetic, validity, output and sink-exclusive LSE contracts.
+    ``backend="prims-ts"`` uses explicit E4M3 Q with typed, unit-scale E4M3
+    cache of width 512, without BF16 SWA dequantization or BF16 query scratch.
+    The Frost default retains BF16 Q with uint8 MXFP8 cache of width 528.
+    Q is [B,1,64,512], cache is [pages,64,1,width] and
+    physical slot IDs are int32[B,1,128]. See deepseek_v41_decode for the
+    mode/backend-specific plan, arithmetic, output and sink-exclusive LSE
+    contracts. The default Frost backend remains unchanged.
     """
-    from .experimental.deepseek_v41.decode import decode
+    if backend == "cute-dsl":
+        from .experimental.deepseek_v41.decode import decode
+    elif backend == "prims-ts":
+        from .experimental.deepseek_v41.prims_ts import decode
+    else:
+        raise ValueError(f"backend must be 'cute-dsl' or 'prims-ts', got {backend!r}")
 
     return decode(q, cache, None, indices, None, sink, plan=plan)
 
 
 @flashinfer_experimental_api
 def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None):
-    """Quantize and write the two cache formats consumed by Frost DS4.1 decode.
+    """Quantize and write the cache formats consumed by DS4.1 decode backends.
 
     Optional Triton preparation helper; decode accepts compatible caches from
     any producer. Contiguous finite BF16/FP32 x[N,512] must already include
@@ -64,6 +115,12 @@ def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None
     must be representable in E4M3. Opaque uint8 output has shape
     [pages,64,1,288] or [pages,64,1,528]. Each page holds all data rows,
     followed by all scale rows; these are not interleaved token records.
+    ``swa_fp8`` instead clamps finite input to [-448,448] and rounds to
+    nearest even E4M3 with unit scale, retaining signed zero/subnormals.
+    It returns contiguous typed torch.float8_e4m3fn[pages,64,1,512], ordinary
+    row-major payload with no scale plane. This format requires explicit
+    FP8 Q and ``backend="prims-ts"`` at decode; it is not interchangeable
+    with ``swa_mxfp8``.
 
     Without slots, input row i writes physical slot i. For incremental
     updates, provide caller-owned out and CUDA int32 slots[N]. Negative or

@@ -120,6 +120,8 @@ class TmemCorrResource(MlaResource):
     atten_sinks: object = None
     output_quant: cutlass.Constexpr = None
     output_quant_args: object = None
+    source_state_store: cutlass.Constexpr = None
+    source_state_store_args: object = None
     o_tensor: object = None
     lse_tensor: object = None
     acc_o_tensor: object = None
@@ -1559,10 +1561,20 @@ class TmemCorrResource(MlaResource):
             cfg.head_dim_per_stage_v // 2
         )
 
-        if cutlass.const_expr(self.output_quant is not None):
-            # Each lane owns half a head's D stage. K128 can span the two
-            # lanes separated by 16; K32 blocks remain entirely lane-local.
-            width = min(self.output_quant.block_size, cfg.head_dim_per_stage_v // 2)
+        fp32_store = (
+            self.source_state_store
+            if self.source_state_store is not None
+            else self.output_quant
+        )
+        fp32_store_args = (
+            self.source_state_store_args
+            if self.source_state_store is not None
+            else self.output_quant_args
+        )
+        if cutlass.const_expr(fp32_store is not None):
+            # Keep loads convergent and retain TMEM ownership until this store
+            # finishes. Source fragments are normalized in ordinary V units.
+            width = min(fp32_store.block_size, cfg.head_dim_per_stage_v // 2)
             for stripe in cutlass.range_constexpr(
                 0, cfg.head_dim_per_stage_v // 2, width
             ):
@@ -1576,12 +1588,15 @@ class TmemCorrResource(MlaResource):
                 cute.arch.fence_view_async_tmem_load()
                 for i in cutlass.range_constexpr(width):
                     values[i] = loaded[i] * final_scale0[0]
+                    if cutlass.const_expr(self.source_state_store is not None):
+                        if final_scale0[0] == Float32(0):
+                            values[i] = Float32(0)
                 if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
                     row = public_query_flat_row(
                         cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
                     )
-                    self.output_quant.store(
-                        self.output_quant_args,
+                    fp32_store.store(
+                        fp32_store_args,
                         values,
                         row,
                         head_dim_offset
@@ -1589,7 +1604,8 @@ class TmemCorrResource(MlaResource):
                         + half_warp_col_offset
                         + stripe,
                         lane_stride=16,
-                        rotary=v_stage_idx + 1 == cfg.v_head_dim_stages,
+                        rotary=self.source_state_store is None
+                        and v_stage_idx + 1 == cfg.v_head_dim_stages,
                     )
             return
 

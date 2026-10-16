@@ -457,6 +457,211 @@ gated: `backend="auto"` skips backends marked `@experimental_backend` unless
 [`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
 full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/README.md).**
 
+### Experimental DeepSeek V4.1 decode
+
+`flashinfer/deepseek_v41.py` exposes mixed-cache and window-only decode with
+explicit `backend="cute-dsl"` (existing Frost default) or `backend="prims-ts"`.
+There is no `"auto"` selector. Imports remain function-local; both backends share
+`experimental/deepseek_v41/decode.py::_validate_inputs` and require
+backend-specific plans. Scope is SM100 / H64 / Sq1 / D512. Prims-TS uses explicit
+`torch.float8_e4m3fn` Q `[B,1,64,512]` with typed, contiguous, unit-scale E4M3 SWA
+`[pages,64,1,512]`, without a scale plane. The optional writer uses
+`format="swa_fp8"` (finite clamp to [-448,448], round-to-nearest-even). This is not
+MXFP8 with ignored E8M0 scales; decode never implicitly quantizes BF16 Q.
+Frost retains BF16 Q and uint8 MXFP8 SWA (width 528). Both backends accept optional
+uint8 FP4 global (width 288), using the existing page-plane ABI.
+
+The separate Prims-TS adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13
+compiler**. Fixed **Keep-AB / M64 / retained-KV8 / split 1 / nonpersistent**
+execution uses BK128 for native FP8 SWA and BK64 for optional global FP4, not
+measured crossover heuristics. Each call refreshes live selections, execution
+lengths and valid counts on the GPU. Ordinary FP8 SWA uses native TMA/QK/P/PV;
+it is not dequantized to BF16. Optional global FP4 uses the existing selected-tile
+BF16 producer with an exact FP8-to-BF16 expansion of Q only. Sink-free normalized
+FP32 source O and log2 LSE are jointly merged; the sink is applied once before
+public BF16 O / FP32 natural-log LSE publication. Window-only allocates neither
+global source states nor BF16 query scratch. The internal `source_state_store`
+hook is restricted to this nonfinalizing 1CTA direct-index topology; it does not
+add a public FP32 native output mode and cannot be combined with output quantization.
+The concrete `Fp4KvProducer` in `prims_ts_resources.py` publishes selected global
+FP4 tiles through retained BF16 stages, with all-writer AsyncThread-to-UMMA
+signaling and per-writer fences; it contains no MXFP8 SWA staging.
+It does not broaden `BatchSparseMLADecodePagedTSWrapper`: that native wrapper
+still accepts matching native BF16 or E4M3 Q/KV, not packed quantized
+cache inputs. Its existing toolchain contract is unchanged. See
+[`SPARSE.md`](flashinfer/attention/prims_ts/kernels/mla_decode/SPARSE.md).
+
+Native-first reorganization acceptance on 2026-10-15 passed **213 CPU cases**
+(127 source-state/adapter/oracle, 6 conversion-lifetime, 34 stdlib-only
+benchmark/example, 40 native host and 6 unknown-backend contracts) with the
+existing DSL 4.8 overlay and strict guards. No CUDA/JIT calls were intercepted;
+CUDA visibility and all 114 fingerprints stayed unchanged during the run, before
+these validation-note edits. No GPU execution or benchmark ran. The historical validation
+records below describe their original pre-reorganization snapshots; they do not
+qualify the rebuilt commits.
+
+Decode tests are in `tests/experimental/test_deepseek_v41_decode.py`; cache-writer
+integration tests are in `tests/experimental/test_deepseek_v41_cache.py`, with guarded
+source-store/adapter/oracle host contracts in
+`tests/experimental/test_deepseek_v41_source_state_cpu.py` (`--confcutdir=tests/experimental`).
+Fresh guarded CPU processes use a static `CUTE_DSL_ARCH=sm_100` declaration,
+thread caps and disabled plugin autoload/JIT without changing CUDA visibility.
+The new 125-case suite passed with DSL 4.8.0 / bundled compiler metadata 13.4,
+with no intercepted CUDA/JIT calls and strict aggregate exit 0. The tested
+4.7.0+flashinfer.5 distribution / compiler metadata 13.3 also passed all 125
+pytest cases, but eager environment-manager default evaluation attempted two
+import-time `cuInit` calls despite the static target. Guards blocked both before
+execution; strict aggregate exit was 1. The existing host40/API6 matrix has the
+same 4.8-clean / 4.7-intercepted distinction. The fixture now guards raw driver/
+runtime calls before CuTe imports and rejects caught attempts; its fresh 4.7
+control reports a setup error. Earlier Torch/CuTe-only guard records did not
+prove raw-driver isolation. Exact cases, source fingerprints and visibility
+matched within each matrix; packages were not modified. See the example README
+for warnings, exits and provenance. These checks do not qualify GPU execution
+or change the native wrapper's DSL 4.7 contract.
+The post-repair default run on `umb-b200-260` (job `5008381`, B200 / DSL 4.8.0 /
+bundled CUDA 13.4) passed the complete expanded **257/257** matrix, including all
+50 new ordinary-FP8 cases, and the independent selected dense **57/57** subset.
+The first allocated B200 smoke (`umb-b200-248`, job `4943022`, DSL 4.8.0 /
+bundled CUDA 13.4) passed preflight and collected the exact expanded 257-case
+manifest, including all 50 new cases and the unchanged legacy 207. Its first smoke
+case failed during JIT lowering because `cutlass.Array` does not support `len()`:
+1 failed, pytest exit 1, Slurm `FAILED` / `1:0`; no accuracy or later matrices ran.
+All 134 fingerprints and Slurm CUDA visibility were preserved. The source store
+now reads its static width from `values.shape[0]`.
+The corrected retry on one allocated B200 / 148 SMs (`umb-b200-263`, job `4943256`,
+DSL 4.8.0 / bundled CUDA 13.4) passed the exact 16-case smoke. Its exact 257-case
+full run completed with decode **142 passed / 1 failed**, cache **48 passed**,
+and native sparse MLA **66 passed**: **256 passed / 1 failed**, with 0 errors or
+skips and 1721 warnings in 3686.71 seconds. All 50 new cases passed (31 decode,
+19 cache). Pytest exited 1 and Slurm recorded `FAILED` / `1:0`; exact JUnit
+identities, all 134 fingerprints, Git state and Slurm CUDA visibility matched
+through full and final postflight, before these validation-note updates.
+The only failure was the unchanged legacy Frost
+`test_e8m0_scale_boundary_changed_graph[None-512-0-cute-dsl]`, during prepared
+graph capture with `cudaErrorStreamCaptureInvalidated` (901), before numerical
+checks. That wrapper stopped before the selected dense 57-case phase.
+A second default run (`umb-b200-263`, job `5000428`, the same toolchain) again
+completed **256 passed / 1 failed**, with all 50 new cases passing; isolated
+capture and smoke passed, but full-suite capture failed at the same case.
+A diagnostic follow-up on `umb-b200-236` (job `5005300`) passed default isolated
+capture **1/1**, smoke **16/16** and the independent default dense subset **57/57**.
+Its instrumented full-order prefix stopped at **93 passed / 1 failed** in case 94;
+this was not a default full257 run. The driver trace records `cuLibraryUnload`
+returning 900 inside a GC interval during capture, before launch/end-capture 901.
+The same library handle was loaded in the preceding standalone
+`test_native_fp4_all_finite_codes` conversion probe. Runtime unload return type,
+complete caller ownership and exhaustive producer coverage remain unproven;
+unknown returns and truncated/short records limit the trace.
+The two standalone conversion probes now explicitly unload their CuTe modules
+at test teardown, instead of leaving cyclic executors for GC in a later capture.
+This is a test-resource lifetime repair, not a decoder/JIT-core arithmetic change.
+Six new CPU-only ownership regressions passed with strict exit 0, no accelerator
+imports and no intercepted calls. Numerical references/gates and default GC/capture
+settings are unchanged. The 5005300 dense phase had 0 failures/errors/skips;
+all 185 fingerprints, Git state and Slurm visibility matched through independent
+terminal corroboration before this repair. The job itself remains `FAILED` / `1:0`
+from its diagnostic failure.
+The post-repair run on `umb-b200-260` (job `5008381`, DSL 4.8.0 / bundled CUDA
+13.4) passed default isolated capture **1/1**, smoke **16/16**, full **257/257**
+(decode **143**, cache **48**, native sparse MLA **66**) and independent dense
+**57/57**, with 0 failures, errors or skips. All 50 new cases passed; the former
+case-94 Frost capture failure passed setup/call/teardown in full-suite order.
+Full reported 1707 warnings in 3552.03 seconds; dense reported 980 in 1105.53
+seconds. All phase exits were 0; Slurm root/batch/extern completed with `0:0`.
+Exact ordered JUnit identities and all 5047 frozen fingerprints, Git state and
+Slurm CUDA visibility matched through final postflight and independent terminal
+corroboration, before these validation-note edits. No matrix sources, references,
+tolerances or default GC/capture settings changed during execution.
+The original frozen auditor's false verdict is retained: its four command-record
+errors compared observer pre-parse argv with diagnostic argv after pytest's
+in-place ini-addopts prepend. A separate post-run checker accepts only the exact
+canonical phase argv, literal `--import-mode=importlib` ini prepend and complete
+interpreter/module command; every other original check reran unchanged. Its
+166 guarded CPU positive/negative checks passed without accelerator imports or
+intercepted calls. The new independent report has `default_qualification=true`,
+no evidence errors and no nonpassing phases; neither frozen inputs nor the
+original report was rewritten. See the README for report paths and coverage
+limits. This successful regression does not establish exhaustive JIT ownership
+or historical runtime-unload return-status attribution.
+The tests include all global widths 0/64/.../512, source precision, exact query
+expansion and changed-data graph replay.
+Their independent FP64 oracle uses the native per-component FP8 rounding bound,
+strict sink-exclusive LSE and exact empty gates; global-only retains strict BF16
+checks. Legacy helpers/tolerances are unchanged. The following 207/57-case B200
+results predate this ordinary-FP8 change and do not qualify the new path.
+Historical writer/decode integration covers both backends, window-only and global
+widths 128/192/512, with CUDA Graph replay and exact encoded-byte references;
+all eight expanded legacy integration cases passed in the full B200 run below.
+The multi-backend benchmark is `benchmarks/bench_deepseek_v41_decode.py`.
+Production-source B200 validation on `umbriel-b200-040` with CuTe-DSL 4.8.0 /
+bundled CUDA 13.4 and a fresh scratch workspace passed all 10 targeted tests,
+with no failures or skips:
+selection refresh and zero-query tile counts at global widths 0/64/192/512,
+plus two checks that Prims-TS does not compile Frost. Existing independent FP64
+output/LSE gates are unchanged, including poisoned-selection CUDA Graph replay.
+The earlier global192 failure was traced to a zero task-cache length despite a
+live span of 384; the getter now snapshots current Python state and the
+production regression passes. Five native automatic-dispatch regressions also
+passed on the same node/toolchain, with no failures, errors or skips. The separate
+`tests/attention/test_prims_ts_sparse_mla.py::test_keep_ab_runtime_task_cache`
+now pins native BF16 Keep-AB for static and CLC persistence, asserts actual compile
+configurations and a 768-slot runtime domain, and reuses the existing FP64 oracle
+and changed-metadata graph replay. Both cases ran in the earlier full matrix: CLC
+passed, while static failed during plan-time FrontendNext compilation.
+That `--full` run on `umb-b200-250` (Slurm job `4907814`) with CuTe-DSL 4.8.0 /
+bundled CUDA 13.4 completed all 207 cases: decode **112 passed**, cache **29 passed**,
+and native sparse MLA **35 passed / 31 failed**, with no pytest errors or skips.
+All 31 native failures occurred during plan-time FrontendNext/task-scheduling
+compilation, before eager accuracy or graph replay checks.
+Narrow Task-interface, work-tile type, G1 temporary-scope and task-body
+activity-guard repairs are implemented. All 40 CPU-only acceptance cases in
+`tests/attention/test_attention_ts_mla_decode.py` historically passed separately
+with DSL 4.7.0 and 4.8.0, with no failures, errors or skips; the recorded Torch/CuTe
+guards were not triggered. That scope did not cover raw CUDA bindings; the current
+stricter matrix above rejects the intercepted 4.7 imports despite pytest passes.
+These host checks do not qualify DSL 4.7 GPU execution; the separate dense
+D576 GPU suite was not part of the 207-case matrix.
+A post-repair smoke run on `umb-b200-236` (job `4909337`)
+with the same toolchain completed 40 cases: **39 passed / 1 failed**, with no errors
+or skips and unchanged source fingerprints. Both pinned static/CLC regressions
+and all eight selected packed selection/cache replay cases passed. The remaining
+native FP8 `small-grid-wide-kv` case failed at plan time with `SCOPE_READ_NEVER_SET`
+in the fused 2CTA parallel reducer. Its warp-only statistics/output locals are now
+separated without arithmetic changes.
+The follow-on three-case GPU smoke and complete 207-case rerun on `umb-b200-041`
+(job `4910237`), with CuTe-DSL 4.8.0 / bundled CUDA 13.4, **passed**: decode **112**,
+cache **29**, native sparse MLA **66**, including both pinned static/CLC regressions.
+There were **0 failures, errors or skips**, with 1679 warnings in 3427.86 seconds;
+pytest exited 0 and Slurm completed with exit `0:0`. The exact 207-case node set
+and all 111 source fingerprints matched through final postflight, before these
+validation-note updates; kernels and accuracy gates were unchanged during testing.
+A separate selected dense D576 QK / D512 V subset in
+`tests/attention/test_attention_ts_mla_decode.py` passed **57/57** on one allocated
+B200 in `umb-b200-250` (job `4936630`), with DSL 4.8.0 / bundled CUDA 13.4.
+It covers BF16/FP8 1CTA/2CTA, runtime-K pruning, fully masked splits,
+compact/empty/causal queries, CLC progress and live-metadata CUDA Graph replay.
+There were no failures, errors or skips, with 980 warnings in 1063.65 seconds;
+pytest exited 0 and Slurm completed with exit `0:0`. All three preceding smoke
+cases passed and belong to the same 57-case manifest. Exact case identities and
+all 111 source fingerprints matched through final postflight, before validation
+notes changed; GPU visibility and independent accuracy gates were unchanged.
+These runs qualify the tested B200/4.8/13.4 matrix and selected dense subset,
+not the entire dense GPU suite, DSL 4.7 GPU execution, other GPU/toolchain
+combinations or checkpoint/full-model behavior.
+A follow-up static implementation review found no confirmed correctness defects
+in the reviewed adapter/shared-kernel/API/test-harness scope; this is not new GPU
+qualification. Six unknown-backend CPU cases passed separately with each of DSL
+4.7.0 and 4.8.0 without CUDA/JIT work. The README distinguishes the tested packed
+widths from supported intermediate widths without end-to-end coverage, exhaustive
+helper tests from direct packed staging, and forced fallback on CUDA 13.4 from
+actual older-compiler execution. Review edits changed only docs/docstrings;
+kernels, tests, references and numerical gates are unchanged.
+Benchmarks have not run; no measurements or measured crossovers are claimed. See
+[`examples/deepseek_v41/README.md`](examples/deepseek_v41/README.md) for the current
+validation status, runnable example and commands. Both backends remain JIT-only
+with no AOT or trace registration.
+
 ## Key Architectural Patterns
 
 ### Module Caching

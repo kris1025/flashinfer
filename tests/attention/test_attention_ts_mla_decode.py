@@ -1452,6 +1452,111 @@ def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
     }.issubset(throttle_stages)
 
 
+@pytest.mark.parametrize(
+    "base_method,capability",
+    (
+        ("_run_pre_work_loop_entries", "_PRE_WORK_LOOP_ACCEPTS_CONTEXT"),
+        ("_run_post_work_loop_entries", "_POST_WORK_LOOP_ACCEPTS_CONTEXT"),
+        ("_run_task_body_impl", "_TASK_BODY_ACCEPTS_CONTEXT"),
+        ("_create_stage_info", "_STAGE_INFO_ACCEPTS_CONTEXT"),
+        ("run_body", "_RUN_BODY_ACCEPTS_CONTEXT"),
+    ),
+)
+def test_attention_ts_mla_task_context_capabilities(base_method, capability):
+    from cutlass.experimental.task_scheduling.task import Task
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta import (
+        tasks as tasks_2cta,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        tasks as tasks_1cta,
+    )
+
+    task_module = tasks_1cta if base_method == "run_body" else tasks_2cta
+    assert getattr(task_module, capability) == (
+        "context" in inspect.signature(getattr(Task, base_method)).parameters
+    )
+
+
+def test_attention_ts_mla_static_queue_uses_canonical_work_tile():
+    from cutlass.experimental.task_scheduling.resources import WorkTileInfo
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        kernel,
+    )
+
+    # In 4.8 this is a TS-local subclass, not the legacy scheduler's base type.
+    assert kernel.WorkTileInfo is WorkTileInfo
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.parametrize("qkv_dtype", ("bf16", "e4m3"))
+@pytest.mark.parametrize(
+    "variant,tile_size_q,split_kv,seq_len_kv,short_merged",
+    (
+        ("swaps_mma_ab", 16, 4, 2048, False),
+        ("swaps_mma_ab", 16, 4, 256, True),
+        ("keeps_mma_ab", 64, 1, 512, False),
+    ),
+)
+def test_attention_ts_mla_guarded_graph_task_body_contract(
+    variant, tile_size_q, split_kv, seq_len_kv, short_merged, qkv_dtype
+):
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        MlaProfile,
+        configure_sparse_mla,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+        build_throughput_latency_mla_task_manager,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.tasks import (
+        MlaDecodeTask,
+    )
+
+    cfg = make_throughput_latency_mla_config(
+        batch_size=1,
+        num_heads_q=tile_size_q,
+        seq_len_q=1,
+        seq_len_kv=seq_len_kv,
+        rope_dim=0,
+        num_tokens_per_page=1,
+        qkv_dtype=qkv_dtype,
+        profile=MlaProfile(
+            name="host_body_guard",
+            tile_size_q=tile_size_q,
+            kernel_variant=variant,
+            num_ctas_per_seq_kv=split_kv,
+            use_multi_ctas_kv=int(split_kv > 1),
+            use_persistent_scheduler=0,
+        ),
+        reduction_mode="gmem_separate",
+        max_active_clusters=148,
+        mask_type="dense",
+    )
+    cfg = configure_sparse_mla(
+        cfg,
+        SparseMlaProfile(
+            family="keep" if variant == "keeps_mma_ab" else "swap",
+            tile_size_q=tile_size_q,
+            split_kv=split_kv,
+        ),
+        finalize_output=True,
+        direct_inputs=True,
+        source_capacities=(128, seq_len_kv - 128),
+    )
+    assert cfg.short_merged_softmax == short_merged
+    task_manager, _ = build_throughput_latency_mla_task_manager(
+        cfg, total_kv_tiles=cfg.total_kv_tiles, use_page_offsets=True
+    )
+    assert task_manager.tasks
+    for task in task_manager.tasks:
+        assert isinstance(task, MlaDecodeTask)
+        assert task._runtime_body_active is None
+    if short_merged:
+        assert any(task.name == "ShortMergedSoftmaxTask" for task in task_manager.tasks)
+
+
 def test_attention_ts_mla_run_requires_plan():
     wrapper = BatchMLADecodePagedTSWrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):

@@ -197,14 +197,18 @@ class MergeMlaSourceStates:
                     offset = q * part_s.stride[0] + h * part_s.stride[1] + column
                     pair = cutlass.Pointer(
                         part_s.iterator + offset, dtype=part_s.element_type
-                    ).load(count=width, alignment=width * 2)
+                    ).load(
+                        count=width, alignment=width * (part_s.element_type.width // 8)
+                    )
                     for j in cutlass.range_constexpr(width):
                         values[j] = Float32(pair[j]) * ws
                 if have_c:
                     offset = q * part_c.stride[0] + h * part_c.stride[1] + column
                     pair = cutlass.Pointer(
                         part_c.iterator + offset, dtype=part_c.element_type
-                    ).load(count=width, alignment=width * 2)
+                    ).load(
+                        count=width, alignment=width * (part_c.element_type.width // 8)
+                    )
                     for j in cutlass.range_constexpr(width):
                         values[j] += Float32(pair[j]) * wc
                 if cutlass.const_expr(self.output_quant is not None):

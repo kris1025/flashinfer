@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Plan ownership and JIT dispatch for the single CuTe DSL decode backend."""
+"""Shared input validation and plan/JIT dispatch for the Frost decode backend."""
 
 from dataclasses import dataclass
 import functools
@@ -132,15 +132,35 @@ class _Plan:
     empty_indices: torch.Tensor
 
 
-def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None):
+def _validate_inputs(
+    q,
+    swa_cache,
+    global_cache,
+    swa_indices,
+    global_indices,
+    sink,
+    *,
+    allow_fp8_swa=False,
+):
+    """Validate the shared SM100 decode contract and return its declaration.
+
+    The default retains Frost's BF16-Q/uint8-MXFP8-SWA declaration. The
+    opt-in additionally accepts E4M3 Q paired with typed, unit-scale E4M3 SWA;
+    it never casts Q or reinterprets the legacy payload/scale layout.
+    """
     if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (10, 0):
         raise ValueError("CuTe DS4.1 decode currently requires SM100")
+    fp8_swa = allow_fp8_swa and q.dtype == torch.float8_e4m3fn
     if (
         q.ndim != 4
         or q.shape[1:] != (1, 64, 512)
         or not 1 <= q.shape[0] <= 65535
-        or q.dtype != torch.bfloat16
+        or (q.dtype != torch.bfloat16 and not fp8_swa)
     ):
+        if allow_fp8_swa:
+            raise ValueError(
+                "Q must be BF16 or E4M3 [B,1,64,512], with 1 <= B <= 65535"
+            )
         raise ValueError("Q must be BF16 [B,1,64,512], with 1 <= B <= 65535")
     if (global_cache is None) != (global_indices is None):
         raise ValueError("global cache and indices must both be present or absent")
@@ -154,13 +174,24 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
         for x in inputs
     ):
         raise ValueError("inputs must be contiguous and 16-byte aligned on Q's device")
-    for cache, width in ((swa_cache, 528), (global_cache, 288)):
+    # Q selects exactly one SWA representation. Cross-pairing BF16 Q with
+    # typed SWA, or E4M3 Q with uint8 MXFP8/scales, is not a conversion path.
+    swa_width = 512 if fp8_swa else 528
+    swa_dtype = torch.float8_e4m3fn if fp8_swa else torch.uint8
+    if fp8_swa and swa_cache is None:
+        raise ValueError("E4M3 Q requires a nonempty E4M3 SWA [pages,64,1,512]")
+    for cache, width, dtype in (
+        (swa_cache, swa_width, swa_dtype),
+        (global_cache, 288, torch.uint8),
+    ):
         if cache is not None and (
             cache.ndim != 4
             or cache.shape[1:] != (64, 1, width)
             or cache.shape[0] < 1
-            or cache.dtype != torch.uint8
+            or cache.dtype != dtype
         ):
+            if dtype == torch.float8_e4m3fn:
+                raise ValueError("E4M3 Q requires a nonempty E4M3 SWA [pages,64,1,512]")
             raise ValueError(
                 "cache must be a nonempty uint8 page pool with page size 64"
             )
@@ -181,9 +212,21 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
         raise ValueError("sink must be FP32 [64]")
     if torch.is_grad_enabled() and any(x.requires_grad for x in inputs):
         raise ValueError("DS4.1 decode is inference-only")
-    signature = tuple(
+    return tuple(
         None if x is None else (tuple(x.shape), tuple(x.stride()), x.dtype, x.device)
         for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
+    )
+
+
+def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None):
+    signature = _validate_inputs(
+        q, swa_cache, global_cache, swa_indices, global_indices, sink
+    )
+    batch = q.shape[0]
+    inputs = tuple(
+        x
+        for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
+        if x is not None
     )
     if plan is not None and (
         not isinstance(plan, _Plan) or plan.signature != signature
