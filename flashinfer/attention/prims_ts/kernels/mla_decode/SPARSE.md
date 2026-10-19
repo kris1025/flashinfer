@@ -50,93 +50,177 @@ products must be finite.
 ## DeepSeek V4.1 quantized-cache adapter (experimental)
 
 The model-specific `deepseek_v41_decode(..., backend="prims-ts")` and
-`deepseek_v41_window_decode(..., backend="prims-ts")` APIs provide a separate
-adapter for the native D512 task graph. The default remains `"cute-dsl"` (Frost);
-selection is explicit, with no `"auto"` route or required opt-in environment
-variable. Plans belong to one backend and cannot cross backends.
+`deepseek_v41_window_decode(..., backend="prims-ts")` APIs are separate adapters
+for the native D512 task graph. The default remains `"cute-dsl"` (Frost), with
+explicit selection and no `"auto"` route or required opt-in environment variable.
+Their V4-style interface now takes caller workspace, combined metadata, optional
+out and runtime BMM factors, returning only BF16 output. Public plans and tuple
+returns are removed. `deepseek_v41_decode_workspace_size(B,K,backend=...)` is a
+pure byte-sizing helper, without CUDA or executable-plan creation.
 
-The adapter's scope is SM100 / H64 / Sq1 / D512. The primary Prims-TS mode uses
-explicit `torch.float8_e4m3fn` Q `[B,1,64,512]` and the same dtype of contiguous,
-unit-scale SWA `[pages,64,1,512]`. This is plain row-major E4M3 without a scale
-plane. `deepseek_v41_quantize_cache(..., format="swa_fp8")` is the optional
-writer. Decode does not silently quantize BF16 Q or accept cross-paired formats.
+Scope is SM100/H64/Sq1/D512. Prims-TS requires explicit E4M3 Q `[B,1,64,512]`
+and typed E4M3 SWA width512, without a side plane. Optional BF16-Q/MXFP8-SWA
+compatibility remains removed; non-E4M3 Q rejects before device queries/shared
+validation/compilation, without conversion or Frost fallback. Frost retains
+BF16 Q and uint8 MXFP8 SWA width528/group32 E8M0 scales. Both accept optional
+uint8 FP4 main width288/group16 E4M3. Packed page64 payload rows precede scale
+rows. Default HND is `[pages,1,64,width]`, explicit NHD `[pages,64,1,width]`;
+singleton-head views change no bytes. All three writer formats retain their
+arithmetic, with the same new HND default. Main is not V4's384-byte NVFP4 ABI.
 
-The separate follow-up adds optional BF16-Q/uint8-MXFP8-SWA compatibility in
-`experimental/deepseek_v41/prims_ts_mxfp8.py`. That explicit input pairing is
-routed by a function-local import; native FP8 calls do not import or compile the
-extension. Its compiler, plan and `deepseek_v41_prims_ts_mxfp8` JIT namespace are
-separate from the primary native `deepseek_v41_prims_ts_fp8` path. Its BK64/BF16
-Keep-AB graph uses fused split-1 finalization. `prims_ts_mxfp8_resources.py` adds
-E8M0 SWA conversion and mixed-source routing, inheriting FP4 stores and all-writer
-publication from the unchanged BF16 `Fp4KvProducer` / `Fp4SmemKvResource` in
-`prims_ts_resources.py`, not the native mode's FP8 specialization. Plans cannot
-cross modes, even with otherwise matching declarations.
+Required combined int32 `[B,128+K]` indices contain128 SWA columns then K main
+columns, K=0/64/.../512. Required int32 `[B]` topk lengths include128 fixed SWA
+positions; main prefix is `topk-128`. Required seq lengths keep SWA prefix
+`[0,clamp(seq_lens,0,128))` as explicit V4.1 policy. The actual V4 H64/Sq1
+CAKE routes do not receive seq_lens; default TRTLLM cubin short-sequence behavior
+has not been independently qualified. Malformed lengths are clamped and negative,
+sentinel and out-of-capacity IDs masked, preserving holes and duplicates. Native
+checks raw combined metadata inside attention; Frost writes compact source tables
+in prepare. Fixed execution spans and live metadata refresh every call/replay,
+without CPU `.item()`.
 
-Frost retains BF16 Q and uint8 page64 MXFP8 SWA of width 528, with group32 E8M0
-scales. Both backends may use optional uint8 FP4 compressed caches of width 288.
-Packed MXFP8/FP4 use a page-plane ABI: all data rows precede all scale rows within
-each page. Window indices have capacity 128; compressed capacity is a multiple
-of 64 up to 512. Shared validation opts into the FP8 contract only for Prims-TS;
-the public default and Frost contract are unchanged.
+Both sources must already be in common KV units. Runtime Python-scalar BMM1 is
+positive finite FP32; BMM2 is finite FP32. For Q descale q_s, common KV descale
+s>0 and attention factor alpha, pass `alpha*q_s*s` and `s`. Native main directly
+rounds/saturates exact `E2M1*original_group16_E4M3_scale` to E4M3; it does not
+calculate amax/request descales, divide by BMM2, or restore factors twice.
+Signed zero/subnormals remain; +/-448 cache-unit saturation is intentional.
+Normalize both writer inputs upstream for nonunit s; inconsistent encoded
+units are not repaired. Public defaults are1.0/1.0, matching V4: pass
+512**-0.5/1.0 explicitly for the former V4.1 attention factor. Runtime scalar
+changes need no value-specific compile; captured values require recapture.
+This local simplification does not establish official token/block64 quantization
+or checkpoint equivalence.
 
-**The native wrapper's packed-input restriction remains unchanged.**
-`BatchSparseMLADecodePagedTSWrapper` still takes matching native BF16 or E4M3
-Q/KV, not these uint8 MXFP8/FP4 pools. The cache/resource adapter is not a new
-input mode of the native wrapper and does not extend its existing CuTe DSL 4.7
-contract.
+The adapter opts into private `sparse_split_softmax_scale`, default-false in
+shared native configuration and restricted to its fixed direct/static E4M3
+Keep-AB/M64/BK128/D512/split1/nonpersistent topology. Maxima remain raw scores;
+explicit non-FTZ RN operations scale differences by runtime BMM1 before log2
+conversion. Each masked probability is zeroed before both FP32 summation and
+FP8 packing, preventing tiny positive BMM1 from reviving the finite mask
+sentinel. Natural-domain sink FMA and direct natural LSE avoid precomputing an
+overflowing `BMM1*log2(e)`. Generic native arithmetic is unchanged. Frost uses
+analogous difference-first arithmetic and raw-max/sum split statistics instead
+of potentially overflowed scaled partial LSE; its policy/schedule is unchanged.
 
-The V4.1 adapter requires **CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler**;
-a system CUDA 13 toolkit alone is insufficient. Fixed **Keep-AB / M64 /
-retained-KV8 / split 1 / nonpersistent** execution uses BK128 and E4M3 Q/K/V/P
-for both native source passes, separate from the native scheduling policy below.
-The optional BF16-Q/MXFP8 adapter retains BK64/BF16 arithmetic. There are no
-measured backend crossovers or tuned batch thresholds.
+**The native wrapper's packed-input restriction is unchanged.**
+`BatchSparseMLADecodePagedTSWrapper` still accepts matching native BF16 or E4M3
+Q/KV, not the adapter's uint8 MXFP8/FP4 pools. Its existing DSL4.7 requirement
+and public metadata/scale behavior remain unchanged.
 
-The compiled callable first launches GPU index sanitation, then the native
-sparse attention graph on the same stream. Sanitation maps negative,
-out-of-capacity and reserved-sentinel indices to holes without compacting the
-lists or removing duplicates. Plan-owned selection buffers are refreshed on
-every call, including CUDA Graph replay. Fixed source lengths preserve list
-positions; true valid counts and real zero extra lengths are refreshed for the
-independent source passes.
+The V4.1 adapter requires **CuTe-DSL >=4.8 with its bundled CUDA13 compiler**;
+system CUDA13 alone is insufficient. Fixed Keep-AB/M64/BK128/retained-KV8/split1/
+nonpersistent execution uses one joint E4M3 Q/K/V/P attention with inline raw
+combined metadata checks and original optional sinks, without native prepare.
+The producer-owned binder returns the same bounded physical-ID predicates to
+KV gather and softmax, before task-manager construction; generic prepared-list
+binding remains unchanged. A fixed SWA HEAD/main LOOP domain includes a masked
+K0 main task, without reading a nonexistent combined-table column. One online
+softmax/PV state applies P448 compensation and sink mass once before final BF16
+output. Internal FP32 natural-log LSE excludes sinks; empty O=0/LSE=-inf. There
+are no per-source O/LSE buffers, main scale tensor or merge launch. Native scratch
+contains only LSE and the K0 dummy. Mixed/window target one launch, requiring
+actual GPU-node validation; Frost retains prepare and its attention scheduling
+(two unsplit/three split launches). No performance benefit is claimed.
 
-In ordinary-FP8 mode, SWA uses the native typed E4M3 TMA/QK/P/PV path; there
-are no BF16 SWA stages or dequantized KV buffers. Main/global storage remains
-packed E2M1 plus group16 E4M3 scales in width-288 page planes. Preparation computes
-one positive FP32 descale per request from the exact amax of its valid selected
-main values, after applying their group scales: `s = div.rn.f32(amax, 448)`, or 1
-for zero/empty selections. It reads actual payload, not `max(group_scale) * 6`,
-and excludes invalid/unselected slots. Scales below 1 are allowed. Only selected
-main tiles are normalized by `div.rn.f32(x, s)`, then rounded/saturated to E4M3,
-retaining signed zero, subnormals and halfway-even behavior. The FP8 shared-memory
-tiles feed QK and PV in a separate BK128/E4M3 pass using the original FP8 Q.
-The main-only private `sparse_request_kv_scale` opt-in retains static base factors
-and restores `ss[request]` in both the softmax and output factors. Its producer
-receives that same FP32 `[B]` tensor via optional `kv_producer_runtime_args`;
-ordinary static and dynamic scalar `[0]` paths are unchanged. Neither mixed nor
-window-only native mode expands Q to BF16 or allocates BF16 query scratch or a
-full converted cache. Computing amax adds a selected-main read; performance is
-unmeasured.
-A narrow internal `source_state_store` hook publishes normalized FP32 O before
-native BF16 packing, with sink-free log2 LSE. It permits only
-nonfinalizing, direct-index, sink-free 1CTA Keep/M64/D512/no-RoPE/Sq1/V1,
-split-1/nonpersistent configurations and is mutually exclusive with output
-quantization. It does not add a public `out_dtype="fp32"` mode. The existing
-P448 compensation is retained; source O must not receive another 448 factor or
-another main descale. `MergeMlaSourceStates` merges the FP32 states, applies the
-sink once and rounds only final O to BF16, returning FP32 natural-log KV LSE.
-Mixed mode owns FP32 `[B]` main-scale scratch, refreshed on every call/replay even
-for zero/empty selections. Window-only omits global source states, main-scale
-storage and amax work; unused compiled slots alias existing buffers without being
-read or written as main scales.
+`MixedFp8KvProducer` / `MixedFp8SmemKvResource` in `prims_ts_resources.py` use
+physical `(main,SWA)` pools but logical primary SWA/extra main routes. Fixed128
+SWA positions give one SWA HEAD even when empty; subsequent LOOP tiles load main.
+Aligned16-byte SWA stores use native FP8 SW128, and exact selected FP4 converts
+directly to the same E4M3 stages. Both use per-writer async-proxy fences and all128
+writer arrivals before AsyncThread-to-UMMA publication. Adapter SWA intentionally
+uses thread loads, not TMA, avoiding mixed completion protocols. Q TMA and the
+generic native TMA producer are unchanged. Int64 widening precedes byte strides;
+invalid rows read no payload and stage zeros. K remains retained through delayed
+PV. There is no BF16 Q expansion or whole converted cache. BF16-named resource
+bases retain exact FP4 register conversion/selected loads, not BF16-Q support.
 
-The independent native reference gathers/masks before decoding main values,
-materializes FP32 amax/448 and FP32 x/s, then reconstructs FP64
-`E4M3(x/s) * s` before both logits and V. Main-only, mixed and window-only use the
-unchanged per-component FP8 probability-rounding bound, strict `atol=1e-5, rtol=0` sink-exclusive LSE and
-exact empty gates, not BF16 main-only gates. The joint KV maximum bounds each
-source's local maximum, so the existing summed underflow term covers both FP8
-source passes. Frost and optional BF16-Q/MXFP8 values/references/gates are unchanged.
+Generic internal source-store/request-scale hooks remain available and tested
+independently. The nonfinalizing 1CTA source store publishes normalized FP32 O
+and sink-free log2 LSE without another448 factor; it is not a public FP32 output
+mode or compatible with output quantization. Generic request factors and
+`MergeMlaSourceStates` behavior are unchanged; this adapter no longer uses them.
+The JIT namespace remains `deepseek_v41_prims_ts_fp8` with a versioned
+`shared_pertensor_joint` signature and the new source closure.
+
+Workspace is caller-owned contiguous int8/uint8,32-byte aligned and sufficiently
+large; undersizing never allocates a fallback. Frost split scratch is
+`B*64*split*514*4` bytes for FP32 partial O/raw maximum/sum. Out may allocate eagerly, but
+capture requires supplied out and warm compiled declarations. Keep captured
+pointers alive/fixed and update tensors in place. Concurrent calls need separate
+workspace/out or synchronization; workspace/out cannot overlap inputs or each
+other. Read-only inputs may alias. Caches hold no caller GPU buffers.
+
+Independent FP64 references mask/gather, decode exact scaled E2M1 and independently
+clamp/round to common-unit E4M3, then apply shared BMM factors once. The native
+componentwise FP8 bound, strict sink-exclusive LSE `atol=1e-5,rtol=0` and exact
+empty gates remain unchanged, including main-only. Frost values/references/gates
+are unchanged. Historical records below do not qualify this joint/shared-scale/
+API/HND-default revision; examples and benchmarks have not run.
+
+The lowering retry (2026-10-19, job5123805 on `umbriel-b200-091`, B200/148SMs,
+DSL4.8/compiler13.4) passed fresh strict CPU263 and isolated Frost capture1/1.
+Its24 passing smoke cases include four production-stage byte probes, both
+conversion-branch rounding replays, both >2GiB address cases, all eight actual
+single-kernel graphs and all eight live-metadata replay cases. The graph cases
+cover K0/64/192/512 with/without sinks; live metadata covers both backends at
+those widths. Eight preserved DOTs each show one finalizing attention/no prepare/
+zero edges; these cases passed unchanged output/LSE checks after real lowering.
+The next Frost K0 shared-BMM/layout case failed strict LSE:3/128 mismatches,
+max absolute1.0912699504928014e-5 versus1e-5/rtol0. Smoke ended24 passed/1 failed,
+10 unexecuted; allocated host/full/dense were prerequisite-skipped. Root FAILED/
+1:0 and all original GPU qualification fields remain false. Separate provenance-
+only corroboration matched10168 frozen inputs/Git, strict CPU263, exact interrupted
+reports/JUnit, eight graph DOTs and root-only accounting with0 errors; it does not
+make the failed run pass or qualify later Frost repairs. Root750 GPU-seconds
+brings cumulative use to7318,3482 remaining of10800. See the example README for
+sealed evidence. Examples/benchmarks have not run; no performance claim is made.
+
+The first inline-metadata GPU attempt (2026-10-19, job5122562 on B200/148SMs,
+DSL4.8/compiler13.4) passed isolated Frost capture1/1 and all four real producer-
+stage byte probes. The next smoke case failed during attention compilation with
+`BOUNDARY_META_LOOP_CARRY` for `scale_softmax_log2`, before numerical checks:
+4 passed/1 failed,30 smoke cases unexecuted; allocated host/full/dense were
+prerequisite-skipped. Root FAILED/1:0 is preserved. Independent source/terminal
+corroboration matched all10167 frozen inputs/Git and the strict CPU259 prerequisite;
+it does not turn the failed GPU acceptance audit into a pass. Native single-kernel
+graphs, live metadata replay and attention numerics remain unqualified, including
+the follow-up lowering repair. That repair materializes split-mode `LOG2_E` as
+FP32 SSA before constructing tasks: `Float32(Float32(LOG2_E).ir_value())` avoids
+the Python-double/rounded-FP32 loop-carry comparison without changing arithmetic
+or raw runtime scales. Host mock regressions are not CuTe lowering acceptance.
+See the example README for exact evidence and scope.
+
+The sealed pre-fusion removal baseline passed full221 in job5116654, but the
+job remains FAILED/1:0 after dense13 passed/44 plan-time `/tmp` ENOSPC failures.
+Fresh dense-only5118181 (B200/148SMs,DSL4.8/compiler13.4) passed57/57 with980
+warnings and COMPLETED/0:0. Its independent dense qualification is true, whole-
+regression qualification false;6617 frozen fingerprints/identities/reports/Git/
+visibility matched, and terminal corroboration passed. It does not relabel the
+original job or qualify fusion. See the example README for exact evidence.
+
+The following dated records preserve their original checkpoint-time status,
+not current fusion qualification. The later removal GPU baseline is above.
+
+Historical post-removal CPU/static acceptance (2026-10-18) passed **382/382** cases: 262
+source-state/resource/adapter/oracle, 7 conversion-lifetime, 67 benchmark/example
+defaults, 40 native host and 6 unknown-backend contracts. The fresh `-I -B -S`
+Python 3.12.3 / Torch 2.11.0+cu128 process used DSL 4.8.0 / bundled compiler
+metadata 13.4, static `sm_100`, thread caps and disabled plugin autoload/JIT.
+Pytest/strict exits were 0, with no failures/errors/skips/intercepted calls and
+uninitialized Torch CUDA. Independent postflight matched exact ordered JUnit
+identities, all 1146 passing setup/call/teardown reports, all 156 fingerprints,
+Git state, inherited visibility and default GC before validation-note edits.
+The tested patch is preserved; focused Ruff/syntax/whitespace checks passed.
+This is host/static qualification only, not CuTe lowering, GPU numerics or
+performance. GPU/example/benchmark execution has not run for the removal; see
+the example README for evidence.
+
+**Pre-removal validation boundary:** all dated records below, including the
+request-scaled full271/dense57 and 413-case CPU snapshot preserved in
+`d27624a74`, predate optional MXFP8 Prims-TS removal. They do not qualify the
+removal or its revised test manifest. Native kernels/ABI and Frost arithmetic
+are unchanged; GPU/example/benchmark execution has not been repeated for it.
 
 Request-scaled GPU validation (2026-10-18) passed on one allocated B200 / 148 SMs
 in `umb-b200-237` (job `5103699`, DSL 4.8.0 / bundled compiler 13.4): isolated
@@ -290,19 +374,17 @@ CUDA visibility were preserved within each matrix; packages were not patched.
 See the example README for exact results/provenance. This is CPU/static checking,
 not GPU/JIT qualification or a change to the native wrapper's DSL 4.7 contract.
 
-The native `Fp4Fp8KvProducer` / `Fp4Fp8SmemKvResource` specialization in
-`experimental/deepseek_v41/prims_ts_resources.py` loads only selected global FP4
-tiles, applies their group16 E4M3 scales and finite-clamped/RTNE conversion, then
-stores native D128 FP8 SW128 shared-memory stages. It reuses native dtype-specific
-K/V descriptors and retained-stage lifetime; it does not stage BF16 KV or expand Q.
-The same file's BF16 `Fp4KvProducer` / `Fp4SmemKvResource` remain unchanged for
-optional MXFP8 compatibility. Neither producer stages MXFP8 SWA, unpacks the whole
-cache or materializes selected dequantized KV in global memory. All 128 loader
-threads fence their own stores and arrive at an AsyncThread-to-UMMA pipeline;
-native TMA byte-completion accounting is not used for these thread-written stages.
-K stays retained through QK and delayed PV, using the existing native
-consumer-release protocol. The ordinary native TMA producer is unchanged when no
-custom producer is selected.
+The current `MixedFp8KvProducer` / `MixedFp8SmemKvResource` specialization in
+`experimental/deepseek_v41/prims_ts_resources.py` reuses the `Fp4Fp8` common-unit
+conversion bases and copies typed SWA bytes into the same D128 FP8 SW128 stages.
+Selected main applies original group16 E4M3 scales and direct RTNE/saturation,
+without request normalization. BF16-named bases provide exact register conversion
+and selected loads, not BF16 KV staging or Q expansion. No producer restores
+MXFP8-SWA support, unpacks the whole cache or materializes converted KV globally.
+All128 loaders fence their stores and arrive at the AsyncThread-to-UMMA pipeline;
+thread stages do not use native TMA byte completion. K stays retained through
+QK/delayed PV via the existing consumer-release protocol. The ordinary native
+TMA producer is unchanged when no custom producer is selected.
 
 Production-source B200 validation on `umbriel-b200-040` with CuTe-DSL 4.8.0 /
 bundled CUDA 13.4 and a fresh scratch workspace passed all 10 targeted tests,

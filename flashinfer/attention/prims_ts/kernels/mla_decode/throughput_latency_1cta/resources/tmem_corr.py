@@ -115,6 +115,7 @@ class TmemCorrResource(MlaResource):
 
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
+    raw_softmax_scale: Float32 = None
     output_scale: Float32 = None
     sparse_epilogue_params: object = None
     atten_sinks: object = None
@@ -559,10 +560,24 @@ class TmemCorrResource(MlaResource):
                     # P and the online sum use the same FP8 quantization scale.
                     # Undo that scale for the externally visible log-sum-exp.
                     lse_sum = lse_sum * fp8_quant_scale_rcp()
-                lse_val = (
-                    cute.math.log2(lse_sum, fastmath=True)
-                    + self.scale_softmax_log2 * selected_max
-                )
+                if cutlass.const_expr(self.cfg.sparse_split_softmax_scale):
+                    # Private DS4.1 LSE excludes the sink and is natural-log
+                    # directly; a log2-domain intermediate can overflow even
+                    # when the final natural LSE is representable in FP32.
+                    log2_sum = cute.math.log2(lse_sum, fastmath=True)
+                    natural_logsum = fmul2(
+                        (log2_sum, log2_sum), (Float32(LN_2), Float32(LN_2))
+                    )
+                    lse_val = ffma2(
+                        (self.raw_softmax_scale, self.raw_softmax_scale),
+                        (selected_max, selected_max),
+                        natural_logsum,
+                    )[0]
+                else:
+                    lse_val = (
+                        cute.math.log2(lse_sum, fastmath=True)
+                        + self.scale_softmax_log2 * selected_max
+                    )
                 if cutlass.const_expr(self.cfg.sparse_direct):
                     if selected_max == neg_max_f32():
                         lse_val = Float32(-Float32.inf)
@@ -575,11 +590,16 @@ class TmemCorrResource(MlaResource):
                                 2 + self.cfg.logical_num_heads_q + batch_idx
                             ]
                         )
-                    lse_val = (
-                        lse_val * Float32(LN_2)
-                        if count > Float32(0)
-                        else Float32(-Float32.inf)
-                    )
+                    if cutlass.const_expr(self.cfg.sparse_split_softmax_scale):
+                        lse_val = (
+                            lse_val if count > Float32(0) else Float32(-Float32.inf)
+                        )
+                    else:
+                        lse_val = (
+                            lse_val * Float32(LN_2)
+                            if count > Float32(0)
+                            else Float32(-Float32.inf)
+                        )
                     valid_output_row = valid_output_row and cta_idx_head_dim_v == Int32(
                         0
                     )
@@ -1243,10 +1263,23 @@ class TmemCorrResource(MlaResource):
             scale_is_identity = old_max == new_max
             scale_vals[0] = Float32(1.0)
             if not scale_is_identity:
-                scale_vals[0] = cute.math.exp2(
-                    self.scale_softmax_log2 * (old_max - new_max),
-                    fastmath=True,
-                )
+                if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+                    scale_vals[0] = Float32(0.0)
+                    if old_max != neg_max_f32():
+                        max_delta = fadd2((old_max, old_max), (-new_max, -new_max))
+                        natural_delta = fmul2(
+                            max_delta, (self.raw_softmax_scale, self.raw_softmax_scale)
+                        )
+                        log2_delta = fmul2(
+                            natural_delta,
+                            (self.scale_softmax_log2, self.scale_softmax_log2),
+                        )
+                        scale_vals[0] = cute.math.exp2(log2_delta[0], fastmath=True)
+                else:
+                    scale_vals[0] = cute.math.exp2(
+                        self.scale_softmax_log2 * (old_max - new_max),
+                        fastmath=True,
+                    )
             lane_scales_are_identity = scale_is_identity
         else:
             lane_scales_are_identity = cutlass.Boolean(True)
@@ -1487,14 +1520,29 @@ class TmemCorrResource(MlaResource):
                         )
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
-                        sink = Float32(self.atten_sinks[logical_head])
+                        sink = Float32(-Float32.inf)
+                        if cutlass.const_expr(self.atten_sinks is not None):
+                            sink = Float32(self.atten_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
                         elif sink != Float32(Float32.inf):
-                            delta = (
-                                sink * Float32(LOG2_E)
-                                - self.scale_softmax_log2 * final_max[scale_idx]
-                            )
+                            if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+                                # Subtract in natural units with one RN/non-FTZ
+                                # FMA, then convert. Separately scaled sink/max
+                                # or BMM1 * LOG2_E can introduce inf - inf.
+                                natural_delta = ffma2(
+                                    (-self.raw_softmax_scale, -self.raw_softmax_scale),
+                                    (final_max[scale_idx], final_max[scale_idx]),
+                                    (sink, sink),
+                                )
+                                delta = fmul2(
+                                    natural_delta, (Float32(LOG2_E), Float32(LOG2_E))
+                                )[0]
+                            else:
+                                delta = (
+                                    sink * Float32(LOG2_E)
+                                    - self.scale_softmax_log2 * final_max[scale_idx]
+                                )
                             attention_rescale = cute.math.exp2(
                                 -cute.math.max(delta, Float32(0)), approx=True
                             )

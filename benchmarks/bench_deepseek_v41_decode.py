@@ -5,29 +5,27 @@
 python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
     --backends cute-dsl prims-ts --context 32768 --output results.json
 
-The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts defaults
-to explicit E4M3 Q/ordinary FP8 SWA and E4M3 Q/K/V/P attention for both sources.
-Valid selected packed FP4 main rows apply group16 E4M3 scales, then share one
-request FP32 descale RN(selected payload amax/448), or 1 for zero/empty requests.
-FP32 x/descale is rounded to E4M3 with RN/satfinite; represented K/V multiply by
-the descale, so decoded values up to +/-2688 are not clipped to +/-448. Q/SWA
-remain unit E4M3. No BF16 query expansion is used.
---prims-ts-mode mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA and legacy gates.
+The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts uses
+explicit E4M3 Q and typed E4M3 SWA, with E4M3 Q/K/V/P attention for both sources.
+SWA and main use common cache units and one pair of runtime BMM factors. Native
+main applies its original group16 E4M3 scales, then directly rounds/saturates to
+E4M3, without amax, request descales or division. Values outside +/-448 cache
+units intentionally saturate. No BF16 query expansion or full converted cache
+is used. This fixture uses common KV descale 1 and explicitly passes the former
+V4.1 attention factor 512**-0.5; the V4-style public default is now 1.0.
 Native and legacy arms have different represented inputs and arithmetic, not
 identical precision. All derive from common seeded BF16 sources and share one
-packed global FP4 pool/indices, not a full converted cache.
-FlashMLA is an optional external legacy BF16-Q/MXFP8 benchmark dependency,
-enabled only by --flashmla, not a shipped decode backend. Cache-writer
-quantization, allocation, JIT and host overhead are excluded from GPU timing.
-Each timed invocation includes the full public replay: GPU selection/count/amax
-preparation, selected-tile staging, both source passes and merge.
+packed global FP4 pool/indices. FlashMLA is an optional external legacy
+BF16-Q/MXFP8 dependency, enabled only by --flashmla, not a shipped backend.
+Each timed invocation includes the complete public GPU replay: metadata
+sanitation and attention (inline metadata in one joint prims-ts attention;
+standalone preparation for Frost). Workspace,
+output and combined metadata are caller-owned and prepared outside timing;
+cache writing, allocation, JIT, capture and host overhead are excluded.
 Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
-a nonpersistent schedule. The source implementation historically passed the
-expanded 257-case B200 matrix and selected 57-case dense subset with DSL 4.8.0 /
-bundled CUDA 13.4. Those pre-FP8-main runs used BF16 main attention and predate the
-native-only source split. Neither those runs nor later unit-clipped FP8-main
-validation qualify request-scaled conversion. No GPU/JIT or benchmark validation
-has run for this change; performance and backend crossovers are unmeasured.
+a nonpersistent schedule. Historical GPU results do not qualify this joint
+shared-scale/caller-workspace revision. The revised benchmark has not run;
+performance and backend crossovers are unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
@@ -42,10 +40,16 @@ import traceback
 
 import torch
 
-from flashinfer.deepseek_v41 import deepseek_v41_decode, deepseek_v41_quantize_cache
+from flashinfer.deepseek_v41 import (
+    deepseek_v41_decode,
+    deepseek_v41_decode_workspace_size,
+    deepseek_v41_quantize_cache,
+)
 
 
 PRIMS_TS_SOURCES = (
+    "experimental/deepseek_v41/_sparse_views.py",
+    "experimental/deepseek_v41/_workspace.py",
     "experimental/deepseek_v41/prims_ts.py",
     "experimental/deepseek_v41/prims_ts_fp8.py",
     "experimental/deepseek_v41/prims_ts_resources.py",
@@ -60,16 +64,6 @@ PRIMS_TS_SOURCES = (
     "attention/prims_ts/kernels/mla_decode/sparse_views.py",
     "attention/prims_ts/kernels/separate_reduction.py",
 )
-PRIMS_TS_MXFP8_SOURCES = (
-    "experimental/deepseek_v41/prims_ts_mxfp8.py",
-    "experimental/deepseek_v41/prims_ts_mxfp8_resources.py",
-)
-
-
-def prims_ts_sources(prims_ts_mode="fp8"):
-    return PRIMS_TS_SOURCES + (
-        PRIMS_TS_MXFP8_SOURCES if prims_ts_mode == "mxfp8" else ()
-    )
 
 
 def selected(pool, indices, fp4, *, round_bf16=True):
@@ -97,7 +91,7 @@ def selected(pool, indices, fp4, *, round_bf16=True):
     return represented.bfloat16().double() if round_bf16 else represented
 
 
-def fixture(batch, context, seed, backends, flashmla=False, *, prims_ts_mode="fp8"):
+def fixture(batch, context, seed, backends, flashmla=False):
     torch.manual_seed(seed + batch)
     q_source = torch.randn(batch, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
     w_source = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16)
@@ -107,7 +101,9 @@ def fixture(batch, context, seed, backends, flashmla=False, *, prims_ts_mode="fp
     ci = torch.empty(batch, 1, 512, device="cuda", dtype=torch.int32)
     for b in range(batch):
         values = torch.randn(context, 512, device="cuda", dtype=torch.bfloat16)
-        cache = deepseek_v41_quantize_cache(values, format="main_kv_fp4")
+        cache = deepseek_v41_quantize_cache(
+            values, format="main_kv_fp4", kv_layout="NHD"
+        )
         main[b * (context // 64) : (b + 1) * (context // 64)].copy_(cache)
         ci[b, 0] = (
             torch.randperm(context, device="cuda")[:512].sort().values + b * context
@@ -125,23 +121,20 @@ def fixture(batch, context, seed, backends, flashmla=False, *, prims_ts_mode="fp
     # Do not allocate a second production-sized global pool or converted cache.
     shared = main, wi, ci, sink
     arms = {}
-    prims_ts_mxfp8 = "prims-ts" in backends and prims_ts_mode == "mxfp8"
-    if "cute-dsl" in backends or flashmla or prims_ts_mxfp8:
+    if "cute-dsl" in backends or flashmla:
         legacy = (
             q_source,
-            deepseek_v41_quantize_cache(w_source, format="swa_mxfp8"),
+            deepseek_v41_quantize_cache(w_source, format="swa_mxfp8", kv_layout="NHD"),
             *shared,
         )
         if "cute-dsl" in backends:
             arms["cute-dsl"] = legacy
         if flashmla:
             arms["flashmla"] = legacy
-        if prims_ts_mxfp8:
-            arms["prims-ts"] = legacy
-    if "prims-ts" in backends and not prims_ts_mxfp8:
+    if "prims-ts" in backends:
         arms["prims-ts"] = (
             q_source.to(torch.float8_e4m3fn),
-            deepseek_v41_quantize_cache(w_source, format="swa_fp8"),
+            deepseek_v41_quantize_cache(w_source, format="swa_fp8", kv_layout="NHD"),
             *shared,
         )
     return arms
@@ -157,22 +150,9 @@ def legacy_reference(q, swa, main, wi, ci, sink):
     return expected, scores.logsumexp(-1)
 
 
-def request_scaled_main(decoded):
-    """Independent FP32 normalization, then FP64 represented main K/V."""
-    decoded = decoded.float()
-    if decoded.shape[1]:
-        amax = decoded.abs().amax(dim=(1, 2), keepdim=True)
-    else:
-        amax = torch.zeros(
-            (decoded.shape[0], 1, 1), device=decoded.device, dtype=torch.float32
-        )
-    # CUDA scalar division may strength-reduce to reciprocal multiplication.
-    divisor = torch.full_like(amax, 448.0)
-    scale = torch.where(amax > 0, (amax / divisor).float(), 1)
-    # Materialize float32 division, not an FP64 quotient or reciprocal multiply.
-    normalized = (decoded / scale).float()
-    staged = normalized.clamp(-448, 448).to(torch.float8_e4m3fn)
-    return staged.double() * scale.double(), scale
+def common_unit_main(decoded):
+    """Independent common-unit E4M3 staging, without amax or a request descale."""
+    return decoded.float().clamp(-448, 448).to(torch.float8_e4m3fn).double()
 
 
 def selected_main_fp8(pool, safe, valid):
@@ -193,18 +173,19 @@ def selected_main_fp8(pool, safe, valid):
     scale = torch.where(valid[..., None], scale, 0)
     scale = scale.contiguous().view(torch.float8_e4m3fn).float()
     decoded = data * scale  # E2M1 * finite E4M3 is exact in float32.
-    represented, _ = request_scaled_main(decoded)
-    return represented
+    return common_unit_main(decoded)
 
 
-def fp8_oracle(q, swa, global_cache, wi, ci, sink):
-    """FP64 represented-input oracle and native componentwise FP8 bound.
+def fp8_oracle(
+    q, swa, global_cache, wi, ci, sink, *, bmm1_scale=512**-0.5, bmm2_scale=1.0
+):
+    """FP64 represented-input oracle and unchanged componentwise FP8 bound.
 
-    Gather and mask selected main bytes before decoding exact scaled E2M1.
-    Each request uses its payload amax/448 in FP32 (1 only for zero/empty),
-    FP32 x/scale, E4M3 RN/satfinite, then FP64 staged*scale for both QK and V.
-    Q/SWA remain unit E4M3. The attention/bound calculation matches the independent
-    native GPU tests; no production conversion helper or source state is reused.
+    Gather/mask selected main bytes before exact E2M1*group16 E4M3 decode,
+    then independently clamp/round to E4M3 in common cache units. Shared BMM1
+    scales logits and BMM2 scales output; there is no request amax or division.
+    The attention/bound calculation matches the independent native GPU tests;
+    no production conversion helper or source state is reused.
     """
     values, masks = [], []
     for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
@@ -220,20 +201,19 @@ def fp8_oracle(q, swa, global_cache, wi, ci, sink):
         values.append(torch.where(valid[..., None], gathered, 0))
         masks.append(valid)
     kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
-    logits = torch.einsum("bhd,bkd->bhk", q[:, 0].double(), kv) * 512**-0.5
+    logits = torch.einsum("bhd,bkd->bhk", q[:, 0].double(), kv) * bmm1_scale
     logits.masked_fill_(~valid[:, None], -math.inf)
     kv_lse = logits.logsumexp(-1)
     normalizer = torch.logaddexp(kv_lse, sink.double()[None, :])
     weights = torch.exp(logits - normalizer[..., None])
     weights = torch.where(torch.isfinite(normalizer)[..., None], weights, 0)
-    expected = torch.einsum("bhk,bkd->bhd", weights, kv)
-    sensitivity = torch.einsum("bhk,bkd->bhd", weights, kv.abs())
+    expected = torch.einsum("bhk,bkd->bhd", weights, kv) * bmm2_scale
+    sensitivity = torch.einsum("bhk,bkd->bhd", weights, kv.abs()) * abs(bmm2_scale)
     max_logit = logits.max(-1).values
     frame_mass = torch.exp(max_logit - normalizer)
     frame_mass = torch.where(torch.isfinite(kv_lse), frame_mass, 0)
-    underflow = frame_mass[..., None] * kv.abs().sum(1)[:, None, :]
-    # The joint maximum bounds each FP8 source's local maximum, so the summed
-    # underflow term remains conservative with two independent FP8 source passes.
+    underflow = frame_mass[..., None] * kv.abs().sum(1)[:, None, :] * abs(bmm2_scale)
+    # The same componentwise bound now covers one joint online-softmax pass.
     bound = (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6
     bound = torch.where(torch.isfinite(kv_lse)[..., None], bound, 0)
     return expected, kv_lse, bound
@@ -262,8 +242,8 @@ def check_legacy(out, stats):
     )
 
 
-def check_arm(name, args, fn, batch, output, *, prims_ts_mode="fp8"):
-    native_fp8 = name == "prims-ts" and prims_ts_mode == "fp8"
+def check_arm(name, args, fn, batch, output):
+    native_fp8 = name == "prims-ts"
     reference = fp8_oracle(*args) if native_fp8 else legacy_reference(*args)
     expected, expected_lse = reference[:2]
     out, lse = fn()
@@ -316,9 +296,9 @@ def check_arm(name, args, fn, batch, output, *, prims_ts_mode="fp8"):
     return stats
 
 
-def arm_metadata(name, args, *, prims_ts_mode="fp8"):
+def arm_metadata(name, args):
     q, swa, main, _, _, _ = args
-    native_fp8 = name == "prims-ts" and prims_ts_mode == "fp8"
+    native_fp8 = name == "prims-ts"
     contract = {"reference": "independent FP64 over this arm's represented Q/KV"}
     if native_fp8:
         arithmetic = (
@@ -327,16 +307,15 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
             "original E4M3 Q, no BF16 query scratch"
         )
         global_conversion = (
-            "request_scaled: valid selected E2M1 * signed finite group16 E4M3; "
-            "one FP32 s[b]=RN(selected payload amax/448), 1 only for zero/empty; "
-            "RN_FP32(x/s) -> E4M3 RN/satfinite SMEM; represented double(staged)*double(s), "
-            "not unit-clipped (decoded finite range +/-2688); Q/SWA remain unit E4M3"
+            "common cache units: valid selected E2M1 * signed finite group16 E4M3 "
+            "-> E4M3 RN/satfinite SMEM; intentional +/-448 cache-unit saturation; "
+            "no request amax, descale or division; shared runtime BMM1/BMM2"
         )
         contract.update(
             reference=(
-                "independent FP64 over stored E4M3 Q/SWA and request_scaled main KV; "
-                "mask selected packed bytes before exact decode/amax, materialize FP32 "
-                "x/s before E4M3 RN/satfinite, then double(staged)*double(s)"
+                "independent FP64 over stored E4M3 Q/SWA and common-unit E4M3 main; "
+                "mask selected packed bytes before exact decode, then independent "
+                "FP32 clamp -> E4M3 RN -> FP64; shared BMM factors applied once"
             ),
             output="componentwise native FP8 P-rounding bound (not legacy relative gates)",
             componentwise_bound=(
@@ -348,12 +327,7 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
         )
     else:
         global_conversion = "scaled E2M1 -> BF16 (unchanged legacy represented values)"
-        if name == "prims-ts":
-            arithmetic = (
-                "Prims-TS BF16 Q/dequantized MXFP8 SWA and FP4 global "
-                "(explicit mxfp8 override)"
-            )
-        elif name == "cute-dsl":
+        if name == "cute-dsl":
             arithmetic = "Frost BF16 Q/dequantized MXFP8 SWA and FP4 global"
         else:
             arithmetic = (
@@ -363,7 +337,6 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
             rel_l2_lt=0.005, max_scaled_lt=0.01, sink_exclusive_lse_abs_lt=1e-5
         )
     metadata = {
-        "prims_ts_mode": prims_ts_mode if name == "prims-ts" else None,
         "q_dtype": str(q.dtype),
         "swa_encoding": "swa_fp8" if native_fp8 else "swa_mxfp8",
         "global_encoding": "main_kv_fp4",
@@ -372,16 +345,64 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
         "cache_shape": {"swa": list(swa.shape), "global_fp4": list(main.shape)},
         "arithmetic": arithmetic,
         "accuracy_contract": contract,
+        "kv_layout": "NHD",
+        "bmm1_scale": 512**-0.5,
+        "bmm2_scale": 1.0,
     }
     if native_fp8:
         metadata.update(
-            global_precision="request_scaled_e4m3",
-            main_scale="FP32[B] scratch, refreshed per call; None in window-only plans",
-            compile_marker=(
-                "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3"
-            ),
+            global_precision="shared_pertensor_e4m3",
+            main_scale="none; caller's common KV units, shared runtime BMM factors",
+            compile_marker="dsv41_shared_pertensor_joint_e4m3_swa512_fp4_inline_metadata_v2",
         )
     return metadata
+
+
+def prepare_decode(args, backend):
+    """Own public replay buffers; keep oracle fixtures independent of the API."""
+    from flashinfer.experimental.deepseek_v41._workspace import (
+        split_kv,
+        workspace_views,
+    )
+
+    q, swa, main, wi, ci, sink = args
+    batch, compressed_k = q.shape[0], ci.shape[-1]
+    indices = torch.cat((wi[:, 0], ci[:, 0]), dim=1)
+    topk_lens = torch.full(
+        (batch,), 128 + compressed_k, device=q.device, dtype=torch.int32
+    )
+    seq_lens = torch.full((batch,), 128, device=q.device, dtype=torch.int32)
+    workspace = torch.empty(
+        deepseek_v41_decode_workspace_size(batch, compressed_k, backend=backend),
+        device=q.device,
+        dtype=torch.uint8,
+    )
+    out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
+    lse = workspace_views(workspace, batch, compressed_k, backend=backend).lse
+
+    def call():
+        result = deepseek_v41_decode(
+            q,
+            swa,
+            workspace,
+            indices,
+            main,
+            topk_lens,
+            seq_lens,
+            out,
+            bmm1_scale=512**-0.5,
+            bmm2_scale=1.0,
+            sinks=sink,
+            kv_layout="NHD",
+            backend=backend,
+        )
+        # LSE stays private scratch: the public API returns only BF16 output.
+        return result, lse
+
+    return call, {
+        "workspace_bytes": workspace.numel(),
+        "split": 1 if backend == "prims-ts" else split_kv(batch, compressed_k),
+    }
 
 
 def graph(fn):
@@ -407,13 +428,7 @@ def build_parser():
         nargs="+",
         choices=("cute-dsl", "prims-ts"),
         default=["cute-dsl"],
-        help="prims-ts defaults to E4M3 Q/ordinary FP8 SWA; cute-dsl retains BF16 Q/MXFP8 SWA",
-    )
-    parser.add_argument(
-        "--prims-ts-mode",
-        choices=("fp8", "mxfp8"),
-        default="fp8",
-        help="prims-ts only: mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA",
+        help="prims-ts uses E4M3 Q/SWA in common KV units; cute-dsl retains BF16 Q/MXFP8 SWA",
     )
     parser.add_argument("--flashmla", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -427,19 +442,34 @@ def main():
     if opts.context < 512 or opts.context % 64:
         raise ValueError("context must be a multiple of64 >=512")
     import cutlass
-    from flashinfer.experimental.deepseek_v41 import cache, decode, hca_v41_primitives
+    from flashinfer import deepseek_v41
+    from flashinfer.experimental.deepseek_v41 import (
+        _metadata,
+        _workspace,
+        cache,
+        decode,
+        hca_v41_primitives,
+    )
 
     source_paths = {
-        m.__name__: Path(m.__file__) for m in (cache, decode, hca_v41_primitives)
+        m.__name__: Path(m.__file__)
+        for m in (
+            deepseek_v41,
+            _metadata,
+            _workspace,
+            cache,
+            decode,
+            hca_v41_primitives,
+        )
     }
     if "cute-dsl" in opts.backends:
         from flashinfer.experimental.deepseek_v41 import hca_v41
 
         source_paths[hca_v41.__name__] = Path(hca_v41.__file__)
     if "prims-ts" in opts.backends:
-        # Hash sources without importing either mode just for provenance.
+        # Hash native sources without importing them just for provenance.
         package_root = Path(decode.__file__).resolve().parents[2]
-        for relative in prims_ts_sources(opts.prims_ts_mode):
+        for relative in PRIMS_TS_SOURCES:
             source_paths[f"flashinfer.{relative[:-3].replace('/', '.')}"] = (
                 package_root / relative
             )
@@ -447,7 +477,6 @@ def main():
         "status": "running",
         "implementation": "deepseek_v41",
         "backends": opts.backends,
-        "prims_ts_mode": opts.prims_ts_mode,
         "device": str(torch.cuda.get_device_properties(0)),
         "torch": torch.__version__,
         "toolchain": {
@@ -466,17 +495,17 @@ def main():
         ),
         "comparison": (
             "common seeded BF16 source Q/SWA; one shared packed global FP4 pool "
-            "and indices; native FP8 (when selected) uses selected-request payload "
-            "amax and FP32 division for request_scaled E4M3 main tiles, not unit clipping; "
-            "legacy represented main values remain BF16; "
-            "arm-specific arithmetic and accuracy contracts"
+            "and indices; native FP8 (when selected) directly stages common-unit "
+            "E4M3 main with intentional saturation, without amax or division; "
+            "legacy represented main values remain BF16; shared BMM pair "
+            "(512**-0.5, 1.0); arm-specific arithmetic and accuracy contracts"
         ),
         "seed": opts.seed,
         "timing": "CUDA Graph/event, 32 calls/replay, symmetric order, 30 samples/arm",
         "scope": (
-            "full public replay GPU latency, including selection/count/amax preparation, "
-            "selected-tile staging, both source passes and merge; "
-            "excludes cache-writer preparation/JIT/allocation/capture/host time"
+            "full public replay GPU latency: metadata sanitation and attention, "
+            "including selected-tile staging and joint native finalization; "
+            "excludes cache writing/metadata allocation/JIT/allocation/capture/host time"
         ),
         "sha256": {
             name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -493,20 +522,14 @@ def main():
                     opts.seed,
                     opts.backends,
                     opts.flashmla,
-                    prims_ts_mode=opts.prims_ts_mode,
                 )
-                plans, fns = {}, {}
+                buffers, fns = {}, {}
                 for backend in opts.backends:
-                    args = arm_args[backend]
-                    plans[backend] = deepseek_v41_decode(*args, backend=backend)[2]
-                    # Capture selection/count/amax prep, staging, source passes
-                    # and merge together; never hoist per-request descales.
-                    fns[backend] = lambda args=args, plan=plans[
-                        backend
-                    ], backend=backend: (
-                        deepseek_v41_decode(*args, plan=plan, backend=backend)[:2]
+                    fns[backend], buffers[backend] = prepare_decode(
+                        arm_args[backend], backend
                     )
-                del args
+                # Capture the full public call. Only caller-owned buffers and
+                # metadata declarations are prepared outside the timed region.
                 if opts.flashmla:
                     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -535,14 +558,7 @@ def main():
                     fns["flashmla"] = flashmla
                     del flashmla
                 stats = {
-                    name: check_arm(
-                        name,
-                        arm_args[name],
-                        fn,
-                        batch,
-                        opts.output,
-                        prims_ts_mode=opts.prims_ts_mode,
-                    )
+                    name: check_arm(name, arm_args[name], fn, batch, opts.output)
                     for name, fn in fns.items()
                 }
                 graphs = {name: graph(fn) for name, fn in fns.items()}
@@ -560,13 +576,11 @@ def main():
                         samples[name].append(start.elapsed_time(end) * 1000 / 32)
                 row = {
                     "batch": batch,
-                    "split": {name: plan.split for name, plan in plans.items()},
-                    "arms": {
-                        name: arm_metadata(
-                            name, arm_args[name], prims_ts_mode=opts.prims_ts_mode
-                        )
-                        for name in fns
+                    "split": {name: info["split"] for name, info in buffers.items()},
+                    "workspace_bytes": {
+                        name: info["workspace_bytes"] for name, info in buffers.items()
                     },
+                    "arms": {name: arm_metadata(name, arm_args[name]) for name in fns},
                     "correctness": stats,
                     "median_us": {k: statistics.median(v) for k, v in samples.items()},
                     "samples_us": samples,
@@ -574,7 +588,7 @@ def main():
                 report["rows"].append(row)
                 opts.output.write_text(json.dumps(report, indent=2))
                 print({k: row[k] for k in ("batch", "split", "median_us")}, flush=True)
-                del graphs, fns, plans, arm_args
+                del graphs, fns, buffers, arm_args
                 if opts.flashmla:
                     del meta
             report["status"] = "pass"

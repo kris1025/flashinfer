@@ -1,11 +1,68 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Shared input validation and plan/JIT dispatch for the Frost decode backend."""
+"""Caller-workspace/JIT dispatch for the Frost DS4.1 decode backend."""
 
-from dataclasses import dataclass
 import functools
+
 import torch
-from ._utils import _overlaps
+
+from . import _workspace
+from ._workspace import bind_inputs, device_sm_count, split_kv
+
+
+@functools.cache
+def _compile_prepare(device_index, compressed_k, has_sink):
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError("warm DS4.1 metadata preparation before CUDA Graph capture")
+    import cutlass
+    import cutlass.cute as cute
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from . import _metadata
+
+    device_sm_count(device_index)
+    batch = cute.sym_int()
+    f = cute.runtime.make_fake_compact_tensor
+    indices = f(
+        cutlass.Int32,
+        (batch, 128 + compressed_k),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    selected_swa = f(cutlass.Int32, (batch, 128), stride_order=(1, 0), assumed_align=16)
+    selected_main = f(
+        cutlass.Int32,
+        (batch, max(64, compressed_k)),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    lengths = f(cutlass.Int32, (batch,), assumed_align=16)
+    sinks = f(cutlass.Float32, (64,), assumed_align=16)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = _metadata.PrepareMetadata(compressed_k, has_sink)
+    return build_and_load_cute_dsl_kernel(
+        "deepseek_v41_metadata",
+        f"v4_combined_c{compressed_k}_sink{int(has_sink)}_v1",
+        lambda: cute.compile(
+            kernel,
+            indices,
+            lengths,
+            lengths,
+            sinks,
+            selected_swa,
+            selected_main,
+            lengths,
+            lengths,
+            lengths,
+            lengths,
+            lengths,
+            sinks,
+            cutlass.Int64(1),
+            cutlass.Int64(1),
+            stream,
+            options="--enable-tvm-ffi --opt-level 2",
+        ),
+        extra_key_files=(__file__, _metadata.__file__, _workspace.__file__),
+    )
 
 
 @functools.cache
@@ -20,11 +77,13 @@ def _compile(
     persistent_ctas=0,
     compact_metadata=False,
 ):
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError("warm DS4.1 Frost decode before CUDA Graph capture")
     import cutlass
     import cutlass.cute as cute
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ...cute_dsl.attention.dsa import hca_helpers
-    from . import hca_v41, hca_v41_primitives
+    from . import _metadata, hca_v41, hca_v41_primitives
 
     if native_fp4 is None:
         # cute.compile uses CUTLASS's bundled compiler, not CUDA_HOME.
@@ -54,7 +113,7 @@ def _compile(
     valid = f(cutlass.Int32, (sb,), assumed_align=16)
     sink = f(cutlass.Float32, (64,), assumed_align=16)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    sm_count = device_sm_count(device_index)
     # WS is selected only for the measured K512 large-batch configuration.
     use_ws = dequant_warps == 16 and not split
     assert not persistent_ctas or use_ws
@@ -84,10 +143,10 @@ def _compile(
     )
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_decode",
-        f"h64_s1_c{compressed_k}_split{int(split)}"
+        f"v4_workspace_h64_s1_c{compressed_k}_split{int(split)}"
         f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}"
         f"_nativefp4{int(native_fp4)}_ws{int(use_ws)}_ctas{persistent_ctas}_sm{sm_count}"
-        f"_meta16{int(compact_metadata)}",
+        f"_meta16{int(compact_metadata)}_raw_bmm1_split_stats_v2",
         lambda: cute.compile(
             kernel,
             q,
@@ -103,7 +162,7 @@ def _compile(
             None,
             lengths,
             valid,
-            cutlass.Float32(512**-0.5),
+            cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             sink,
             stream,
@@ -111,6 +170,8 @@ def _compile(
         ),
         extra_key_files=(
             __file__,
+            _workspace.__file__,
+            _metadata.__file__,
             hca_v41.__file__,
             hca_v41_primitives.__file__,
             hca_helpers.__file__,
@@ -118,228 +179,97 @@ def _compile(
     )
 
 
-@dataclass(frozen=True)
-class _Plan:
-    signature: tuple
-    kernel: object
-    split: int
-    out: torch.Tensor
-    lse: torch.Tensor
-    workspace: object
-    lengths: torch.Tensor
-    window_valid: torch.Tensor
-    empty_cache: torch.Tensor
-    empty_indices: torch.Tensor
-
-
-def _validate_inputs(
-    q,
-    swa_cache,
-    global_cache,
-    swa_indices,
-    global_indices,
-    sink,
-    *,
-    allow_fp8_swa=False,
+def decode_mixed(
+    query,
+    swa_kv_cache,
+    workspace_buffer,
+    sparse_indices=None,
+    compressed_kv_cache=None,
+    sparse_topk_lens=None,
+    seq_lens=None,
+    out=None,
+    bmm1_scale=1.0,
+    bmm2_scale=1.0,
+    sinks=None,
+    kv_layout="HND",
 ):
-    """Validate the shared SM100 decode contract and return its declaration.
-
-    The default retains Frost's BF16-Q/uint8-MXFP8-SWA declaration. The
-    opt-in additionally accepts E4M3 Q paired with typed, unit-scale E4M3 SWA;
-    it never casts Q or reinterprets the legacy payload/scale layout.
-    """
-    if q.device.type != "cuda" or torch.cuda.get_device_capability(q.device) != (10, 0):
-        raise ValueError("CuTe DS4.1 decode currently requires SM100")
-    fp8_swa = allow_fp8_swa and q.dtype == torch.float8_e4m3fn
-    if (
-        q.ndim != 4
-        or q.shape[1:] != (1, 64, 512)
-        or not 1 <= q.shape[0] <= 65535
-        or (q.dtype != torch.bfloat16 and not fp8_swa)
-    ):
-        if allow_fp8_swa:
-            raise ValueError(
-                "Q must be BF16 or E4M3 [B,1,64,512], with 1 <= B <= 65535"
-            )
-        raise ValueError("Q must be BF16 [B,1,64,512], with 1 <= B <= 65535")
-    if (global_cache is None) != (global_indices is None):
-        raise ValueError("global cache and indices must both be present or absent")
-    inputs = tuple(
-        x
-        for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
-        if x is not None
+    bound = bind_inputs(
+        query,
+        swa_kv_cache,
+        workspace_buffer,
+        sparse_indices,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        seq_lens,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        sinks,
+        kv_layout,
+        backend="cute-dsl",
     )
-    if any(
-        x.device != q.device or not x.is_contiguous() or x.data_ptr() % 16
-        for x in inputs
-    ):
-        raise ValueError("inputs must be contiguous and 16-byte aligned on Q's device")
-    # Q selects exactly one SWA representation. Cross-pairing BF16 Q with
-    # typed SWA, or E4M3 Q with uint8 MXFP8/scales, is not a conversion path.
-    swa_width = 512 if fp8_swa else 528
-    swa_dtype = torch.float8_e4m3fn if fp8_swa else torch.uint8
-    if fp8_swa and swa_cache is None:
-        raise ValueError("E4M3 Q requires a nonempty E4M3 SWA [pages,64,1,512]")
-    for cache, width, dtype in (
-        (swa_cache, swa_width, swa_dtype),
-        (global_cache, 288, torch.uint8),
-    ):
-        if cache is not None and (
-            cache.ndim != 4
-            or cache.shape[1:] != (64, 1, width)
-            or cache.shape[0] < 1
-            or cache.dtype != dtype
-        ):
-            if dtype == torch.float8_e4m3fn:
-                raise ValueError("E4M3 Q requires a nonempty E4M3 SWA [pages,64,1,512]")
-            raise ValueError(
-                "cache must be a nonempty uint8 page pool with page size 64"
-            )
-    batch = q.shape[0]
-    if swa_indices.shape != (batch, 1, 128) or swa_indices.dtype != torch.int32:
-        raise ValueError("SWA indices must be int32 [B,1,128]")
-    if global_indices is not None and (
-        global_indices.ndim != 3
-        or global_indices.shape[:2] != (batch, 1)
-        or not 64 <= global_indices.shape[2] <= 512
-        or global_indices.shape[2] % 64
-        or global_indices.dtype != torch.int32
-    ):
-        raise ValueError(
-            "global indices must be int32 [B,1,K], K a multiple of64 up to512"
+    batch, ck, views = bound.batch, bound.compressed_k, bound.views
+    split = split_kv(batch, ck)
+    dequant_warps, phase_chunks, narrow_offsets = 8, 8, False
+    largest_pool = max(bound.swa_cache.numel(), bound.main_cache.numel())
+    if ck == 512 and batch >= 128:
+        dequant_warps, phase_chunks = 16, 2
+    elif ck == 512 and batch >= 64 and largest_pool < 2**31:
+        phase_chunks, narrow_offsets = 2, True
+    with torch.cuda.device(query.device):
+        persistent_ctas = 0
+        if dequant_warps == 16:
+            sm_count = device_sm_count(query.device.index)
+            if batch > sm_count:
+                waves = (batch + sm_count - 1) // sm_count
+                persistent_ctas = (batch + waves - 1) // waves
+        kernel = _compile(
+            query.device.index,
+            ck,
+            split > 1,
+            dequant_warps,
+            phase_chunks,
+            narrow_offsets,
+            persistent_ctas=persistent_ctas,
+            compact_metadata=bool(persistent_ctas) and largest_pool < 2**35,
         )
-    if sink.shape != (64,) or sink.dtype != torch.float32:
-        raise ValueError("sink must be FP32 [64]")
-    if torch.is_grad_enabled() and any(x.requires_grad for x in inputs):
-        raise ValueError("DS4.1 decode is inference-only")
-    return tuple(
-        None if x is None else (tuple(x.shape), tuple(x.stride()), x.dtype, x.device)
-        for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
-    )
+        prepare = _compile_prepare(query.device.index, ck, sinks is not None)
+        from cutlass import Int32, Int64, Float32
 
-
-def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None):
-    signature = _validate_inputs(
-        q, swa_cache, global_cache, swa_indices, global_indices, sink
-    )
-    batch = q.shape[0]
-    inputs = tuple(
-        x
-        for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
-        if x is not None
-    )
-    if plan is not None and (
-        not isinstance(plan, _Plan) or plan.signature != signature
-    ):
-        raise ValueError("decode plan declaration mismatch")
-    with torch.cuda.device(q.device):
-        if plan is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError("prepare a decode plan before CUDA Graph capture")
-            ck = 0 if global_indices is None else global_indices.shape[2]
-            # Keep the measured split schedule for low-latency small batches.
-            desired = (
-                10
-                if batch <= 4
-                else 8
-                if batch <= 16
-                else 4
-                if batch <= 32
-                else 2
-                if batch <= 64
-                else 1
-            )
-            split = min(desired, (128 + ck) // 64)
-            dequant_warps, phase_chunks, narrow_offsets = 8, 8, False
-            if ck == 512 and batch >= 128:
-                # WS QK/PV with fused softmax/correction uses sixteen dequant
-                # warps and a short load phase. Reuse CTAs only above one wave.
-                dequant_warps, phase_chunks = 16, 2
-            elif (
-                ck == 512
-                and batch >= 64
-                and max(swa_cache.numel(), global_cache.numel()) < 2**31
-            ):
-                # Narrow offsets only after proving both complete pools fit.
-                phase_chunks, narrow_offsets = 2, True
-            persistent_ctas = 0
-            if dequant_warps == 16:
-                sm_count = torch.cuda.get_device_properties(
-                    q.device
-                ).multi_processor_count
-                if batch > sm_count:
-                    # Balance requests per CTA across the minimum number of
-                    # waves, avoiding a short final wave on the full-SM grid.
-                    waves = (batch + sm_count - 1) // sm_count
-                    persistent_ctas = (batch + waves - 1) // waves
-            kernel = _compile(
-                q.device.index,
-                ck,
-                split > 1,
-                dequant_warps,
-                phase_chunks,
-                narrow_offsets,
-                persistent_ctas=persistent_ctas,
-                # Signed Int32 metadata stores 16-byte units. Prove the
-                # complete pools fit before selecting this specialization.
-                compact_metadata=(
-                    bool(persistent_ctas)
-                    and max(swa_cache.numel(), global_cache.numel()) < 2**35
-                ),
-            )
-            workspace = (
-                torch.empty(
-                    batch * 64 * split * 513 * 4, device=q.device, dtype=torch.int8
-                )
-                if split > 1
-                else None
-            )
-            plan = _Plan(
-                signature,
-                kernel,
-                split,
-                torch.empty_like(q),
-                torch.empty((batch, 64, 1), device=q.device, dtype=torch.float32),
-                workspace,
-                torch.full((batch,), 128 + ck, device=q.device, dtype=torch.int32),
-                torch.full((batch,), 128, device=q.device, dtype=torch.int32),
-                torch.empty((1, 64, 1, 288), device=q.device, dtype=torch.uint8),
-                torch.full((batch, 1, 64), -1, device=q.device, dtype=torch.int32),
-            )
-        owned = (
-            plan.out,
-            plan.lse,
-            plan.lengths,
-            plan.window_valid,
-            plan.empty_cache,
-            plan.empty_indices,
+        # Compile both specializations before the first metadata write. Warm
+        # cache hits need neither JIT nor device-property queries in capture.
+        prepare(
+            bound.indices,
+            bound.topk_lens,
+            bound.seq_lens,
+            views.sink if sinks is None else sinks,
+            views.selected_swa,
+            views.selected_main,
+            views.swa_lengths,
+            views.main_lengths,
+            views.total_lengths,
+            views.swa_counts,
+            views.main_counts,
+            views.sink,
+            Int64(bound.swa_cache.shape[0] * 64),
+            Int64(bound.main_cache.shape[0] * 64 if ck else 0),
         )
-        if plan.workspace is not None:
-            owned += (plan.workspace,)
-        if any(_overlaps(dst, src) for dst in owned for src in inputs):
-            raise ValueError("decode inputs must not overlap plan-owned buffers")
-        if torch.is_grad_enabled() and any(x.requires_grad for x in owned):
-            raise ValueError("DS4.1 decode is inference-only")
-        from cutlass import Int32, Float32
-
-        main = plan.empty_cache if global_cache is None else global_cache
-        ids = plan.empty_indices if global_indices is None else global_indices
-        plan.kernel(
-            q,
-            swa_cache.view(swa_cache.shape[0], -1),
-            main.view(main.shape[0], -1),
-            swa_indices.view(batch, 128),
-            ids.view(batch, -1),
-            plan.out,
-            plan.lse.view(batch, 1, 64),
-            plan.workspace,
-            Int32(plan.split),
-            plan.lengths,
+        kernel(
+            bound.query,
+            bound.swa_cache.view(bound.swa_cache.shape[0], -1),
+            bound.main_cache.view(bound.main_cache.shape[0], -1),
+            views.selected_swa,
+            views.selected_main,
+            bound.out,
+            views.lse.view(batch, 1, 64),
+            views.frost_scratch,
+            Int32(split),
+            views.total_lengths,
             None,
-            plan.lengths,
-            plan.window_valid,
-            Float32(512**-0.5),
-            Float32(1.0),
-            sink,
+            views.total_lengths,
+            views.swa_lengths,
+            Float32(bound.bmm1_scale),
+            Float32(bound.bmm2_scale),
+            views.sink,
         )
-    return plan.out, plan.lse, plan
+    return bound.out

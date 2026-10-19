@@ -96,7 +96,7 @@ def _quantize_swa_fp8(X, OUT, SLOTS, N, CAPACITY, HAS_SLOTS: tl.constexpr):
     x = tl.load(X + rows[:, None] * 512 + col[None, :], rows[:, None] < N, 0).to(
         tl.float32
     )
-    # Ordinary E4M3 has unit scale and no side plane. Explicit RTNE after the
+    # E4M3 stores common cache units without a scale plane. Explicit RTNE after the
     # finite-range clamp preserves signed zero and representable subnormals.
     fp8 = tl.minimum(tl.maximum(x, -448.0), 448.0).to(
         tl.float8e4nv, fp_downcast_rounding="rtne"
@@ -104,14 +104,15 @@ def _quantize_swa_fp8(X, OUT, SLOTS, N, CAPACITY, HAS_SLOTS: tl.constexpr):
     tl.store(OUT + slot[:, None] * 512 + col[None, :], fp8, valid[:, None])
 
 
-def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
+def quantize_cache(x, *, format, page_size=64, out=None, slots=None, kv_layout="HND"):
     """Write finite contiguous BF16/FP32 ``[N,512]`` rows into a decode pool.
 
-    ``swa_fp8`` is ordinary unit-scale E4M3: clamp to ``[-448,448]`` and round
-    to nearest even, preserving signed zero and subnormals. Its typed
-    ``torch.float8_e4m3fn [pages,64,1,512]`` payload is plain row-major storage,
-    without the E8M0 scale plane of the separate uint8 ``swa_mxfp8`` format.
+    ``swa_fp8`` clamps to ``[-448,448]`` in cache units and rounds to nearest
+    even, preserving signed zero and subnormals, with no scale plane. For
+    shared nonunit descales, normalize both writers' inputs upstream.
     ``main_kv_fp4`` and ``swa_mxfp8`` retain their packed payload/scale layouts.
+    HND returns ``[pages,1,64,width]``; explicit NHD returns
+    ``[pages,64,1,width]`` with identical storage bytes.
 
     ``out`` owns the capacity for scatter updates. Live ``slots`` must be
     unique; negative or out-of-capacity slots are skipped. Unwritten rows,
@@ -120,6 +121,8 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
     CPU checks. Reusing ``out`` and updating input/slot values in place is
     CUDA Graph compatible.
     """
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError("kv_layout must be HND or NHD")
     if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) != (10, 0):
         raise ValueError("DS4.1 decode cache preparation requires SM100")
     if (
@@ -139,24 +142,21 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
     fp8_swa = format == "swa_fp8"
     width = 512 if fp8_swa else 288 if format == "main_kv_fp4" else 528
     dtype = torch.float8_e4m3fn if fp8_swa else torch.uint8
+    tail = (1, 64, width) if kv_layout == "HND" else (64, 1, width)
     if out is None:
         if slots is not None:
             raise ValueError("scatter updates require caller-owned cache capacity")
-        out = torch.empty((tr.cdiv(n, 64), 64, 1, width), dtype=dtype, device=x.device)
+        out = torch.empty((tr.cdiv(n, 64), *tail), dtype=dtype, device=x.device)
     elif (
         out.ndim != 4
-        or out.shape[1:] != (64, 1, width)
+        or out.shape[1:] != tail
         or out.dtype != dtype
         or out.device != x.device
         or not out.is_contiguous()
     ):
-        if fp8_swa:
-            raise ValueError(
-                "swa_fp8 output must be contiguous E4M3 [pages,64,1,512] "
-                "on the input device"
-            )
         raise ValueError(
-            "output must be contiguous uint8 decode cache on the input device"
+            f"output must be a contiguous {dtype} {kv_layout} decode cache "
+            "on the input device"
         )
     if fp8_swa and out.requires_grad and torch.is_grad_enabled():
         raise ValueError("cache quantization has no implicit QAT derivative")

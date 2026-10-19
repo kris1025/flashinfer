@@ -78,8 +78,9 @@ batches retain the split schedule. Both share cache conversion and reduction.
 Queries, dequantized KV and probabilities use BF16; accumulation and softmax
 use FP32. Physical slot -1 is masked without reading cache storage. The sink
 is applied once at final normalization, preserving natural-log, sink-exclusive
-public LSE even when the sink dominates all real keys. Split intermediates
-retain log2 LSE for merging. See examples/deepseek_v41/decode.py.
+internal LSE even when the sink dominates all real keys. Split intermediates
+retain raw-dot maxima and denominator sums, avoiding scaled-LSE overflow for
+large finite BMM1 factors. See examples/deepseek_v41/decode.py.
 """
 
 
@@ -390,7 +391,7 @@ class BlackwellV41MixedCacheDecode:
         :type o: cute.Tensor
         :param lse: The LSE tensor with shape [num_head, seq_len_q, batch_size]
         :type lse: cute.Tensor
-        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_lse
+        :param workspace: The workspace tensor with 1-d shape prepared for acc_o and acc_stats
         :type workspace: cute.Tensor
         :param split_kv: The scalar factor for split KV
         :type split_kv: cutlass.Int32
@@ -525,7 +526,7 @@ class BlackwellV41MixedCacheDecode:
         if cutlass.const_expr(lse.stride[0] != 1):
             raise ValueError("lse must have leading dimension 0")
 
-        acc_o, acc_lse = self.initialize_workspace(
+        acc_o, acc_stats = self.initialize_workspace(
             q_latent.shape[0],
             q_latent.shape[1],
             q_latent.shape[2],
@@ -693,8 +694,6 @@ class BlackwellV41MixedCacheDecode:
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
-        softmax_scale_log2 = softmax_scale * LOG2_E
-
         output_flat = cute.make_tensor(
             o.iterator,
             cute.make_layout(
@@ -717,13 +716,13 @@ class BlackwellV41MixedCacheDecode:
             o,
             lse,
             acc_o,
-            acc_lse,
+            acc_stats,
             split_kv,
             cache_seqs,
             block_split_kvs,
             sparse_mla_topk_lens,
             window_valid_lens,
-            softmax_scale_log2,
+            softmax_scale,
             output_scale,
             attn_sink_unscaled,
             q_latent_smem_layout_staged,
@@ -752,11 +751,12 @@ class BlackwellV41MixedCacheDecode:
                     o,
                     lse,
                     acc_o,
-                    acc_lse,
+                    acc_stats,
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
                     attn_sink_unscaled,
+                    softmax_scale,
                     True,
                 ).launch(
                     grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
@@ -769,11 +769,12 @@ class BlackwellV41MixedCacheDecode:
                     o,
                     lse,
                     acc_o,
-                    acc_lse,
+                    acc_stats,
                     split_kv,
                     cache_seqs,
                     block_split_kvs,
                     attn_sink_unscaled,
+                    softmax_scale,
                     False,
                 ).launch(
                     grid=(q_latent.shape[0], q_latent.shape[2], q_latent.shape[3]),
@@ -797,13 +798,13 @@ class BlackwellV41MixedCacheDecode:
         mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         mAccO: Optional[cute.Tensor],
-        mAccLSE: Optional[cute.Tensor],
+        mAccStats: Optional[cute.Tensor],
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
         sparse_mla_topk_lens: cute.Tensor,
         window_valid_lens: cute.Tensor,
-        softmax_scale_log2: cutlass.Float32,
+        softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
         q_latent_smem_layout_staged: cute.ComposedLayout,
@@ -856,8 +857,8 @@ class BlackwellV41MixedCacheDecode:
         :type mLSE: cute.Tensor
         :param mAccO: Intermediate accumulator output tensor
         :type mAccO: cute.Tensor
-        :param mAccLSE: Intermediate accumulator log-sum-exp tensor
-        :type mAccLSE: cute.Tensor
+        :param mAccStats: Intermediate raw-score maxima and denominator sums
+        :type mAccStats: cute.Tensor
         :param split_kv: The split_kv parameter
         :type split_kv: cutlass.Int32
         :param cache_seqs: The variable sequence length tensor
@@ -868,8 +869,8 @@ class BlackwellV41MixedCacheDecode:
         :type sparse_mla_topk_lens: cute.Tensor
         :param window_valid_lens: Per-query valid sliding-window length tensor
         :type window_valid_lens: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
+        :param softmax_scale: Natural-log BMM1 factor; maxima stay in raw-dot units
+        :type softmax_scale: cutlass.Float32
         :param output_scale: The scale factor for the output
         :type output_scale: cutlass.Float32
         :param q_latent_smem_layout_staged: Shared memory layout for query tensor
@@ -1398,8 +1399,8 @@ class BlackwellV41MixedCacheDecode:
                             mma_o_pipeline=mma_o_pipeline,
                             epilogue_params=SimpleNamespace(
                                 output_scale=output_scale,
-                                softmax_scale_log2=softmax_scale_log2,
-                                mAccLSE=mAccLSE,
+                                softmax_scale=softmax_scale,
+                                mAccStats=mAccStats,
                                 mLSE=mLSE,
                             ),
                         )
@@ -1408,7 +1409,7 @@ class BlackwellV41MixedCacheDecode:
                             sP=sP,
                             mma_s_pipeline=mma_s_pipeline,
                             p_mma_pipeline=p_mma_pipeline,
-                            softmax_scale_log2=softmax_scale_log2,
+                            softmax_scale=softmax_scale,
                         )
                         (
                             mma_s_consumer_state,
@@ -1505,7 +1506,7 @@ class BlackwellV41MixedCacheDecode:
                             sP=sP,
                             mma_s_pipeline=mma_s_pipeline,
                             p_mma_pipeline=p_mma_pipeline,
-                            softmax_scale_log2=softmax_scale_log2,
+                            softmax_scale=softmax_scale,
                         )
                         (
                             mma_s_consumer_state,
@@ -1594,7 +1595,7 @@ class BlackwellV41MixedCacheDecode:
                             sP=sP,
                             mma_s_pipeline=mma_s_pipeline,
                             p_mma_pipeline=p_mma_pipeline,
-                            softmax_scale_log2=softmax_scale_log2,
+                            softmax_scale=softmax_scale,
                         )
                         (
                             mma_s_consumer_state,
@@ -1666,8 +1667,8 @@ class BlackwellV41MixedCacheDecode:
                         )
                         compute_epilogue_params = SimpleNamespace(
                             output_scale=output_scale,
-                            softmax_scale_log2=softmax_scale_log2,
-                            mAccLSE=mAccLSE,
+                            softmax_scale=softmax_scale,
+                            mAccStats=mAccStats,
                             mLSE=mLSE,
                         )
                         p_cor_consumer_state, mma_o_consumer_state = self.correction(
@@ -1687,11 +1688,12 @@ class BlackwellV41MixedCacheDecode:
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         mAccO: cute.Tensor,
-        mAccLSE: cute.Tensor,
+        mAccStats: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
         attn_sink: cute.Tensor,
+        softmax_scale: cutlass.Float32,
         vector_io: cutlass.Constexpr,
     ):
         """The reduction kernel for Heavily Compressed Attention (HCA) that combines intermediate results
@@ -1703,14 +1705,16 @@ class BlackwellV41MixedCacheDecode:
         :type mLSE: cute.Tensor
         :param mAccO: Accumulated output tensor from split_kv blocks
         :type mAccO: cute.Tensor
-        :param mAccLSE: Accumulated LSE tensor from split_kv blocks
-        :type mAccLSE: cute.Tensor
+        :param mAccStats: Raw maxima and denominator sums from split_kv blocks
+        :type mAccStats: cute.Tensor
         :param split_kv: Number of split_kv blocks
         :type split_kv: cutlass.Int32
         :param cache_seqs: Cache sequence lengths tensor
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
         :type block_split_kvs: cute.Tensor
+        :param softmax_scale: Natural-log BMM1 factor, applied after raw-max subtraction
+        :type softmax_scale: cutlass.Float32
         :param vector_io: Compile contiguous four-element IO for the
             measured H64/S1 small-batch route. Split accumulation
             order and output/LSE arithmetic remain identical.
@@ -1747,55 +1751,62 @@ class BlackwellV41MixedCacheDecode:
             lse_scale_ptr, cute.make_layout(reduction_splits)
         )
 
-        gLSE = mAccLSE[blk_coord[0], None, blk_coord[1], blk_coord[2]]
+        gMax = mAccStats[blk_coord[0], None, 0, blk_coord[1], blk_coord[2]]
+        gSum = mAccStats[blk_coord[0], None, 1, blk_coord[1], blk_coord[2]]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
-            # calculate the global lse and exp ^ (local_lse - global_lse)
-            lse_per_thread = cute.ceil_div(reduction_splits, self.threads_per_warp)
-
-            local_lse = cute.make_rmem_tensor(
-                cute.make_layout(lse_per_thread), self.lse_dtype
+            stats_per_thread = cute.ceil_div(reduction_splits, self.threads_per_warp)
+            local_max = cute.make_rmem_tensor(
+                cute.make_layout(stats_per_thread), self.acc_dtype
             )
-            lse_max = -self.lse_dtype.inf
-            # find the max lse
-            for i in cutlass.range_constexpr(lse_per_thread):
+            local_sum = cute.make_rmem_tensor(
+                cute.make_layout(stats_per_thread), self.acc_dtype
+            )
+            row_max = -self.acc_dtype.inf
+            for i in cutlass.range_constexpr(stats_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
-                local_lse[i] = (
-                    gLSE[split_kv_idx]
-                    if cute.elem_less(split_kv_idx, local_split_kv)
+                in_bounds = cute.elem_less(split_kv_idx, local_split_kv)
+                local_max[i] = gMax[split_kv_idx] if in_bounds else -self.acc_dtype.inf
+                local_sum[i] = gSum[split_kv_idx] if in_bounds else self.acc_dtype(0.0)
+                row_max = cute.arch.fmax(row_max, local_max[i])
+            row_max = cute.arch.warp_reduction_max(row_max)
+            row_max = row_max if row_max != -self.acc_dtype.inf else 0.0
+            row_sum = self.acc_dtype(0.0)
+            for i in cutlass.range_constexpr(stats_per_thread):
+                # Combine raw anchors and denominators, not rounded/overflowed
+                # partial LSEs. Tied huge logits still retain split counts.
+                local_sum[i] = (
+                    cute.math.exp2(
+                        hw.scale_delta_log2(local_max[i] - row_max, softmax_scale),
+                        fastmath=True,
+                    )
+                    * local_sum[i]
+                    if local_sum[i] != self.acc_dtype(0.0)
+                    else self.acc_dtype(0.0)
+                )
+                row_sum += local_sum[i]
+            row_sum = cute.arch.warp_reduction_sum(row_sum)
+            has_reduction_mass = row_sum != self.acc_dtype(0.0) or row_sum != row_sum
+            if tidx == 0:
+                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = (
+                    self._natural_lse(row_max, row_sum, softmax_scale)
+                    if has_reduction_mass
                     else -self.lse_dtype.inf
                 )
-                # reduce the local lse
-                lse_max = cute.arch.fmax(lse_max, local_lse[i])
-            lse_max = cute.arch.warp_reduction_max(lse_max)
-            lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-            # calculate sum_lse
-            sum_lse = 0.0
-            for i in cutlass.range_constexpr(lse_per_thread):
-                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-            sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-            has_reduction_mass = sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
-            # calculate the global_lse
-            global_lse = (
-                lse_max + cute.math.log2(sum_lse, fastmath=True)
-                if has_reduction_mass
-                else -self.lse_dtype.inf
-            )
-            if tidx == 0:
-                mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse / LOG2_E
             # Add one sink to the denominator, never to the returned LSE.
-            sink_log2_scale = self._sink_log2_scale(global_lse, attn_sink[blk_coord[0]])
-            # store the scale to shared memory
-            for i in cutlass.range_constexpr(lse_per_thread):
+            sink_log2_scale = self._sink_log2_scale(
+                row_max, row_sum, softmax_scale, attn_sink[blk_coord[0]]
+            )
+            normalizer = (
+                cute.arch.rcp_approx(row_sum)
+                * cute.math.exp2(sink_log2_scale, fastmath=True)
+                if has_reduction_mass
+                else self.acc_dtype(0.0)
+            )
+            for i in cutlass.range_constexpr(stats_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 if cute.elem_less(split_kv_idx, local_split_kv):
-                    smem_lse_scale[split_kv_idx] = (
-                        cute.math.exp2(
-                            local_lse[i] - global_lse + sink_log2_scale, fastmath=True
-                        )
-                        if has_reduction_mass
-                        else self.acc_dtype(0.0)
-                    )
+                    smem_lse_scale[split_kv_idx] = local_sum[i] * normalizer
 
         pipeline.sync(barrier_id=4)
 
@@ -1854,15 +1865,37 @@ class BlackwellV41MixedCacheDecode:
         return
 
     @cute.jit
-    def _sink_log2_scale(self, lse_log2: cutlass.Float32, sink: cutlass.Float32):
-        """Log2 of the real-key probability mass after adding one sink."""
-        # Stabilize in natural-log space before multiplying by LOG2_E: a
-        # finite FP32 sink can overflow that conversion. With d = sink - LSE,
-        # log(sigmoid(-d)) = -max(d, 0) - log(1 + exp(-abs(d))). Even if d
-        # overflows to +/-inf, all exponent arguments are nonpositive.
-        # Empty rows select zero mass at the caller; avoid -inf - -inf here.
-        finite_lse = lse_log2 if lse_log2 != -self.lse_dtype.inf else 0.0
-        delta = sink - finite_lse / LOG2_E
+    def _natural_lse(
+        self,
+        row_max: cutlass.Float32,
+        row_sum: cutlass.Float32,
+        softmax_scale: cutlass.Float32,
+    ):
+        return hw.fma_rn_f32(
+            softmax_scale,
+            row_max,
+            cute.math.log2(row_sum, fastmath=True) / LOG2_E,
+        )
+
+    @cute.jit
+    def _sink_log2_scale(
+        self,
+        row_max: cutlass.Float32,
+        row_sum: cutlass.Float32,
+        softmax_scale: cutlass.Float32,
+        sink: cutlass.Float32,
+    ):
+        """Log2 of real-key mass, without materializing a scaled score/LSE."""
+        # With d = sink - LSE, log(sigmoid(-d)) is sign-stable even for an
+        # infinite d. FMA preserves finite cancellation between the sink and
+        # BMM1 * raw_max; internal FP32 LSE may itself overflow legitimately.
+        # Empty rows select zero mass at the caller.
+        safe_max = row_max if row_sum != self.acc_dtype(0.0) else 0.0
+        safe_sum = row_sum if row_sum != self.acc_dtype(0.0) else 1.0
+        delta = (
+            hw.fma_rn_f32(-softmax_scale, safe_max, sink)
+            - cute.math.log2(safe_sum, fastmath=True) / LOG2_E
+        )
         return -cute.arch.fmax(delta, 0.0) * LOG2_E - cute.math.log2(
             1.0
             + cute.math.exp2(-cute.arch.fmax(delta, -delta) * LOG2_E, fastmath=True),
@@ -2782,8 +2815,9 @@ class BlackwellV41MixedCacheDecode:
         """Compute the correction factor for the last k tile."""
         no_correction = cutlass.Int32(0)
         if (
-            row_max_new - row_max
-        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+            hw.scale_delta_log2(row_max_new - row_max, softmax_params.softmax_scale)
+            <= self.skip_correction_threshold
+        ):
             no_correction = cutlass.Int32(1)
             row_max_new = row_max
         stage = p_cor_producer_state.index
@@ -3164,15 +3198,18 @@ class BlackwellV41MixedCacheDecode:
         # before forming P, the old-sum factor, and final-tile metadata so
         # every quantity uses the same anchor; P remains bounded by 2**6.
         if (
-            row_max_new - row_max
-        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+            hw.scale_delta_log2(row_max_new - row_max, softmax_params.softmax_scale)
+            <= self.skip_correction_threshold
+        ):
             row_max_new = row_max
         empty_row = row_max_new == -self.acc_dtype.inf
         correction_factor = cute.math.exp2(
             cutlass.select_(
                 empty_row,
                 self.acc_dtype(0.0),
-                (row_max - row_max_new) * softmax_params.softmax_scale_log2,
+                hw.scale_delta_log2(
+                    row_max - row_max_new, softmax_params.softmax_scale
+                ),
             ),
             fastmath=True,
         )
@@ -3191,29 +3228,15 @@ class BlackwellV41MixedCacheDecode:
                     p_cor_producer_state,
                 )
 
-        fma_b = softmax_params.softmax_scale_log2
-        fma_c = cutlass.select_(
-            empty_row,
-            self.acc_dtype(0.0),
-            (0.0 - row_max_new) * softmax_params.softmax_scale_log2,
-        )
-        if cutlass.const_expr(self.use_ws):
-            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-                scaled = prims.fma_packed_f32x2(
-                    (tTR_rAcc[i], tTR_rAcc[i + 1]),
-                    (fma_b, fma_b),
-                    (fma_c, fma_c),
-                    rnd="rn",
-                )
-                tTR_rAcc[i] = cute.math.exp2(scaled[0], fastmath=True)
-                tTR_rAcc[i + 1] = cute.math.exp2(scaled[1], fastmath=True)
-
-        else:
-            for i in cutlass.range(
-                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
-            ):
-                tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
-                tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
+        anchor = cutlass.select_(empty_row, self.acc_dtype(0.0), row_max_new)
+        # Keep maxima in raw-dot units. Scale the difference before log2
+        # conversion: separately scaling S and its anchor can form inf - inf
+        # for a large finite BMM1, even when every valid score is tied at zero.
+        for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            exponent = hw.scale_delta_log2(
+                tTR_rAcc[i] - anchor, softmax_params.softmax_scale
+            )
+            tTR_rAcc[i] = cute.math.exp2(exponent, fastmath=True)
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
@@ -3605,7 +3628,7 @@ class BlackwellV41MixedCacheDecode:
                 self.mma_pv_tiler[1],
                 self.mma_pv_tiler[2],
             )
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
+            if cutlass.const_expr(epilogue_params.mAccStats is None):
                 gLSE = cute.local_tile(
                     epilogue_params.mLSE,
                     (cta_pv_tiler[0], 1, 1),
@@ -3628,8 +3651,8 @@ class BlackwellV41MixedCacheDecode:
                 )
             else:
                 gLSE = cute.local_tile(
-                    epilogue_params.mAccLSE[
-                        None, common_params.blk_coord[3], None, None
+                    epilogue_params.mAccStats[
+                        None, common_params.blk_coord[3], 0, None, None
                     ],
                     (cta_pv_tiler[0], 1, 1),
                     (
@@ -3641,8 +3664,8 @@ class BlackwellV41MixedCacheDecode:
                 )
                 cLSE = cute.local_tile(
                     cute.make_identity_tensor(
-                        epilogue_params.mAccLSE[
-                            None, common_params.blk_coord[3], None, None
+                        epilogue_params.mAccStats[
+                            None, common_params.blk_coord[3], 0, None, None
                         ].shape
                     ),
                     (cta_pv_tiler[0], 1, 1),
@@ -3653,22 +3676,40 @@ class BlackwellV41MixedCacheDecode:
                     ),
                     (1, 1, 1),
                 )
-            lse = (
-                cute.math.log2(row_sum, fastmath=True)
-                + epilogue_params.softmax_scale_log2 * row_max
-            )
+                gSum = cute.local_tile(
+                    epilogue_params.mAccStats[
+                        None, common_params.blk_coord[3], 1, None, None
+                    ],
+                    (cta_pv_tiler[0], 1, 1),
+                    (
+                        common_params.blk_coord[0],
+                        common_params.blk_coord[1],
+                        common_params.blk_coord[2],
+                    ),
+                    (1, 1, 1),
+                )
             lse_row = (tidx // 32) * 16 + tidx % 16
             if cute.elem_less(cLSE[lse_row][0], common_params.H):
                 if tidx % 32 < 16:
-                    if cutlass.const_expr(epilogue_params.mAccLSE is None):
-                        gLSE[lse_row] = lse / LOG2_E
+                    if cutlass.const_expr(epilogue_params.mAccStats is None):
+                        gLSE[lse_row] = self._natural_lse(
+                            row_max, row_sum, epilogue_params.softmax_scale
+                        )
                     else:
-                        gLSE[lse_row] = lse
+                        # Preserve raw units and count separately. A partial
+                        # scaled LSE may overflow even though O is finite.
+                        gLSE[lse_row] = row_max
+                        gSum[lse_row] = row_sum
 
         sink_scale = self.acc_dtype(1.0)
         if cutlass.const_expr(common_params.mAccO is None):
             head = common_params.blk_coord[0] * cta_pv_tiler[0] + lse_row
-            sink_log2_scale = self._sink_log2_scale(lse, common_params.attn_sink[head])
+            sink_log2_scale = self._sink_log2_scale(
+                row_max,
+                row_sum,
+                epilogue_params.softmax_scale,
+                common_params.attn_sink[head],
+            )
             sink_scale = (
                 cute.math.exp2(sink_log2_scale, fastmath=True)
                 if row_sum != self.acc_dtype(0.0)
@@ -3958,7 +3999,7 @@ class BlackwellV41MixedCacheDecode:
         workspace: cute.Tensor,
     ) -> tuple[cute.Tensor, cute.Tensor]:
         """Initialize the workspace for the HCA kernel. Construct the intermediate tensors
-        acc_o and acc_lse.
+        acc_o and acc_stats.
 
         :param H: The height of the output tensor C
         :type H: cutlass.Int32
@@ -3978,7 +4019,7 @@ class BlackwellV41MixedCacheDecode:
         :return: The output tensor C and the workspace tensor
         :rtype: tuple[cute.Tensor, cute.Tensor]
         """
-        acc_o, acc_lse = None, None
+        acc_o, acc_stats = None, None
         if cutlass.const_expr(workspace is not None):
             align = 256 // self.q_dtype.width
             acc_o_layout = cute.make_layout(
@@ -3993,13 +4034,13 @@ class BlackwellV41MixedCacheDecode:
             )
             acc_o_iter = cute.recast_ptr(workspace.iterator, dtype=acc_dtype)
             acc_o = cute.make_tensor(acc_o_iter, acc_o_layout)
-            acc_lse_layout = cute.make_layout(
-                (H, split_kv, S, B),
-                stride=(split_kv, 1, H * split_kv, H * split_kv * S),
+            acc_stats_layout = cute.make_layout(
+                (H, split_kv, 2, S, B),
+                stride=(2 * split_kv, 2, 1, 2 * H * split_kv, 2 * H * split_kv * S),
             )
-            acc_lse_iter = cute.recast_ptr(
+            acc_stats_iter = cute.recast_ptr(
                 workspace.iterator + cute.cosize(acc_o_layout) * acc_dtype.width // 8,
                 dtype=acc_dtype,
             )
-            acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
-        return acc_o, acc_lse
+            acc_stats = cute.make_tensor(acc_stats_iter, acc_stats_layout)
+        return acc_o, acc_stats

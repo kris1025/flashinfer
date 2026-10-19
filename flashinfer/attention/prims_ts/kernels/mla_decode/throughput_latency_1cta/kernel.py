@@ -56,6 +56,7 @@ from .config import (
     make_throughput_latency_mla_config,
     configure_sparse_mla,
     validate_source_state_store_config,
+    validate_split_softmax_scale_config,
 )
 from .resources import (
     SmemKvResource,
@@ -522,6 +523,25 @@ def build_throughput_latency_mla_task_manager(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
     )
+    validate_split_softmax_scale_config(cfg)
+    if cfg.sparse_split_softmax_scale and (
+        kv_producer is None
+        or source_state_store is not None
+        or source_state_store_args is not None
+        or output_quant is not None
+        or output_quant_args is not None
+        or kv_producer_runtime_args is not None
+        or cu_seqlens_q is not None
+        or acc_o_tensor is not None
+        or acc_lse_tensor is not None
+        or not use_page_offsets
+        or use_clc_dynamic_scheduler
+        or use_static_persistent_scheduler
+    ):
+        raise ValueError(
+            "split softmax scales require a joint custom KV producer, fixed Q, "
+            "direct page offsets and final unquantized output without source states"
+        )
     if kv_producer is not None and (
         not cfg.single_kv_pipe or cfg.kernel_variant != "keeps_mma_ab"
     ):
@@ -1230,12 +1250,23 @@ def _make_single_kv_pipe_task_graph(
 
     Keep stores P in TMEM; single-stream swap stores P in SMEM. Both use
     one softmax group, two score stages, and one output accumulator.
+
+    The private scale slot normally holds BMM1 * LOG2_E. Only the validated
+    DS4.1 split-scale mode carries raw runtime BMM1 in that slot; resources then
+    retain raw maxima and apply BMM1 before the constant log2 conversion.
     """
 
     scale_softmax_log2, output_scale = _default_scales(
         scale_softmax_log2,
         output_scale,
     )
+    raw_softmax_scale = None
+    if cfg.sparse_split_softmax_scale:
+        raw_softmax_scale = scale_softmax_log2
+        # Materialize before task loops: a literal-backed Float32 retains a
+        # Python double, which FrontendNext's carry audit otherwise compares
+        # against the rounded FP32 reference initializer after lazy promotion.
+        scale_softmax_log2 = Float32(Float32(LOG2_E).ir_value())
     _check_persistent_scheduler_modes(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
@@ -1421,6 +1452,7 @@ def _make_single_kv_pipe_task_graph(
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
+        raw_softmax_scale=raw_softmax_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1448,6 +1480,7 @@ def _make_single_kv_pipe_task_graph(
             pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
+            raw_softmax_scale=raw_softmax_scale,
             tmem_alias_ref=tmem_s,
             name="ll_mla_q64_tmem_p",
         )
@@ -1484,6 +1517,7 @@ def _make_single_kv_pipe_task_graph(
         cfg=cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
+        raw_softmax_scale=raw_softmax_scale,
         output_scale=output_scale,
         sparse_epilogue_params=sparse_epilogue_params,
         atten_sinks=_atten_sinks_view(cfg, sparse_epilogue_params),
@@ -1785,6 +1819,7 @@ class ThroughputLatencyMlaDecodeTs:
         self.direct_sparse = source_state_store is not None
         self.direct_static_scales = False
         self.direct_request_kv_scale = False
+        self.direct_split_softmax_scale = False
         self.direct_sparse_capacities = (0, 0)
 
         cfg = self._make_config()
@@ -1921,6 +1956,17 @@ class ThroughputLatencyMlaDecodeTs:
             raise ValueError(
                 "request KV scales require a custom producer and source store"
             )
+        if self.direct_split_softmax_scale and (
+            self.sparse_profile is None
+            or self.kv_producer is None
+            or self.source_state_store is not None
+            or self.output_quant is not None
+            or self.device_scales
+        ):
+            raise ValueError(
+                "split softmax scales require joint direct final output with "
+                "host scalars, a custom producer and no source store or output quantizer"
+            )
         cfg = make_throughput_latency_mla_config(
             batch_size=self.batch_size,
             num_heads_q=self.num_heads,
@@ -1950,6 +1996,7 @@ class ThroughputLatencyMlaDecodeTs:
                 direct_inputs=self.direct_sparse,
                 static_scales=self.direct_static_scales,
                 request_kv_scale=self.direct_request_kv_scale,
+                split_softmax_scale=self.direct_split_softmax_scale,
                 source_capacities=self.direct_sparse_capacities,
                 source_state_store=self.source_state_store is not None,
             )
@@ -2053,6 +2100,20 @@ class ThroughputLatencyMlaDecodeTs:
             kv_producer_runtime_args is not None and self.kv_producer is None
         ):
             raise ValueError("KV producer runtime arguments require a custom producer")
+        if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+            if cutlass.const_expr(
+                cu_seqlens_q is not None
+                or output_quant_args is not None
+                or source_state_store_args is not None
+                or kv_producer_runtime_args is not None
+                or q_latent.element_type != cutlass.Float8E4M3FN
+                or o.element_type != cutlass.BFloat16
+                or lse.element_type != cutlass.Float32
+            ):
+                raise ValueError(
+                    "split softmax scales require fixed E4M3 Q, final BF16 O/FP32 LSE "
+                    "and no source-state, quantizer or producer-scale arguments"
+                )
         if cutlass.const_expr(cfg.sparse_request_kv_scale):
             if cutlass.const_expr(
                 cu_seqlens_q is not None
@@ -2325,7 +2386,13 @@ class ThroughputLatencyMlaDecodeTs:
                     l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
                 )
 
-        softmax_scale_log2 = softmax_scale * LOG2_E
+        # This private launch slot carries raw runtime BMM1 only in DS4.1's
+        # validated split-scale mode. Never precompute BMM1 * LOG2_E there:
+        # finite FP32 BMM1 may overflow that coefficient even for tied scores.
+        if cutlass.const_expr(cfg.sparse_split_softmax_scale):
+            softmax_scale_log2 = softmax_scale
+        else:
+            softmax_scale_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
         )
@@ -2542,14 +2609,27 @@ class ThroughputLatencyMlaDecodeTs:
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
-            page_offsets, cache_seqs = bind_sparse_views(
-                si,
-                ci,
-                sl,
-                cl,
-                cfg.total_kv_tiles * cfg.tile_size_kv,
-                request=request,
-            )
+            if cutlass.const_expr(
+                self.kv_producer is not None
+                and hasattr(self.kv_producer, "bind_sparse_views")
+            ):
+                page_offsets, cache_seqs = self.kv_producer.bind_sparse_views(
+                    si,
+                    sl,
+                    cl,
+                    kv_producer_args,
+                    cfg.total_kv_tiles * cfg.tile_size_kv,
+                    request=request,
+                )
+            else:
+                page_offsets, cache_seqs = bind_sparse_views(
+                    si,
+                    ci,
+                    sl,
+                    cl,
+                    cfg.total_kv_tiles * cfg.tile_size_kv,
+                    request=request,
+                )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 softmax_scale_log2 = (
                     cutlass.Float32(sm[0])
@@ -2647,7 +2727,9 @@ class ThroughputLatencyMlaDecodeTs:
                 prims.prefetch_tensormap(tma_desc_c_rope.get_ptr())
                 prims.prefetch_tensormap(tma_desc_v.get_ptr())
             if cutlass.const_expr(
-                cfg.sparse_direct and self.source_state_store is None
+                cfg.sparse_direct
+                and self.source_state_store is None
+                and sparse_epilogue_params is not None
             ):
                 lane = cute.arch.thread_idx()[0] % 32
                 if lane < (cfg.logical_num_heads_q + 31) // 32:

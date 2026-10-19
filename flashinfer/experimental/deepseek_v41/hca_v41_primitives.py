@@ -45,6 +45,29 @@ def fp8x2_to_bf16_word(word: cutlass.Int32):
 
 
 @cute.jit
+def scale_delta_log2(delta: cutlass.Float32, scale: cutlass.Float32):
+    """Scale a score difference before converting to log2; retain subnormals."""
+    # Precomputing scale * log2(e) can overflow for a finite BMM1. Explicit
+    # non-FTZ instructions also keep a positive subnormal BMM1 from becoming zero.
+    return prims.inline_ptx(
+        "{ .reg .f32 scaled; "
+        "mul.rn.f32 scaled, {$r0}, {$r1}; "
+        "mul.rn.f32 {$w0}, scaled, {$r2}; }",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[delta, scale, cutlass.Float32(1.4426950408889634)],
+    )
+
+
+@cute.jit
+def fma_rn_f32(a: cutlass.Float32, b: cutlass.Float32, c: cutlass.Float32):
+    return prims.inline_ptx(
+        "fma.rn.f32 {$w0}, {$r0}, {$r1}, {$r2};",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[a, b, c],
+    )
+
+
+@cute.jit
 def qk_mma(sq, sk, dst, kv_stage: cutlass.Int32):
     """M64 N64 K512, Q/K both SW128 K-major; overwrite the score tile."""
     # The primitive consumes a native addrspace-6 pointer. Rebuild it from

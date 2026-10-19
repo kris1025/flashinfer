@@ -58,7 +58,7 @@ def test_exact_cache_bytes_and_changed_graph(fmt, rows, dtype):
     torch.manual_seed(841 + rows)
     x = torch.randn(rows, 512, device="cuda", dtype=dtype)
     x[0, :32] = 0
-    out = deepseek_v41_quantize_cache(x, format=fmt)
+    out = deepseek_v41_quantize_cache(x, format=fmt, kv_layout="NHD")
 
     def check():
         for actual, expected in zip(
@@ -73,7 +73,7 @@ def test_exact_cache_bytes_and_changed_graph(fmt, rows, dtype):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        deepseek_v41_quantize_cache(x, format=fmt, out=out)
+        deepseek_v41_quantize_cache(x, format=fmt, out=out, kv_layout="NHD")
     torch.cuda.current_stream().wait_stream(stream)
     for _ in range(2):
         x.copy_(torch.randn_like(x))
@@ -94,10 +94,12 @@ def test_scatter_changed_slots_and_untouched_bytes(fmt, width, sf):
     slots = torch.tensor([67, 1, -1, 63, 64], device="cuda", dtype=torch.int32)
     out = torch.full((2, 64, 1, width + sf), 173, device="cuda", dtype=torch.uint8)
     expected = torch.empty_like(out).view(2, -1)
-    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots, kv_layout="NHD")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+        deepseek_v41_quantize_cache(
+            x, format=fmt, out=out, slots=slots, kv_layout="NHD"
+        )
     for step in range(3):
         x.copy_(torch.randn_like(x))
         slots.copy_(torch.randperm(128, device="cuda")[:5].int())
@@ -127,10 +129,12 @@ def test_invalid_slots_are_masked_under_graph_replay(fmt, width, sf):
         [0, 127, -1, -2, 128, 2**31 - 1, 64], device="cuda", dtype=torch.int32
     )
     out = torch.full((2, 64, 1, width + sf), 173, device="cuda", dtype=torch.uint8)
-    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots, kv_layout="NHD")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+        deepseek_v41_quantize_cache(
+            x, format=fmt, out=out, slots=slots, kv_layout="NHD"
+        )
     for step in range(2):
         if step:
             slots.fill_(-2)
@@ -171,7 +175,7 @@ def test_fp4_halfway_even_and_signed_zero():
         -3.5,
     ]
     x = torch.tensor([values * 32], device="cuda")
-    cache = deepseek_v41_quantize_cache(x, format="main_kv_fp4")
+    cache = deepseek_v41_quantize_cache(x, format="main_kv_fp4", kv_layout="NHD")
     actual = unpack_bytes(cache, 1, True)
     assert actual[0][0, 0].item() == 128
     for a, e in zip(actual, reference(x, "main_kv_fp4"), strict=True):
@@ -185,7 +189,7 @@ def test_cache_write_above_2gib(fmt, width):
     out = torch.full((page + 1, 64, 1, width), 197, device="cuda", dtype=torch.uint8)
     x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
     slot = torch.tensor([page * 64], device="cuda", dtype=torch.int32)
-    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slot)
+    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slot, kv_layout="NHD")
     for a, e in zip(
         unpack_bytes(out[page:], 1, fmt == "main_kv_fp4"),
         reference(x, fmt),
@@ -200,46 +204,50 @@ def test_cache_write_above_2gib(fmt, width):
 def test_empty_and_rejected_declarations(fmt):
     gate()
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
-    out = deepseek_v41_quantize_cache(x, format=fmt)
-    empty = deepseek_v41_quantize_cache(x[:0], format=fmt)
+    out = deepseek_v41_quantize_cache(x, format=fmt, kv_layout="NHD")
+    empty = deepseek_v41_quantize_cache(x[:0], format=fmt, kv_layout="NHD")
     assert empty.shape[0] == 0
     with pytest.raises(ValueError, match="page_size=64"):
-        deepseek_v41_quantize_cache(x, format=fmt, page_size=32)
+        deepseek_v41_quantize_cache(x, format=fmt, page_size=32, kv_layout="NHD")
     with pytest.raises(ValueError, match="cache format"):
-        deepseek_v41_quantize_cache(x, format="mxfp4")
+        deepseek_v41_quantize_cache(x, format="mxfp4", kv_layout="NHD")
     with pytest.raises(ValueError, match="QAT"):
-        deepseek_v41_quantize_cache(x.requires_grad_(), format=fmt)
+        deepseek_v41_quantize_cache(x.requires_grad_(), format=fmt, kv_layout="NHD")
     x = x.detach()
     with pytest.raises(ValueError, match="overlap"):
         alias = x.view(torch.uint8).flatten()[: out.numel()].view_as(out)
-        deepseek_v41_quantize_cache(x, format=fmt, out=alias)
+        deepseek_v41_quantize_cache(x, format=fmt, out=alias, kv_layout="NHD")
     with pytest.raises(ValueError, match="overlap"):
         slots = out.flatten()[: x.shape[0] * 4].view(torch.int32)
-        deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+        deepseek_v41_quantize_cache(
+            x, format=fmt, out=out, slots=slots, kv_layout="NHD"
+        )
     with pytest.raises(ValueError, match="capacity"):
-        deepseek_v41_quantize_cache(x, format=fmt, out=out[:0])
+        deepseek_v41_quantize_cache(x, format=fmt, out=out[:0], kv_layout="NHD")
     torch.cuda.set_sync_debug_mode("error")
     try:
-        deepseek_v41_quantize_cache(x, format=fmt, out=out)
+        deepseek_v41_quantize_cache(x, format=fmt, out=out, kv_layout="NHD")
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
 @pytest.mark.parametrize("compressed_k", [0, 128, 192, 512])
-def test_prepared_cache_feeds_decode(backend, compressed_k):
-    from flashinfer.deepseek_v41 import (
-        deepseek_v41_decode,
-        deepseek_v41_window_decode,
+def test_prepared_cache_feeds_decode(compressed_k):
+    from .test_deepseek_v41_decode import (
+        check,
+        decode_case,
+        window_case,
+        gate as decode_gate,
     )
-    from .test_deepseek_v41_decode import check, gate as decode_gate
 
-    decode_gate(backend)
+    decode_gate()
     torch.manual_seed(841 + compressed_k)
     x = torch.randn(max(128, compressed_k), 512, device="cuda", dtype=torch.bfloat16)
-    swa = deepseek_v41_quantize_cache(x[:128], format="swa_mxfp8")
+    swa = deepseek_v41_quantize_cache(x[:128], format="swa_mxfp8", kv_layout="NHD")
     main = (
-        deepseek_v41_quantize_cache(x, format="main_kv_fp4") if compressed_k else None
+        deepseek_v41_quantize_cache(x, format="main_kv_fp4", kv_layout="NHD")
+        if compressed_k
+        else None
     )
     wi = torch.arange(128, device="cuda", dtype=torch.int32).view(1, 1, 128)
     ci = (
@@ -253,20 +261,24 @@ def test_prepared_cache_feeds_decode(backend, compressed_k):
     sink = torch.randn(64, device="cuda")
     args = q, swa, main, wi, ci, sink
 
-    def run(plan=None):
+    def run(buffers=None):
         if compressed_k:
-            return deepseek_v41_decode(*args, plan=plan, backend=backend)
-        return deepseek_v41_window_decode(q, swa, wi, sink, plan=plan, backend=backend)
+            return decode_case(*args, buffers=buffers, backend="cute-dsl")
+        return window_case(q, swa, wi, sink, buffers=buffers, backend="cute-dsl")
 
-    out, lse, plan = run()
+    out, lse, buffers = run()
     check(args, out, lse)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         # Cache preparation and decode must compose on the same captured stream.
-        deepseek_v41_quantize_cache(x[:128], format="swa_mxfp8", out=swa)
+        deepseek_v41_quantize_cache(
+            x[:128], format="swa_mxfp8", out=swa, kv_layout="NHD"
+        )
         if compressed_k:
-            deepseek_v41_quantize_cache(x, format="main_kv_fp4", out=main)
-        run(plan)
+            deepseek_v41_quantize_cache(
+                x, format="main_kv_fp4", out=main, kv_layout="NHD"
+            )
+        run(buffers)
     for step in range(3):
         x.normal_()
         q.normal_()
@@ -322,7 +334,7 @@ def test_swa_fp8_exact_bytes_and_changed_graph(rows, dtype):
     x = torch.randn(rows, 512, device="cuda", dtype=dtype) * 300
     x[0, :32] = 0
     x[0, 1] = -0.0
-    out = deepseek_v41_quantize_cache(x, format="swa_fp8")
+    out = deepseek_v41_quantize_cache(x, format="swa_fp8", kv_layout="NHD")
     assert out.dtype == torch.float8_e4m3fn
     assert out.shape == ((rows + 63) // 64, 64, 1, 512)
     assert out.is_contiguous()
@@ -337,7 +349,10 @@ def test_swa_fp8_exact_bytes_and_changed_graph(rows, dtype):
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        assert deepseek_v41_quantize_cache(x, format="swa_fp8", out=out) is out
+        assert (
+            deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, kv_layout="NHD")
+            is out
+        )
     torch.cuda.current_stream().wait_stream(stream)
     for _ in range(2):
         x.copy_(torch.randn_like(x) * 300)
@@ -362,7 +377,7 @@ def test_swa_fp8_all_finite_codes(dtype):
         dtype=torch.uint8,
     ).repeat(3)[:512]
     x = codes.view(torch.float8_e4m3fn).to(dtype).view(1, 512)
-    out = deepseek_v41_quantize_cache(x, format="swa_fp8")
+    out = deepseek_v41_quantize_cache(x, format="swa_fp8", kv_layout="NHD")
     torch.testing.assert_close(
         _swa_fp8_bytes(out)[:1], codes.view(1, 512), rtol=0, atol=0
     )
@@ -444,7 +459,7 @@ def test_swa_fp8_halfway_even_saturation_and_signed_zero(dtype):
     ]
     x = torch.tensor([values * 16], device="cuda", dtype=dtype)
     expected = torch.tensor([expected_codes * 16], device="cuda", dtype=torch.uint8)
-    out = deepseek_v41_quantize_cache(x, format="swa_fp8")
+    out = deepseek_v41_quantize_cache(x, format="swa_fp8", kv_layout="NHD")
     torch.testing.assert_close(_swa_fp8_bytes(out)[:1], expected, rtol=0, atol=0)
     torch.testing.assert_close(
         _swa_fp8_bytes(out)[:1], _swa_fp8_reference(x), rtol=0, atol=0
@@ -470,11 +485,18 @@ def test_swa_fp8_scatter_changed_slots_invalid_and_untouched_bytes(dtype):
                 expected.view(-1, 512)[slot].copy_(data[row])
         torch.testing.assert_close(out_bytes, expected, rtol=0, atol=0)
 
-    assert deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=slots) is out
+    assert (
+        deepseek_v41_quantize_cache(
+            x, format="swa_fp8", out=out, slots=slots, kv_layout="NHD"
+        )
+        is out
+    )
     check()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=slots)
+        deepseek_v41_quantize_cache(
+            x, format="swa_fp8", out=out, slots=slots, kv_layout="NHD"
+        )
     changed_slots = (
         [67, 1, -1, 63, 64, 128, 2**31 - 1],
         [2**31 - 1, 65, 127, -2, 0, -1, 128],
@@ -498,7 +520,9 @@ def test_swa_fp8_cache_write_above_2gib():
     out = out_bytes.view(torch.float8_e4m3fn)
     x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
     slot = torch.tensor([page * 64], device="cuda", dtype=torch.int32)
-    deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=slot)
+    deepseek_v41_quantize_cache(
+        x, format="swa_fp8", out=out, slots=slot, kv_layout="NHD"
+    )
     torch.testing.assert_close(
         _swa_fp8_bytes(out[page:])[:1], _swa_fp8_reference(x), rtol=0, atol=0
     )
@@ -512,21 +536,25 @@ def test_swa_fp8_empty_and_rejected_declarations():
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
     out_bytes = torch.full((1, 64, 1, 512), 173, device="cuda", dtype=torch.uint8)
     out = out_bytes.view(torch.float8_e4m3fn)
-    empty = deepseek_v41_quantize_cache(x[:0], format="swa_fp8")
+    empty = deepseek_v41_quantize_cache(x[:0], format="swa_fp8", kv_layout="NHD")
     assert empty.shape == (0, 64, 1, 512)
     assert empty.dtype == torch.float8_e4m3fn
     empty_slots = torch.empty(0, device="cuda", dtype=torch.int32)
     assert (
-        deepseek_v41_quantize_cache(x[:0], format="swa_fp8", out=out, slots=empty_slots)
+        deepseek_v41_quantize_cache(
+            x[:0], format="swa_fp8", out=out, slots=empty_slots, kv_layout="NHD"
+        )
         is out
     )
     assert (out_bytes == 173).all()
     with pytest.raises(ValueError, match="caller-owned"):
-        deepseek_v41_quantize_cache(x[:0], format="swa_fp8", slots=empty_slots)
+        deepseek_v41_quantize_cache(
+            x[:0], format="swa_fp8", slots=empty_slots, kv_layout="NHD"
+        )
     with pytest.raises(ValueError, match="page_size=64"):
-        deepseek_v41_quantize_cache(x, format="swa_fp8", page_size=32)
+        deepseek_v41_quantize_cache(x, format="swa_fp8", page_size=32, kv_layout="NHD")
     with pytest.raises(ValueError, match="cache format"):
-        deepseek_v41_quantize_cache(x, format="fp8")
+        deepseek_v41_quantize_cache(x, format="fp8", kv_layout="NHD")
     for invalid in (
         x.half(),
         x.to(torch.float8_e4m3fn),
@@ -535,7 +563,7 @@ def test_swa_fp8_empty_and_rejected_declarations():
         torch.empty((64, 1024), device="cuda", dtype=x.dtype)[:, ::2],
     ):
         with pytest.raises(ValueError, match="contiguous BF16/FP32"):
-            deepseek_v41_quantize_cache(invalid, format="swa_fp8")
+            deepseek_v41_quantize_cache(invalid, format="swa_fp8", kv_layout="NHD")
     for invalid in (
         out_bytes,
         torch.empty((1, 64, 1, 528), device="cuda", dtype=torch.uint8),
@@ -546,7 +574,9 @@ def test_swa_fp8_empty_and_rejected_declarations():
         out.expand(2, -1, -1, -1),
     ):
         with pytest.raises(ValueError, match="swa_fp8 output"):
-            deepseek_v41_quantize_cache(x, format="swa_fp8", out=invalid)
+            deepseek_v41_quantize_cache(
+                x, format="swa_fp8", out=invalid, kv_layout="NHD"
+            )
     slots = torch.arange(64, device="cuda", dtype=torch.int32)
     for invalid in (
         slots.long(),
@@ -555,24 +585,30 @@ def test_swa_fp8_empty_and_rejected_declarations():
         torch.arange(64, dtype=torch.int32),
     ):
         with pytest.raises(ValueError, match="slots must"):
-            deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=invalid)
+            deepseek_v41_quantize_cache(
+                x, format="swa_fp8", out=out, slots=invalid, kv_layout="NHD"
+            )
     with pytest.raises(ValueError, match="QAT"):
-        deepseek_v41_quantize_cache(x.requires_grad_(), format="swa_fp8")
+        deepseek_v41_quantize_cache(
+            x.requires_grad_(), format="swa_fp8", kv_layout="NHD"
+        )
     x = x.detach()
     with pytest.raises(ValueError, match="QAT"):
         deepseek_v41_quantize_cache(
-            x, format="swa_fp8", out=out.detach().requires_grad_()
+            x, format="swa_fp8", out=out.detach().requires_grad_(), kv_layout="NHD"
         )
     with pytest.raises(ValueError, match="overlap"):
         alias = (
             x.view(torch.uint8).flatten()[: out.numel()].view(torch.float8_e4m3fn)
         ).view_as(out)
-        deepseek_v41_quantize_cache(x, format="swa_fp8", out=alias)
+        deepseek_v41_quantize_cache(x, format="swa_fp8", out=alias, kv_layout="NHD")
     with pytest.raises(ValueError, match="overlap"):
         alias_slots = out_bytes.flatten()[: x.shape[0] * 4].view(torch.int32)
-        deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=alias_slots)
+        deepseek_v41_quantize_cache(
+            x, format="swa_fp8", out=out, slots=alias_slots, kv_layout="NHD"
+        )
     with pytest.raises(ValueError, match="capacity"):
-        deepseek_v41_quantize_cache(x, format="swa_fp8", out=out[:0])
+        deepseek_v41_quantize_cache(x, format="swa_fp8", out=out[:0], kv_layout="NHD")
 
 
 def test_swa_fp8_writer_has_no_host_sync():
@@ -585,11 +621,15 @@ def test_swa_fp8_writer_has_no_host_sync():
     out = out_bytes.view(torch.float8_e4m3fn)
     # Warm compilation before enabling the same synchronization guard used by
     # the legacy writer tests. Slot values remain device-side metadata.
-    deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=slots)
+    deepseek_v41_quantize_cache(
+        x, format="swa_fp8", out=out, slots=slots, kv_layout="NHD"
+    )
     torch.cuda.set_sync_debug_mode("error")
     try:
         assert (
-            deepseek_v41_quantize_cache(x, format="swa_fp8", out=out, slots=slots)
+            deepseek_v41_quantize_cache(
+                x, format="swa_fp8", out=out, slots=slots, kv_layout="NHD"
+            )
             is out
         )
     finally:
@@ -604,13 +644,10 @@ def test_swa_fp8_writer_has_no_host_sync():
 
 @pytest.mark.parametrize("compressed_k", [0, 128, 192, 512])
 def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
-    from flashinfer.deepseek_v41 import (
-        deepseek_v41_decode,
-        deepseek_v41_window_decode,
-    )
     from .test_deepseek_v41_decode import (
         check_fp8,
-        fp8_main_reference,
+        decode_case,
+        window_case,
         fp8_oracle,
         gate as decode_gate,
     )
@@ -619,10 +656,12 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
     torch.manual_seed(941 + compressed_k)
     x = torch.randn(max(128, compressed_k), 512, device="cuda", dtype=torch.bfloat16)
     x.clamp_(-0.5, 0.5)
-    x[0, -1] = 3  # Exact writer-decoded max; the last group must enter prep amax.
-    swa = deepseek_v41_quantize_cache(x[:128], format="swa_fp8")
+    x[0, -1] = 3  # The final group16 scale must survive direct reconstruction.
+    swa = deepseek_v41_quantize_cache(x[:128], format="swa_fp8", kv_layout="NHD")
     main = (
-        deepseek_v41_quantize_cache(x, format="main_kv_fp4") if compressed_k else None
+        deepseek_v41_quantize_cache(x, format="main_kv_fp4", kv_layout="NHD")
+        if compressed_k
+        else None
     )
     wi = torch.arange(128, device="cuda", dtype=torch.int32).view(1, 1, 128)
     ci = (
@@ -637,12 +676,10 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
     sink = torch.randn(64, device="cuda")
     args = q, swa, main, wi, ci, sink
 
-    def run(plan=None):
+    def run(buffers=None):
         if compressed_k:
-            return deepseek_v41_decode(*args, plan=plan, backend="prims-ts")
-        return deepseek_v41_window_decode(
-            q, swa, wi, sink, plan=plan, backend="prims-ts"
-        )
+            return decode_case(*args, buffers=buffers, backend="prims-ts")
+        return window_case(q, swa, wi, sink, buffers=buffers, backend="prims-ts")
 
     def check():
         # Byte gates are separate from the represented-value FP64 decode gate.
@@ -656,33 +693,25 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
                 strict=True,
             ):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            _, expected_scale, _ = fp8_main_reference(main, ci)
-            assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (
-                1,
-            )
-            torch.testing.assert_close(plan.main_scale, expected_scale, rtol=0, atol=0)
-        else:
-            assert plan.main_scale is None
+        assert not hasattr(buffers.views, "main_scale")
         check_fp8(out, lse, fp8_oracle(*args))
 
-    out, lse, plan = run()
+    out, lse, buffers = run()
     check()
     if compressed_k:
-        torch.testing.assert_close(
-            plan.main_scale, torch.full_like(plan.main_scale, 3 / 448), rtol=0, atol=0
-        )
-        previous_scale = plan.main_scale.clone()
         previous_bytes = main.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        deepseek_v41_quantize_cache(x[:128], format="swa_fp8", out=swa)
+        deepseek_v41_quantize_cache(x[:128], format="swa_fp8", out=swa, kv_layout="NHD")
         if compressed_k:
-            deepseek_v41_quantize_cache(x, format="main_kv_fp4", out=main)
-        run(plan)
+            deepseek_v41_quantize_cache(
+                x, format="main_kv_fp4", out=main, kv_layout="NHD"
+            )
+        run(buffers)
     for step in range(3):
         x.normal_().clamp_(-1, 1).mul_(step + 1)
-        # Live replays use exact writer group scales one/two and decoded
-        # maxima 6/12. Captured prep must reread the changed bytes, not reuse s.
+        # Live writer group scales change, and the joint consumer must reread
+        # payload/scale bytes without any decode-time amax or request descale.
         x[0, -1] = 6 * (step + 1)
         q_source.normal_()
         q.copy_(q_source.to(torch.float8_e4m3fn))
@@ -698,7 +727,6 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
             ci[..., ::17] = -1
             ci[..., 1] = 0  # Keep the changed maximum selected on live replays.
             main.fill_(255)
-            plan.main_scale.fill_(float("nan"))
         if step == 2:
             wi.fill_(-1)
             if compressed_k:
@@ -711,14 +739,40 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
         if compressed_k:
             _, written_scales = unpack_bytes(main, x.shape[0], True)
             assert written_scales[0, -1].item() == (0x38, 0x40, 0x44)[step]
-            expected_scale = 1.0 if step == 2 else 6 * (step + 1) / 448
-            torch.testing.assert_close(
-                plan.main_scale,
-                torch.full_like(plan.main_scale, expected_scale),
-                rtol=0,
-                atol=0,
-            )
             assert not torch.equal(main, previous_bytes)
-            assert not torch.equal(plan.main_scale, previous_scale)
             previous_bytes.copy_(main)
-            previous_scale.copy_(plan.main_scale)
+
+
+@pytest.mark.parametrize(
+    "fmt,width,dtype",
+    [
+        ("main_kv_fp4", 288, torch.uint8),
+        ("swa_mxfp8", 528, torch.uint8),
+        ("swa_fp8", 512, torch.float8_e4m3fn),
+    ],
+)
+def test_default_hnd_and_explicit_nhd_writer_bytes_and_identity(fmt, width, dtype):
+    gate()
+    x = torch.randn(65, 512, device="cuda", dtype=torch.bfloat16)
+    hnd = deepseek_v41_quantize_cache(x, format=fmt)
+    nhd = deepseek_v41_quantize_cache(x, format=fmt, kv_layout="NHD")
+    assert hnd.shape == (2, 1, 64, width) and nhd.shape == (2, 64, 1, width)
+    assert hnd.dtype == nhd.dtype == dtype
+    if fmt == "swa_fp8":
+        torch.testing.assert_close(
+            _swa_fp8_bytes(hnd)[:65], _swa_fp8_reference(x), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            _swa_fp8_bytes(hnd)[:65], _swa_fp8_bytes(nhd)[:65], rtol=0, atol=0
+        )
+    else:
+        for actual, expected, other in zip(
+            unpack_bytes(hnd, 65, fmt == "main_kv_fp4"),
+            reference(x, fmt),
+            unpack_bytes(nhd, 65, fmt == "main_kv_fp4"),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual, other, rtol=0, atol=0)
+    assert deepseek_v41_quantize_cache(x, format=fmt, out=hnd) is hnd
+    assert deepseek_v41_quantize_cache(x, format=fmt, out=nhd, kv_layout="NHD") is nhd

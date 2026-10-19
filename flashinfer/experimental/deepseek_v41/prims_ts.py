@@ -1,22 +1,17 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""V4.1 native FP8 SWA adapter for D512 Prims-TS.
+"""Joint shared-unit FP8 SWA/main attention for the V4.1 adapter."""
 
-BF16-Q/MXFP8 compatibility is isolated behind a function-local import.
-"""
-
-from dataclasses import dataclass
 import functools
 import hashlib
 from pathlib import Path
 
 import torch
 
-from ._utils import _overlaps
-from .decode import _validate_inputs
+from ._workspace import bind_inputs, device_sm_count
 
 
-def _make_fp8_sources(compressed_k, sm_count, native_fp4):
+def _make_fp8_attention(compressed_k, sm_count, native_fp4):
     from ...attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
     from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
@@ -24,74 +19,67 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
     from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
         MlaProfile,
     )
-    from .prims_ts_fp8 import Fp32SourceStore
-    from .prims_ts_resources import Fp4Fp8KvProducer
+    from .prims_ts_resources import MixedFp8KvProducer
 
-    def source(name, capacity, producer=None):
-        attention = ThroughputLatencyMlaDecodeTs(
-            batch_size=1,
-            num_heads=64,
-            seq_len_q=1,
-            seq_len_k=max(256, ((capacity + 127) // 128) * 128),
-            latent_dim=512,
-            rope_dim=0,
-            page_size=1,
-            max_active_clusters=sm_count,
-            qkv_dtype="e4m3",
-            out_dtype="bf16",
-            profile=MlaProfile(
-                name=name,
-                kernel_variant="keeps_mma_ab",
-                tile_size_q=64,
-                use_persistent_scheduler=0,
-            ),
-            logical_num_heads=64,
-            logical_seq_len_q=1,
+    # A fixed SWA HEAD precedes ceil(K/128) main LOOP tiles, including when
+    # every SWA entry is invalid. One online softmax/PV state spans both pools.
+    capacity = max(256, 128 + ((compressed_k + 127) // 128) * 128)
+    attention = ThroughputLatencyMlaDecodeTs(
+        batch_size=1,
+        num_heads=64,
+        seq_len_q=1,
+        seq_len_k=capacity,
+        latent_dim=512,
+        rope_dim=0,
+        page_size=1,
+        max_active_clusters=sm_count,
+        qkv_dtype="e4m3",
+        out_dtype="bf16",
+        profile=MlaProfile(
+            name="dsv41_shared_pertensor_joint",
+            kernel_variant="keeps_mma_ab",
             tile_size_q=64,
-            explicit_split_kv=1,
-            explicit_persistent=False,
-            reduction_mode="gmem_separate",
-            mask_type="dense",
-            sparse_profile=SparseMlaProfile(
-                family="keep",
-                tile_size_q=64,
-                split_kv=1,
-                scheduler="nonpersistent",
-                head_dim_ctas=1,
-                gather_issue_warps=4,
-                direct_inputs=True,
-                reuse_kv=True,
-                reuse_kv_stages=8,
-                kv_tile_size=128,
-                page_pipeline_stages=1,
-            ),
-            finalize_output=False,
-            kv_producer=producer,
-            source_state_store=Fp32SourceStore(),
-        )
-        attention.direct_static_scales = True
-        attention.direct_request_kv_scale = producer is not None
-        attention.direct_sparse_capacities = (capacity, 0)
-        return attention
-
-    # Both sources use native FP8 BK128 with four D128 stages per tile.
-    # Main normalizes selected FP4 tiles by a live per-request descale before
-    # E4M3 staging; the same descale restores its QK and normalized O units.
-    swa = source("dsv41_fp8_swa_source", 128)
-    main = (
-        source(
-            "dsv41_fp4_fp8_source",
-            compressed_k,
-            Fp4Fp8KvProducer(native_fp4=native_fp4),
-        )
-        if compressed_k
-        else None
+            use_persistent_scheduler=0,
+        ),
+        logical_num_heads=64,
+        logical_seq_len_q=1,
+        tile_size_q=64,
+        explicit_split_kv=1,
+        explicit_persistent=False,
+        reduction_mode="gmem_separate",
+        mask_type="dense",
+        sparse_profile=SparseMlaProfile(
+            family="keep",
+            tile_size_q=64,
+            split_kv=1,
+            scheduler="nonpersistent",
+            head_dim_ctas=1,
+            gather_issue_warps=4,
+            direct_inputs=True,
+            reuse_kv=True,
+            reuse_kv_stages=8,
+            kv_tile_size=128,
+            page_pipeline_stages=1,
+        ),
+        finalize_output=True,
+        kv_producer=MixedFp8KvProducer(native_fp4=native_fp4),
     )
-    return swa, main
+    # Without a source-state store the constructor does not enable direct
+    # sparse inputs itself. Static here means host scalars, not device scales
+    # or value-specialized binaries; both BMM factors remain runtime Float32.
+    attention.direct_sparse = True
+    attention.direct_static_scales = True
+    attention.direct_request_kv_scale = False
+    attention.direct_split_softmax_scale = True
+    attention.direct_sparse_capacities = (128, compressed_k)
+    return attention
 
 
 @functools.cache
-def _compile(device_index, compressed_k, *, native_fp4=None):
+def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
+    if torch.cuda.is_current_stream_capturing():
+        raise ValueError("warm up the decode specialization before CUDA Graph capture")
+
     import cutlass
     import cutlass.cute as cute
     from packaging.version import Version
@@ -109,15 +97,17 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import kernel
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ...cute_dsl import fp4_common
-    from . import hca_v41_primitives, prims_ts_fp8, prims_ts_resources
+    from . import (
+        _sparse_views,
+        _workspace,
+        hca_v41_primitives,
+        prims_ts_fp8,
+        prims_ts_resources,
+    )
 
-    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    swa_attention, global_attention = _make_fp8_sources(
-        compressed_k, sm_count, native_fp4
-    )
-    decode_kernel = prims_ts_fp8.Fp8SwaDecodeKernel(
-        swa_attention, global_attention, compressed_k
-    )
+    sm_count = device_sm_count(device_index)
+    attention = _make_fp8_attention(compressed_k, sm_count, native_fp4)
+    decode_kernel = prims_ts_fp8.Fp8SwaDecodeKernel(attention)
     batch = cute.sym_int()
     f = cute.runtime.make_fake_compact_tensor
 
@@ -137,7 +127,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
         (512, 1, 512),
         assumed_align=16,
     )
-    global_cache = f(
+    main_cache = f(
         cutlass.Uint8,
         (cute.sym_int64(divisibility=64 * 288),),
         assumed_align=16,
@@ -149,33 +139,17 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     def lengths():
         return f(cutlass.Int32, (batch,), assumed_align=16)
 
-    def source_out():
-        return f(
-            cutlass.Float32,
-            (batch, 64, 512),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
-
-    def source_lse():
-        return f(cutlass.Float32, (batch, 64), stride_order=(1, 0), assumed_align=16)
-
-    wi, selected_swa = indices(128), indices(128)
-    ci, selected_global = indices(max(64, compressed_k)), indices(max(64, compressed_k))
-    swa_lengths, global_lengths, empty_lengths = lengths(), lengths(), lengths()
-    swa_counts, global_counts = lengths(), lengths()
-    main_scale = f(cutlass.Float32, (batch,), assumed_align=16)
-    part_s, part_c = source_out(), source_out()
-    lse_s, lse_c, lse = source_lse(), source_lse(), source_lse()
-    sink = f(cutlass.Float32, (64,), assumed_align=16)
+    combined = indices(128 + compressed_k)
+    topk_lens, seq_lens = lengths(), lengths()
+    lse = f(cutlass.Float32, (batch, 64), stride_order=(1, 0), assumed_align=16)
+    sinks = f(cutlass.Float32, (64,), assumed_align=16) if has_sink else None
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     signature = (
-        "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3",
-        swa_attention.compile_signature(),
-        global_attention.compile_signature() if global_attention is not None else None,
-        "source_o_fp32",
-        "source_lse_log2",
-        "public_o_bf16_lse_ln",
+        "dsv41_shared_pertensor_joint_e4m3_swa512_fp4_inline_metadata_v2",
+        attention.compile_signature(),
+        has_sink,
+        "public_o_bf16_internal_lse_ln_sink_exclusive",
+        "runtime_bmm1_bmm2_f32",
         cutlass.__version__,
         compiler,
     )
@@ -183,35 +157,29 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     native_root = Path(kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
-        f"h64_d512_swa128_c{compressed_k}_keep_bk128_globalbk128_kv8_split1_i64"
-        f"_fp4e4m3_requestscale_fp32src_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
+        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split1_i64"
+        f"_shared_pertensor_joint_sink{int(has_sink)}"
+        f"_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
             decode_kernel,
             q,
             swa,
-            global_cache,
-            wi,
-            ci,
-            selected_swa,
-            selected_global,
-            swa_lengths,
-            global_lengths,
-            empty_lengths,
-            swa_counts,
-            global_counts,
-            main_scale,
-            part_s,
-            part_c,
-            lse_s,
-            lse_c,
-            sink,
+            main_cache,
+            combined,
+            topk_lens,
+            seq_lens,
+            sinks,
             out,
             lse,
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
             stream,
             options="--enable-tvm-ffi --opt-level 2",
         ),
         extra_key_files=(
             __file__,
+            _workspace.__file__,
+            _sparse_views.__file__,
             prims_ts_fp8.__file__,
             prims_ts_resources.__file__,
             hca_v41_primitives.__file__,
@@ -221,175 +189,53 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     )
 
 
-def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None):
-    signature = _validate_inputs(
-        q,
-        swa_cache,
-        global_cache,
-        swa_indices,
-        global_indices,
-        sink,
-        allow_fp8_swa=True,
-    )
-    if q.dtype == torch.bfloat16:
-        from .prims_ts_mxfp8 import decode as decode_mxfp8
-
-        return decode_mxfp8(
-            q,
-            swa_cache,
-            global_cache,
-            swa_indices,
-            global_indices,
-            sink,
-            signature=signature,
-            plan=plan,
-        )
-    return _decode_fp8(
-        q,
-        swa_cache,
-        global_cache,
-        swa_indices,
-        global_indices,
-        sink,
-        signature=signature,
-        plan=plan,
-    )
-
-
-@dataclass(frozen=True)
-class _Plan:
-    signature: tuple
-    kernel: object
-    split: int
-    out: torch.Tensor
-    lse: torch.Tensor
-    selected_swa: torch.Tensor
-    selected_global: torch.Tensor
-    swa_lengths: torch.Tensor
-    global_lengths: torch.Tensor
-    empty_lengths: torch.Tensor
-    swa_counts: torch.Tensor
-    global_counts: torch.Tensor
-    main_scale: object
-    part_s: torch.Tensor
-    part_c: object
-    lse_s: torch.Tensor
-    lse_c: object
-    empty_cache: torch.Tensor
-    empty_indices: torch.Tensor
-
-
-def _decode_fp8(
-    q, swa_cache, global_cache, swa_indices, global_indices, sink, *, signature, plan
+def decode_mixed(
+    query,
+    swa_kv_cache,
+    workspace_buffer,
+    sparse_indices=None,
+    compressed_kv_cache=None,
+    sparse_topk_lens=None,
+    seq_lens=None,
+    out=None,
+    bmm1_scale=1.0,
+    bmm2_scale=1.0,
+    sinks=None,
+    kv_layout="HND",
 ):
-    if plan is not None and (
-        not isinstance(plan, _Plan) or plan.signature != signature
-    ):
-        raise ValueError("decode plan declaration mismatch")
-    batch = q.shape[0]
-    ck = 0 if global_indices is None else global_indices.shape[2]
-    inputs = tuple(
-        x
-        for x in (q, swa_cache, global_cache, swa_indices, global_indices, sink)
-        if x is not None
+    if query.dtype != torch.float8_e4m3fn:
+        raise ValueError("Prims-TS decode requires E4M3 Q")
+    bound = bind_inputs(
+        query,
+        swa_kv_cache,
+        workspace_buffer,
+        sparse_indices,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        seq_lens,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        sinks,
+        kv_layout,
+        backend="prims-ts",
     )
-    with torch.cuda.device(q.device):
-        if plan is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError("prepare a decode plan before CUDA Graph capture")
-
-            def allocate(shape, dtype):
-                return torch.empty(shape, device=q.device, dtype=dtype)
-
-            plan = _Plan(
-                signature=signature,
-                kernel=_compile(q.device.index, ck),
-                split=1,
-                out=allocate(q.shape, torch.bfloat16),
-                lse=allocate((batch, 64, 1), torch.float32),
-                selected_swa=allocate((batch, 128), torch.int32),
-                selected_global=allocate((batch, max(64, ck)), torch.int32),
-                swa_lengths=allocate((batch,), torch.int32),
-                global_lengths=allocate((batch,), torch.int32),
-                empty_lengths=allocate((batch,), torch.int32),
-                swa_counts=allocate((batch,), torch.int32),
-                global_counts=allocate((batch,), torch.int32),
-                main_scale=allocate((batch,), torch.float32) if ck else None,
-                part_s=allocate((batch, 64, 512), torch.float32),
-                part_c=allocate((batch, 64, 512), torch.float32) if ck else None,
-                lse_s=allocate((batch, 64), torch.float32),
-                lse_c=allocate((batch, 64), torch.float32) if ck else None,
-                empty_cache=allocate((1, 64, 1, 288), torch.uint8),
-                empty_indices=torch.full(
-                    (batch, 64), -1, device=q.device, dtype=torch.int32
-                ),
-            )
-        if ck and (
-            not isinstance(plan.main_scale, torch.Tensor)
-            or plan.main_scale.dtype != torch.float32
-            or plan.main_scale.device != q.device
-            or plan.main_scale.shape != (batch,)
-            or not plan.main_scale.is_contiguous()
-        ):
-            raise ValueError(
-                "main request scales must be contiguous same-device FP32[B]"
-            )
-        owned = tuple(
-            x
-            for x in (
-                plan.out,
-                plan.lse,
-                plan.selected_swa,
-                plan.selected_global,
-                plan.swa_lengths,
-                plan.global_lengths,
-                plan.empty_lengths,
-                plan.swa_counts,
-                plan.global_counts,
-                plan.main_scale,
-                plan.part_s,
-                plan.part_c,
-                plan.lse_s,
-                plan.lse_c,
-                plan.empty_cache,
-                plan.empty_indices,
-            )
-            if x is not None
+    views = bound.views
+    with torch.cuda.device(query.device):
+        kernel = _compile(
+            query.device.index, bound.compressed_k, has_sink=bound.sinks is not None
         )
-        if any(_overlaps(dst, src) for dst in owned for src in inputs):
-            raise ValueError("decode inputs must not overlap plan-owned buffers")
-        if torch.is_grad_enabled() and any(x.requires_grad for x in owned):
-            raise ValueError("DS4.1 decode is inference-only")
-        main = plan.empty_cache if global_cache is None else global_cache
-        ids = plan.empty_indices if global_indices is None else global_indices
-        # Window-only omits global states. Unused source-state ABI slots alias
-        # existing buffers; its compiled branch cannot read them. Both passes
-        # consume the original FP8 Q; only public O is rounded to BF16.
-        part_c = plan.part_s if plan.part_c is None else plan.part_c
-        lse_c = plan.lse_s if plan.lse_c is None else plan.lse_c
-        main_scale = (
-            plan.lse_s.view(-1)[:batch] if plan.main_scale is None else plan.main_scale
+        kernel(
+            query.permute(2, 3, 1, 0),
+            bound.swa_cache.view(-1, 1, 512).permute(1, 2, 0),
+            bound.main_cache.view(-1),
+            bound.indices,
+            bound.topk_lens,
+            bound.seq_lens,
+            bound.sinks,
+            bound.out.permute(2, 3, 1, 0),
+            views.lse.view(bound.batch, 64),
+            bound.bmm1_scale,
+            bound.bmm2_scale,
         )
-        plan.kernel(
-            q.permute(2, 3, 1, 0),
-            swa_cache.view(-1, 1, 512).permute(1, 2, 0),
-            main.view(-1),
-            swa_indices.view(batch, 128),
-            ids.view(batch, -1),
-            plan.selected_swa,
-            plan.selected_global,
-            plan.swa_lengths,
-            plan.global_lengths,
-            plan.empty_lengths,
-            plan.swa_counts,
-            plan.global_counts,
-            main_scale,
-            plan.part_s,
-            part_c,
-            plan.lse_s,
-            lse_c,
-            sink,
-            plan.out.permute(2, 3, 1, 0),
-            plan.lse.view(batch, 64),
-        )
-    return plan.out, plan.lse, plan
+    return bound.out

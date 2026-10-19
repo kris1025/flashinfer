@@ -1,22 +1,16 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Native E4M3 attention and FP32 source states for the V4.1 adapter.
+"""Shared-unit E4M3 SWA/main attention for the V4.1 adapter.
 
-SWA stays native FP8 through TMA, QK, P and PV. The optional main pass normalizes
-selected FP4 values by a live request descale before E4M3 staging, then restores
-their units in QK and normalized O. Both passes use the original FP8 Q and keep
-normalized O in FP32 until merging.
+Original metadata is checked inside one finalizing native attention. Both sources
+share online softmax, FP32 PV, sink normalization and final BF16 publication.
+The generic FP32 source-store hook below remains available independently.
 """
 
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
-
-from ...attention.prims_ts.kernels.separate_reduction import MergeMlaSourceStates
-from ...cute_dsl.fp4_common import block_reduce, fdiv_rn, fmax_f32, warp_reduce
-from .prims_ts_resources import _fp4_group_amax
 
 
 @dataclass(frozen=True)
@@ -44,222 +38,56 @@ class Fp32SourceStore:
 
 
 class Fp8SwaDecodeKernel:
-    def __init__(self, swa_attention, global_attention, compressed_k):
-        self.swa_attention = swa_attention
-        self.global_attention = global_attention
-        self.compressed_k = compressed_k
-        self.merge = MergeMlaSourceStates(compressed_k > 0)
-
-    @cute.kernel
-    def _prepare(
-        self,
-        swa_indices: cute.Tensor,
-        global_indices: cute.Tensor,
-        selected_swa: cute.Tensor,
-        selected_global: cute.Tensor,
-        swa_lengths: cute.Tensor,
-        global_lengths: cute.Tensor,
-        empty_lengths: cute.Tensor,
-        swa_counts: cute.Tensor,
-        global_counts: cute.Tensor,
-        global_cache: cute.Tensor,
-        main_scale: cute.Tensor,
-        swa_capacity: cutlass.Int64,
-        global_capacity: cutlass.Int64,
-    ):
-        request = cute.arch.block_idx()[0]
-        lane = cute.arch.thread_idx()[0]
-        if lane == 0:
-            swa_lengths[request] = cutlass.Int32(128)
-            global_lengths[request] = cutlass.Int32(self.compressed_k)
-            empty_lengths[request] = cutlass.Int32(0)
-            swa_counts[request] = cutlass.Int32(0)
-            global_counts[request] = cutlass.Int32(0)
-        cute.arch.sync_threads()
-
-        index = cutlass.Int32(swa_indices[request, lane])
-        valid_s = (
-            (index >= cutlass.Int32(0))
-            & (index != cutlass.Int32(0x7FFFFFFF))
-            & (cutlass.Int64(index) < swa_capacity)
-        )
-        selected_swa[request, lane] = index if valid_s else cutlass.Int32(-1)
-        valid_c = cutlass.Int32(0)
-        if cutlass.const_expr(self.compressed_k > 0):
-            for group in cutlass.range_constexpr((self.compressed_k + 127) // 128):
-                column = lane + group * 128
-                if column < self.compressed_k:
-                    global_index = cutlass.Int32(global_indices[request, column])
-                    keep = (
-                        (global_index >= cutlass.Int32(0))
-                        & (global_index != cutlass.Int32(0x7FFFFFFF))
-                        & (cutlass.Int64(global_index) < global_capacity)
-                    )
-                    selected_global[request, column] = (
-                        global_index if keep else cutlass.Int32(-1)
-                    )
-                    valid_c += cutlass.Int32(keep)
-        elif lane < 64:
-            selected_global[request, lane] = cutlass.Int32(-1)
-
-        # Execution spans retain holes/duplicates; counts describe actual live
-        # positions so empty sources never contribute poisoned partial states.
-        count_s = cute.arch.warp_reduction_sum(cutlass.Int32(valid_s))
-        count_c = cute.arch.warp_reduction_sum(valid_c)
-        if lane % 32 == 0:
-            cute.arch.atomic_add(swa_counts.iterator + request, count_s, scope="cta")
-            cute.arch.atomic_add(global_counts.iterator + request, count_c, scope="cta")
-
-        if cutlass.const_expr(self.compressed_k > 0):
-            # One warp owns one selected row; its lanes cover the 32 group16s
-            # with coalesced payload/scale reads. All selections are published
-            # before any warp reads another thread's sanitized slot.
-            cute.arch.sync_threads()
-            reduction_buffer = utils.SmemAllocator().allocate_tensor(
-                cutlass.Float32, cute.make_layout((1, 4)), byte_alignment=4
-            )
-            local_amax = cutlass.Float32(0.0)
-            for column in cutlass.range(lane // 32, self.compressed_k, 4):
-                slot = cutlass.Int32(selected_global[request, column])
-                if slot >= cutlass.Int32(0):
-                    group_amax = _fp4_group_amax(global_cache, slot, lane % 32)
-                    local_amax = fmax_f32(local_amax, group_amax)
-            warp_amax = warp_reduce(local_amax, fmax_f32)
-            amax = block_reduce(
-                warp_amax, fmax_f32, reduction_buffer, cutlass.Float32(0.0)
-            )
-            if lane == 0:
-                descale = cutlass.Float32(1.0)
-                if amax > cutlass.Float32(0.0):
-                    descale = fdiv_rn(amax, cutlass.Float32(448.0))
-                main_scale[request] = descale
+    def __init__(self, attention):
+        self.attention = attention
 
     @cute.jit
     def __call__(
         self,
         q: cute.Tensor,
         swa_cache: cute.Tensor,
-        global_cache: cute.Tensor,
-        swa_indices: cute.Tensor,
-        global_indices: cute.Tensor,
-        selected_swa: cute.Tensor,
-        selected_global: cute.Tensor,
-        swa_lengths: cute.Tensor,
-        global_lengths: cute.Tensor,
-        empty_lengths: cute.Tensor,
-        swa_counts: cute.Tensor,
-        global_counts: cute.Tensor,
-        main_scale: cute.Tensor,
-        part_s: cute.Tensor,
-        part_c: cute.Tensor,
-        lse_s: cute.Tensor,
-        lse_c: cute.Tensor,
-        sink: cute.Tensor,
+        main_cache: cute.Tensor,
+        indices: cute.Tensor,
+        topk_lens: cute.Tensor,
+        seq_lens: cute.Tensor,
+        sinks: object,
         out: cute.Tensor,
         lse: cute.Tensor,
+        bmm1_scale: cutlass.Float32,
+        bmm2_scale: cutlass.Float32,
         stream: object,
     ):
-        self._prepare(
-            swa_indices,
-            global_indices,
-            selected_swa,
-            selected_global,
-            swa_lengths,
-            global_lengths,
-            empty_lengths,
-            swa_counts,
-            global_counts,
-            global_cache,
-            main_scale,
-            cutlass.Int64(swa_cache.shape[2]),
-            cutlass.Int64(cute.size(global_cache)) // 288,
-        ).launch(
-            grid=(swa_indices.shape[0], 1, 1),
-            block=(128, 1, 1),
-            stream=stream,
+        final_lse = cute.make_tensor(
+            lse.iterator,
+            cute.make_layout((64, 1, indices.shape[0]), stride=(1, 64, 64)),
         )
-        source_lse_layout = cute.make_layout(
-            (64, 1, swa_indices.shape[0]), stride=(1, 64, 64)
+        # The producer-owned binder consumes this original combined table and
+        # its live lengths, rather than generic caller-prepared source lists.
+        direct = (
+            indices,
+            None,
+            seq_lens,
+            topk_lens,
+            None,
+            None,
+            None,
+            None,
+            sinks,
         )
-        swa_lse = cute.make_tensor(lse_s.iterator, source_lse_layout)
-        # Each pass has only a primary source. Extra slots bind a real tensor
-        # with length zero, matching the native compiled direct-index ABI.
-        direct_swa = (
-            selected_swa,
-            selected_global,
-            swa_lengths,
-            empty_lengths,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        self.swa_attention(
+        self.attention(
             q,
             q,
-            swa_cache,
+            main_cache,
             swa_cache,
             None,
             out,
-            swa_lse,
+            final_lse,
             None,
             cutlass.Int32(1),
-            swa_lengths,
+            seq_lens,
             None,
-            direct_swa,
-            cutlass.Float32(512**-0.5),
-            cutlass.Float32(1.0),
-            stream,
-            source_state_store_args=(part_s, swa_counts),
-        )
-        if cutlass.const_expr(self.compressed_k > 0):
-            global_lse = cute.make_tensor(lse_c.iterator, source_lse_layout)
-            direct_global = (
-                selected_global,
-                selected_swa,
-                global_lengths,
-                empty_lengths,
-                None,
-                None,
-                main_scale,
-                None,
-                None,
-            )
-            self.global_attention(
-                q,
-                q,
-                global_cache,
-                global_cache,
-                None,
-                out,
-                global_lse,
-                None,
-                cutlass.Int32(1),
-                global_lengths,
-                None,
-                direct_global,
-                cutlass.Float32(512**-0.5),
-                cutlass.Float32(1.0),
-                stream,
-                source_state_store_args=(part_c, global_counts),
-                kv_producer_runtime_args=(main_scale,),
-            )
-        final_out = cute.make_tensor(
-            out.iterator,
-            cute.make_layout(
-                (swa_indices.shape[0], 64, 512), stride=(64 * 512, 512, 1)
-            ),
-        )
-        self.merge(
-            part_s,
-            part_c,
-            lse_s,
-            lse_c,
-            swa_counts,
-            global_counts if self.compressed_k > 0 else swa_counts,
-            sink,
-            final_out,
-            lse,
+            direct,
+            bmm1_scale,
+            bmm2_scale,
             stream,
         )

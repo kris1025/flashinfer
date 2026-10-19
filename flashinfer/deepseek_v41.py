@@ -8,149 +8,209 @@ from .api_logging import flashinfer_experimental_api
 
 @flashinfer_experimental_api
 def deepseek_v41_decode(
-    q,
-    swa_cache,
-    global_cache,
-    swa_indices,
-    global_indices,
-    sink,
+    query,
+    swa_kv_cache,
+    workspace_buffer,
+    sparse_indices=None,
+    compressed_kv_cache=None,
+    sparse_topk_lens=None,
+    seq_lens=None,
+    out=None,
+    bmm1_scale=1.0,
+    bmm2_scale=1.0,
+    sinks=None,
+    kv_layout="HND",
     *,
-    plan=None,
     backend="cute-dsl",
 ):
-    """Mixed SWA/FP4 decode using CuTe DSL primitives on SM100.
+    """Single-token SWA/main decode with the V4 caller-workspace convention.
 
-    ``backend="prims-ts"`` uses explicit torch.float8_e4m3fn Q[B,1,64,512]
-    with the same dtype of contiguous, unit-scale SWA[pages,64,1,512], without
-    a scale plane. This is ordinary E4M3, not MXFP8 with ignored scales.
-    Decode never implicitly quantizes BF16 Q. Both SWA and main attention use
-    E4M3 Q/K/V/P with the original FP8 Q. SWA uses native TMA, not BF16
-    dequantization. Optional uint8 FP4 global[pages,64,1,288] retains packed
-    E2M1 data and group16 E4M3 scales in global memory. Each request computes
-    the exact amax of its valid selected main values after those scales,
-    then an FP32 descale s = amax / 448 (1 for zero/empty selections).
-    Both divisions use FP32 round-to-nearest: selected values x are normalized
-    by s, then rounded/saturated to E4M3 with signed zero/subnormal support.
-    The same s is restored in QK and normalized V output, rather than clipping
-    represented main values to +/-448. Conversion remains lossy. The FP8
-    shared-memory tiles feed both QK and PV; no full converted cache or BF16
-    query expansion/scratch is allocated. Only mixed mode owns FP32[B] main
-    descales; window-only omits the main pass, scale storage and amax work.
-    Sink-free normalized FP32 source outputs and log2 LSE are merged before
-    final BF16 output rounding; the sink contributes denominator mass once.
-    Window-only also omits the global pass and global source states.
+    The supported V4-style prefix accepts Q ``[B,1,64,512]``, a caller-owned
+    contiguous int8/uint8 workspace, optional BF16 ``out`` of Q's shape, and
+    shared Python-scalar ``bmm1_scale`` / ``bmm2_scale``. Only the BF16 output
+    is returned; supplied ``out`` is returned by identity. Use
+    :func:`deepseek_v41_decode_workspace_size` to size the workspace. Its base
+    must be 32-byte aligned. No public executable plan or LSE is returned.
 
-    ``backend="cute-dsl"`` preserves the Frost implementation (default):
-    contiguous BF16 Q[B,1,64,512], uint8 MXFP8 SWA[pages,64,1,528] and optional
-    uint8 FP4 global[pages,64,1,288]. Both packed caches use page-plane storage:
-    all payload rows precede all scale rows. With ``backend="prims-ts"``,
-    explicit BF16 Q with this MXFP8 SWA selects a separate, lazily imported
-    compatibility adapter. E4M3 Q/SWA remains the primary Prims-TS
-    implementation; there is no implicit conversion or public decode-format
-    selector.
+    ``sparse_indices`` is required CUDA int32 ``[B,128+K]``: its first128
+    columns address SWA physical slots and the remaining K columns address
+    main slots, where K=0/64/.../512. K>0 requires ``compressed_kv_cache``.
+    Also required are CUDA int32 ``sparse_topk_lens[B]`` and ``seq_lens[B]``.
+    Topk lengths include the fixed128 SWA positions, so the active main
+    prefix is ``topk-128``. The SWA prefix is ``[0,clamp(seq_lens,0,128))``
+    as explicit V4.1 policy, not a claim about V4 H64/Sq1 CAKE or cubin
+    behavior. Negative, reserved-sentinel and out-of-capacity slots are masked; holes and
+    duplicate multiplicity are preserved. Valid topk values lie in
+    ``[128,128+K]``. Lengths and selections refresh on every call/replay.
+    Callers own causal visibility and initialization of every valid slot.
 
-    Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler.
-    Fixed Keep-AB/M64/retained-KV8/split-1/nonpersistent schedules use BK128
-    for both native FP8 sources. MXFP8 compatibility instead retains BF16
-    Q/K/V/P, BK64 and fused finalization; its FP4-to-BF16 staging is unchanged.
-    Live selections are refreshed on the GPU on every call/replay; native
-    FP8 also refreshes true valid counts for its independent source passes.
-    Plans cannot cross modes or backends. The native sparse wrapper's
-    packed-input restriction is unchanged.
+    ``kv_layout="HND"`` (default) expects contiguous
+    ``[pages,1,64,width]`` caches; explicit ``"NHD"`` expects
+    ``[pages,64,1,width]``. Layout normalization is zero-copy. Packed pages
+    retain separate payload and scale planes, not interleaved token records.
 
-    SWA indices are int32[B,1,128]; global indices int32[B,1,K], K a positive
-    multiple of64 up to512. Negative, reserved-sentinel and out-of-capacity
-    slots are masked; duplicate positions retain their multiplicity. The
-    caller owns causal visibility and initialization of every valid slot.
-    Sink is FP32[64], finite or -inf (disabled). Effective Q/K/V must be
-    finite. Accumulation and softmax use FP32; no backward parity is claimed.
+    ``backend="cute-dsl"`` retains Frost (the default): BF16 Q, uint8
+    MXFP8 SWA width528, and optional uint8 FP4 main width288. Its attention
+    schedule is unchanged; standalone sanitation adds one preparation launch.
+    ``backend="prims-ts"`` requires explicit torch.float8_e4m3fn Q and
+    typed E4M3 SWA width512, with the same optional packed FP4 main. BF16 Q
+    is rejected before device validation or compilation, without conversion
+    or fallback. Prims-TS requires CuTe-DSL>=4.8 and its bundled CUDA13
+    compiler. Fixed Keep-AB/M64/BK128/retained-KV8/split1/nonpersistent
+    execution jointly attends SWA and main in one finalizing kernel, consuming
+    raw metadata and optional sinks inline without a preparation launch. Its
+    workspace contains internal LSE and a K0 dummy, not sanitized metadata.
+    SWA uses thread-written FP8 stages; Q retains native TMA.
 
-    Returns (out,lse,plan): BF16 output shaped like Q, even for FP8 Q, and
-    FP32 natural-log LSE [B,64,1] excluding the sink. Empty rows give exact
-    zero output and -inf LSE. Prepare before capture and reuse a plan with
-    matching shape, strides, dtype and device. Replay overwrites owned
-    outputs/scratch and retains captured input addresses; update values in
-    place or recapture when addresses change. Eager calls may change input
-    addresses. One plan must not execute concurrently on different streams.
+    Both caches must already use common cache units. ``bmm1_scale`` is the
+    positive finite FP32 QK/softmax factor; ``bmm2_scale`` is a finite FP32
+    output factor. For Q descale q_s, shared KV descale s>0 and attention
+    factor alpha, supply ``alpha*q_s*s`` and ``s``. Native main staging
+    directly rounds/saturates ``E2M1*group16_E4M3_scale`` to E4M3 in those
+    units, retaining signed zeros/subnormals. It does not calculate amax or
+    a request descale, divide by bmm2, or restore scales twice. Saturation
+    at +/-448 cache units is intentional. Neither backend repairs caches
+    encoded with inconsistent units. The original packed group scales and
+    cache-writer ABI remain unchanged.
 
-    Request-scaled main conversion/restoration passed full271/selected-dense57
-    on B200/DSL 4.8.0/bundled compiler 13.4 (job 5103699). Qualification covers
-    only that tested snapshot and selected dense subset, not the entire dense
-    suite or other hardware/toolchains. Historical job 5049128 qualifies only
-    unit-scale FP8 main; older full257 results used BF16 main attention.
-    Examples and benchmarks have not run. Performance, crossovers and checkpoint/
-    full-model behavior are unmeasured.
-    See examples/deepseek_v41/README.md for scope and commands. Single-token
-    decode only; MTP and SM103 are outside this adapter's scope.
+    The defaults are V4's ``bmm1_scale=1.0,bmm2_scale=1.0``. Explicitly pass
+    ``bmm1_scale=512**-0.5`` to retain the former V4.1 attention factor.
+    ``sinks`` is optional FP32[64], finite or -inf; omitted means disabled.
+    Sink mass is applied once to output normalization. Score maxima stay in
+    raw-dot units; differences are multiplied by BMM1 before log2 conversion,
+    avoiding a prematurely overflowing BMM1*log2(e) coefficient. Frost split
+    scratch retains raw maxima and sums rather than scaled partial LSE.
+    Empty rows produce exact zero output. Effective Q/K/V must be finite;
+    this is inference-only.
+
+    Capture requires supplied out, sufficient workspace, and eager warmup
+    for the same backend/declaration. Captured addresses must remain alive
+    and fixed; update tensor values in place. Python scalar factors are
+    captured values: changing them requires recapture, not recompilation.
+    Eager calls may change addresses. Concurrent calls need separate output
+    and workspace, or caller synchronization. Workspace and out must not overlap
+    inputs or each other; read-only inputs may alias one another.
+
+    This experimental API supports only SM100/H64/Sq1/D512; it does not add
+    V4 varlen, PDL, RopeQuant, SM120, MTP or automatic-backend support.
+    Historical tests do not qualify this shared-scale/API/inline-metadata revision.
+    No performance or checkpoint/full-model equivalence is claimed. See
+    ``examples/deepseek_v41/README.md`` for current validation boundaries.
     """
     if backend == "cute-dsl":
-        from .experimental.deepseek_v41.decode import decode
+        from .experimental.deepseek_v41.decode import decode_mixed
     elif backend == "prims-ts":
-        from .experimental.deepseek_v41.prims_ts import decode
+        from .experimental.deepseek_v41.prims_ts import decode_mixed
     else:
         raise ValueError(f"backend must be 'cute-dsl' or 'prims-ts', got {backend!r}")
-
-    return decode(
-        q, swa_cache, global_cache, swa_indices, global_indices, sink, plan=plan
+    return decode_mixed(
+        query,
+        swa_kv_cache,
+        workspace_buffer,
+        sparse_indices,
+        compressed_kv_cache,
+        sparse_topk_lens,
+        seq_lens,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        sinks,
+        kv_layout,
     )
 
 
 @flashinfer_experimental_api
 def deepseek_v41_window_decode(
-    q, cache, indices, sink, *, plan=None, backend="cute-dsl"
+    query,
+    swa_kv_cache,
+    workspace_buffer,
+    sparse_indices=None,
+    sparse_topk_lens=None,
+    seq_lens=None,
+    out=None,
+    bmm1_scale=1.0,
+    bmm2_scale=1.0,
+    sinks=None,
+    kv_layout="HND",
+    *,
+    backend="cute-dsl",
 ):
-    """Window-only variant of deepseek_v41_decode, with explicit backend selection.
+    """K=0 helper with the same ownership/scaling contract as mixed decode.
 
-    ``backend="prims-ts"`` uses explicit E4M3 Q with typed, unit-scale E4M3
-    cache of width 512, without BF16 SWA dequantization or BF16 query scratch.
-    The Frost default retains BF16 Q with uint8 MXFP8 cache of width 528;
-    that explicit pairing also selects the optional Prims-TS MXFP8 adapter.
-    Q is [B,1,64,512], cache is [pages,64,1,width] and
-    physical slot IDs are int32[B,1,128]. See deepseek_v41_decode for the
-    mode/backend-specific plan, arithmetic, output and sink-exclusive LSE
-    contracts. The default Frost backend remains unchanged.
+    ``sparse_indices`` is required int32[B,128], ``sparse_topk_lens`` is
+    required int32[B] with values128, and ``seq_lens`` is required int32[B].
+    Both backends use caller workspace and optional BF16 out, and return
+    only output. See :func:`deepseek_v41_decode` for cache units/layouts,
+    the V4 scale defaults, capture lifetime and supported declarations.
     """
-    if backend == "cute-dsl":
-        from .experimental.deepseek_v41.decode import decode
-    elif backend == "prims-ts":
-        from .experimental.deepseek_v41.prims_ts import decode
-    else:
-        raise ValueError(f"backend must be 'cute-dsl' or 'prims-ts', got {backend!r}")
-
-    return decode(q, cache, None, indices, None, sink, plan=plan)
+    return deepseek_v41_decode(
+        query,
+        swa_kv_cache,
+        workspace_buffer,
+        sparse_indices,
+        None,
+        sparse_topk_lens,
+        seq_lens,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        sinks,
+        kv_layout,
+        backend=backend,
+    )
 
 
 @flashinfer_experimental_api
-def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None):
-    """Quantize and write the cache formats consumed by DS4.1 decode backends.
+def deepseek_v41_decode_workspace_size(
+    batch_size, compressed_topk=0, *, backend="cute-dsl"
+):
+    """Return workspace bytes for a 32-byte-aligned allocation, without CUDA.
+
+    ``batch_size`` is in [1,65535]; ``compressed_topk`` is0 or a multiple of64
+    through512. This pure sizing helper neither compiles nor creates a plan.
+    The returned size includes backend-specific scratch and internal LSE.
+    """
+    from .experimental.deepseek_v41._workspace import workspace_size
+
+    return workspace_size(batch_size, compressed_topk, backend=backend)
+
+
+@flashinfer_experimental_api
+def deepseek_v41_quantize_cache(
+    x, *, format, page_size=64, out=None, slots=None, kv_layout="HND"
+):
+    """Quantize/write DS4.1 cache bytes in caller-chosen cache units.
 
     Optional Triton preparation helper; decode accepts compatible caches from
     any producer. Contiguous finite BF16/FP32 x[N,512] must already include
-    any model-required RoPE. SM100 and page_size=64 only.
+    model-required RoPE and any normalization to shared per-tensor cache
+    units. This writer does not calculate a shared tensor descale. SM100 and
+    page_size=64 only. Decode factors restore the caller's common units.
 
-    ``main_kv_fp4`` uses E2M1 data, group16/E4M3 scales, no global scale;
-    native FP8 decode computes a request-selected descale and normalizes only
-    selected main tiles before E4M3 staging, restoring it in attention without
-    changing this writer or packed storage ABI.
-    ``swa_mxfp8`` uses E4M3 data and group32/E8M0 scales. Main-cache scales
-    must be representable in E4M3. Opaque uint8 output has shape
-    [pages,64,1,288] or [pages,64,1,528]. Each page holds all data rows,
-    followed by all scale rows; these are not interleaved token records.
-    ``swa_fp8`` instead clamps finite input to [-448,448] and rounds to
-    nearest even E4M3 with unit scale, retaining signed zero/subnormals.
-    It returns contiguous typed torch.float8_e4m3fn[pages,64,1,512], ordinary
-    row-major payload with no scale plane. This format requires explicit
-    FP8 Q and ``backend="prims-ts"`` at decode; it is not interchangeable
-    with ``swa_mxfp8``.
+    ``main_kv_fp4`` uses E2M1 data and group16/E4M3 scales, width288;
+    ``swa_mxfp8`` uses E4M3 data and group32/E8M0 scales, width528. Opaque
+    uint8 pages retain all payload rows followed by all scale rows.
+    ``swa_fp8`` clamps to [-448,448] and rounds to nearest-even E4M3,
+    retaining signed zero/subnormals, and returns typed E4M3 width512
+    without a scale plane. It requires explicit E4M3 Q and Prims-TS decode.
+    Main-group scales must be representable in E4M3.
 
-    Without slots, input row i writes physical slot i. For incremental
-    updates, provide caller-owned out and CUDA int32 slots[N]. Negative or
-    out-of-capacity slots skip publication. Valid slots must be unique;
-    uniqueness is a caller precondition and is not checked. Unwritten slots
-    remain untouched and must not be attended to before initialization.
-    Inputs and output must not overlap. Reusing out permits allocation-free
-    CUDA Graph replay. No implicit QAT derivative.
+    Default ``kv_layout="HND"`` output is contiguous [pages,1,64,width];
+    explicit ``"NHD"`` gives [pages,64,1,width], with identical storage
+    bytes. Supplied ``out`` is returned by identity. Without slots, input
+    row i writes slot i. Incremental updates require caller-owned out and
+    CUDA int32 slots[N]. Invalid slots skip publication; valid slots must
+    be unique (unchecked caller precondition). Unwritten slots remain
+    untouched and must not be attended to before initialization. Inputs
+    and out must not overlap. Reusing out permits allocation-free replay.
     """
     from .experimental.deepseek_v41.cache import quantize_cache
 
-    return quantize_cache(x, format=format, page_size=page_size, out=out, slots=slots)
+    return quantize_cache(
+        x,
+        format=format,
+        page_size=page_size,
+        out=out,
+        slots=slots,
+        kv_layout=kv_layout,
+    )
