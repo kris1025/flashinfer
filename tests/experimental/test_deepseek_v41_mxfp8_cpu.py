@@ -17,12 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from .test_deepseek_v41_source_state_cpu import (
-    _host_case,
-    _metadata_case,
-    adapter as adapter,
-    native as native,
-)
+from . import test_deepseek_v41_source_state_cpu as source_state
+from .test_deepseek_v41_source_state_cpu import _host_case, _metadata_case
+
+# Expose the same guarded fixtures without shadowing imported fixture names in
+# every test's parameter list (F811).
+adapter = source_state.adapter
+native = source_state.native
 
 
 def _declaration(args):
@@ -75,9 +76,11 @@ def _bf16_packed_config(runtime):
     attention.direct_sparse = True
     attention.direct_static_scales = True
     attention.direct_sparse_capacities = (128, 64)
+    assert not attention.direct_request_kv_scale
     cfg = attention._make_config()
     assert (cfg.qkv_dtype, cfg.tile_size_kv, cfg.kv_stages) == ("bf16", 64, 8)
-    assert cfg.sparse_direct
+    assert cfg.sparse_direct and cfg.sparse_static_scales
+    assert not cfg.sparse_request_kv_scale
     return cfg
 
 
@@ -201,6 +204,7 @@ def test_mxfp8_owned_shapes_bindings_and_changed_input_replay(mxfp8, compressed)
     args = _mxfp8_case(compressed=compressed)
     out, lse, plan = mxfp8.run(args)
     assert type(plan) is mxfp8.module._Plan
+    assert "main_scale" not in plan.__dataclass_fields__
     assert plan.signature == _declaration(args) and plan.split == 1
     assert out is plan.out and lse is plan.lse
     assert out.dtype == torch.bfloat16 and out.shape == args[0].shape
@@ -408,6 +412,50 @@ def test_native_primary_and_packed_extra_fp4_pool_bindings(native, native_fp4):
     assert plain.name == "native_fp4" and mixed.name == "packed_mxfp8"
 
 
+@pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.parametrize("mixed", (False, True))
+@pytest.mark.parametrize("explicit_none", (False, True))
+def test_bf16_task_graph_preserves_legacy_factory_without_runtime_kwargs(
+    native, monkeypatch, mixed, explicit_none
+):
+    from flashinfer.experimental.deepseek_v41 import (
+        prims_ts_mxfp8_resources as packed,
+        prims_ts_resources as fp4,
+    )
+
+    cfg = _bf16_packed_config(native)
+    cls = packed.PackedKvProducer if mixed else fp4.Fp4KvProducer
+    factory = cls.make_resource
+    calls = []
+
+    def make_resource(self, pools, **kwargs):
+        # Do not silently add runtime_args=None: old factories forward all
+        # keywords into resources that have no such dataclass field.
+        assert "runtime_args" not in kwargs
+        resource = factory(self, pools, **kwargs)
+        calls.append((pools, resource))
+        return resource
+
+    monkeypatch.setattr(cls, "make_resource", make_resource)
+    pools = (object(), object())
+    kwargs = {"kv_producer_runtime_args": None} if explicit_none else {}
+    manager, _ = native.kernel.build_throughput_latency_mla_task_manager(
+        cfg,
+        total_kv_tiles=cfg.total_kv_tiles,
+        use_page_offsets=True,
+        kv_producer=cls(native_fp4=True),
+        kv_producer_args=pools,
+        **kwargs,
+    )
+    assert manager.tasks and len(calls) == 1
+    actual_pools, resource = calls[0]
+    assert actual_pools is pools
+    assert resource.fp4_cache is pools[1 if mixed else 0]
+    assert not hasattr(resource, "main_scale")
+    if mixed:
+        assert resource.swa_cache is pools[0]
+
+
 def test_packed_pipeline_inherits_all_writer_async_signaling(native, monkeypatch):
     from flashinfer.experimental.deepseek_v41 import (
         prims_ts_mxfp8_resources as packed,
@@ -509,7 +557,7 @@ def test_native_and_mxfp8_jit_namespaces_and_source_keys_are_isolated(native):
                     for target in node.targets
                 )
             )
-        assert {ast.unparse(node) for node in files.elts} == {
+        expected_files = {
             "__file__",
             "prims_ts_resources.__file__",
             "hca_v41_primitives.__file__",
@@ -517,7 +565,9 @@ def test_native_and_mxfp8_jit_namespaces_and_source_keys_are_isolated(native):
             "*sorted(native_root.rglob('*.py'))",
         }
         if module is prims_ts:
+            expected_files.add("fp4_common.__file__")
             assert "mxfp8" not in ast.unparse(function)
+        assert {ast.unparse(node) for node in files.elts} == expected_files
 
     tree = ast.parse(inspect.getsource(prims_ts))
     assert not any(

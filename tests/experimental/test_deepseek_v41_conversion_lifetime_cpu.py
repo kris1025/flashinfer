@@ -107,3 +107,12 @@ def test_conversion_probe_registers_owner_before_launch(name):
     )
     assert ast.unparse(register.args[0]) == "compiled"
     assert compile_call.lineno < register.lineno < launch.lineno
+    # The request-scaled probe compiles preparation and staging together. Its
+    # nested production _prepare must not acquire an unregistered module owner.
+    assert (
+        sum(
+            isinstance(node, ast.Call) and ast.unparse(node.func) == "cute.compile"
+            for node in ast.walk(probe)
+        )
+        == 1
+    )

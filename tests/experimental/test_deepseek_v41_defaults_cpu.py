@@ -3,14 +3,17 @@
 """Benchmark/example contracts without importing Torch, CUDA, CuTe or FlashInfer.
 
 Run with --confcutdir=tests/experimental to exclude root CUDA collection probes.
-AST extraction executes only parser/fixture/gate helpers with stdlib mocks;
-these checks are not numerical or GPU qualification of the rewritten sources.
+AST extraction executes parser/fixture/gate helpers with stdlib mocks and checks
+request-scaled reference arithmetic with a small stdlib-only numerical tensor.
+These host contracts are not GPU/JIT or full decode numerical qualification.
 """
 
 import argparse
 import ast
 import builtins
+import math
 from pathlib import Path
+import struct
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call
 
@@ -63,6 +66,143 @@ def extract(path, name, **bindings):
         namespace,
     )
     return namespace[name]
+
+
+def float32(value):
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def e4m3_value(code):
+    exponent, mantissa = (code >> 3) & 15, code & 7
+    assert (code & 127) != 127
+    magnitude = (
+        mantissa * 2**-9 if exponent == 0 else (8 + mantissa) * 2 ** (exponent - 10)
+    )
+    return math.copysign(magnitude, -1 if code & 128 else 1)
+
+
+def e4m3_rn_satfinite(value):
+    # Independent finite code enumeration; the code's low bit implements RTNE.
+    code = min(
+        range(127),
+        key=lambda code: (abs(e4m3_value(code) - abs(value)), code & 1),
+    )
+    return math.copysign(e4m3_value(code), value)
+
+
+class RequestTensor:
+    """Only the benchmark normalization ops, with explicit FP32 materialization.
+
+    Each request has scalar samples shaped [B, K, 1]; no accelerator or array
+    library is needed to exercise amax, broadcast descales and staged rounding.
+    """
+
+    device = "host"
+
+    def __init__(self, rows, dtype="float64", staged=None):
+        self.rows = tuple(tuple(row) for row in rows)
+        assert self.rows and all(len(row) == len(self.rows[0]) for row in self.rows)
+        self.shape = (len(self.rows), len(self.rows[0]), 1)
+        self.dtype = dtype
+        self.staged = [] if staged is None else staged
+
+    def map(self, operation, dtype=None):
+        return RequestTensor(
+            [[operation(value) for value in row] for row in self.rows],
+            dtype or self.dtype,
+            self.staged,
+        )
+
+    def binary(self, other, operation, dtype=None):
+        if not isinstance(other, RequestTensor):
+            other = RequestTensor([[other] for _ in self.rows])
+        assert len(self.rows) == len(other.rows)
+        result = []
+        for left, right in zip(self.rows, other.rows, strict=True):
+            width = max(len(left), len(right)) if left and right else 0
+            assert not width or (len(left) in (1, width) and len(right) in (1, width))
+            result.append(
+                [
+                    operation(
+                        left[i if len(left) > 1 else 0],
+                        right[i if len(right) > 1 else 0],
+                    )
+                    for i in range(width)
+                ]
+            )
+        value = RequestTensor(result, dtype or self.dtype, self.staged)
+        return value.float() if value.dtype == "float32" else value
+
+    def float(self):
+        return self.map(float32, "float32")
+
+    def double(self):
+        return self.map(float, "float64")
+
+    def abs(self):
+        return self.map(abs)
+
+    def amax(self, *, dim, keepdim):
+        assert dim == (1, 2) and keepdim
+        return RequestTensor([[max(row)] for row in self.rows], self.dtype, self.staged)
+
+    def clamp(self, low, high):
+        return self.map(lambda value: min(max(value, low), high))
+
+    def to(self, dtype):
+        assert dtype == "float8_e4m3fn"
+        self.staged.append((self.dtype, self.rows))
+        return self.map(e4m3_rn_satfinite, dtype)
+
+    def __truediv__(self, other):
+        assert isinstance(other, RequestTensor)
+        assert self.dtype == other.dtype == "float32"
+        return self.binary(other, lambda left, right: left / right)
+
+    def __mul__(self, other):
+        return self.binary(other, lambda left, right: left * right)
+
+    def __gt__(self, other):
+        return self.binary(other, lambda left, right: left > right, "bool")
+
+
+def numeric_request_scaled_main(rows):
+    decoded = RequestTensor(rows)
+
+    def where(condition, candidate, fallback):
+        assert condition.shape == candidate.shape
+        return RequestTensor(
+            [
+                [
+                    value if keep else fallback
+                    for keep, value in zip(mask, row, strict=True)
+                ]
+                for mask, row in zip(condition.rows, candidate.rows, strict=True)
+            ],
+            candidate.dtype,
+            candidate.staged,
+        )
+
+    def zeros(shape, *, device, dtype):
+        assert shape == (len(rows), 1, 1) and device == "host" and dtype == "float32"
+        return RequestTensor([[0.0] for _ in rows], dtype, decoded.staged)
+
+    def full_like(tensor, value):
+        assert tensor.dtype == "float32" and tensor.shape == (len(rows), 1, 1)
+        assert value == 448.0
+        return tensor.map(lambda _: float32(value))
+
+    torch = SimpleNamespace(
+        float32="float32",
+        float8_e4m3fn="float8_e4m3fn",
+        where=where,
+        zeros=zeros,
+        full_like=full_like,
+    )
+    normalize = extract(_BENCHMARK, "request_scaled_main", torch=torch)
+    represented, scale = normalize(decoded)
+    assert len(decoded.staged) == 1
+    return represented, scale, decoded.staged[0]
 
 
 @pytest.mark.parametrize("backend", [None, "cute-dsl", "prims-ts"])
@@ -248,8 +388,7 @@ def test_native_oracle_uses_stored_values_and_only_selected_global_rows():
     ]
     assert gathered == [
         "pool.double().reshape(-1, 512)[safe]",
-        "selected(pool, safe[:, None], True, round_bf16=False)",
-        "gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()",
+        "selected_main_fp8(pool, safe, valid)",
     ]
     valid = next(
         node for node in assignments if ast.unparse(node.targets[0]) == "valid"
@@ -257,8 +396,8 @@ def test_native_oracle_uses_stored_values_and_only_selected_global_rows():
     assert ast.unparse(valid.value) == (
         "(index >= 0) & (index < pool.shape[0] * 64) & (index != 2147483647)"
     )
-    # Legacy decoding retains BF16 values. Native main decoding bypasses that
-    # rounding, then applies its own finite-clamped/RTNE unit-E4M3 conversion.
+    # Legacy decoding retains its original BF16 values. Native main uses its
+    # separate masked-byte gather and request-scaled reference below.
     decoder = definition(_BENCHMARK, "selected")
     assert [ast.literal_eval(value) for value in decoder.args.kw_defaults] == [True]
     result = next(node.value for node in decoder.body if isinstance(node, ast.Return))
@@ -280,26 +419,13 @@ def test_native_main_conversion_precedes_shared_qk_and_v_inputs():
         if isinstance(node, ast.If) and ast.unparse(node.test) == "not fp4"
     )
     assert [ast.unparse(node) for node in branch.orelse] == [
-        "gathered = selected(pool, safe[:, None], True, round_bf16=False)",
-        "gathered = gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()",
+        "gathered = selected_main_fp8(pool, safe, valid)",
     ]
-    represented = MagicMock(name="scaled_fp4")
-    dtype = object()
-    converted = eval(
-        compile(ast.Expression(branch.orelse[1].value), str(_BENCHMARK), "eval"),
-        {"gathered": represented, "torch": SimpleNamespace(float8_e4m3fn=dtype)},
-    )
-    assert represented.mock_calls == [
-        call.clamp(-448, 448),
-        call.clamp().to(dtype),
-        call.clamp().to().double(),
-    ]
-    assert (
-        converted is represented.clamp.return_value.to.return_value.double.return_value
-    )
     assert ast.unparse(loop.body[-2]) == (
         "values.append(torch.where(valid[..., None], gathered, 0))"
     )
+    # Duplicate and all-zero valid rows keep their attention multiplicity.
+    assert ast.unparse(loop.body[-1]) == "masks.append(valid)"
     inputs = {
         ast.unparse(node.targets[0]): ast.unparse(node.value)
         for node in oracle.body
@@ -311,8 +437,153 @@ def test_native_main_conversion_precedes_shared_qk_and_v_inputs():
     assert inputs["expected"] == "torch.einsum('bhk,bkd->bhd', weights, kv)"
     assert not any(
         isinstance(node, ast.Attribute) and node.attr == "bfloat16"
-        for node in ast.walk(oracle)
+        for function in (
+            oracle,
+            definition(_BENCHMARK, "selected_main_fp8"),
+            definition(_BENCHMARK, "request_scaled_main"),
+        )
+        for node in ast.walk(function)
     )
+
+
+def test_selected_main_masks_packed_payload_and_scales_before_decode():
+    pool, safe, valid, payload, raw_scale, masked_payload, masked_scale, data = (
+        MagicMock(name=name)
+        for name in (
+            "pool",
+            "safe",
+            "valid",
+            "payload",
+            "raw_scale",
+            "masked_payload",
+            "masked_scale",
+            "data",
+        )
+    )
+    pool.shape = (4, 64, 1, 288)
+    pages = pool.view.return_value
+    pages.__getitem__.side_effect = [payload, raw_scale]
+    torch = MagicMock(name="torch_stub")
+    torch.where.side_effect = [masked_payload, masked_scale]
+    torch.tensor.return_value.__getitem__.return_value = data
+    represented = object()
+    normalize = Mock(return_value=(represented, object()))
+    gather = extract(
+        _BENCHMARK, "selected_main_fp8", torch=torch, request_scaled_main=normalize
+    )
+    assert gather(pool, safe, valid) is represented
+    assert torch.where.call_args_list == [
+        call(valid[..., None], payload, 0),
+        call(valid[..., None], raw_scale, 0),
+    ]
+    # Invalid safe-row poison is zeroed as bytes, before any floating decode.
+    payload.__rshift__.assert_not_called()
+    raw_scale.contiguous.assert_not_called()
+    masked_payload.__rshift__.assert_called_once()
+    masked_scale.contiguous.return_value.view.assert_called_once_with(
+        torch.float8_e4m3fn
+    )
+    scale = masked_scale.contiguous.return_value.view.return_value.float.return_value
+    normalize.assert_called_once_with(data * scale)
+    pool.double.assert_not_called()
+    pool.view.assert_called_once_with(4, -1)
+    assert pages.__getitem__.call_count == 2
+    lut = torch.tensor.call_args.args[0]
+    assert lut == [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6]
+    assert math.copysign(1, lut[8]) == -1
+    assert torch.tensor.call_args.kwargs["dtype"] is torch.float32
+    assignments = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in definition(_BENCHMARK, "selected_main_fp8").body
+        if isinstance(node, ast.Assign)
+    }
+    assert assignments["(page, row)"] == "(safe // 64, safe % 64)"
+    gathers = [
+        ast.unparse(node.value)
+        for node in definition(_BENCHMARK, "selected_main_fp8").body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Subscript)
+        and ast.unparse(node.value.value) == "pages"
+    ]
+    assert gathers == [
+        "pages[page[..., None], row[..., None] * 256 + column // 2]",
+        "pages[page[..., None], 64 * 256 + row[..., None] * 32 + column // 16]",
+    ]
+    assert assignments["decoded"] == "data * scale"
+    assert assignments["(represented, _)"] == "request_scaled_main(decoded)"
+
+
+def test_request_scaled_main_uses_exact_payload_amax_not_max_group_times_six():
+    payloads = (0, 1, 1)
+    scales = tuple(e4m3_value(code) for code in (0x7E, 0x40, 0xC0))
+    decoded = [payload * scale for payload, scale in zip(payloads, scales, strict=True)]
+    assert decoded == [0.0, 2.0, -2.0]
+    represented, scale, staged = numeric_request_scaled_main([decoded])
+    expected_scale = float32(2 / 448)
+    assert scale.dtype == "float32" and scale.rows == ((expected_scale,),)
+    assert expected_scale != float32(max(map(abs, scales)) * 6 / 448)
+    assert represented.dtype == "float64"
+    assert represented.rows == ((0.0, 448 * expected_scale, -448 * expected_scale),)
+    assert staged == (
+        "float32",
+        ((0.0, float32(2 / expected_scale), float32(-2 / expected_scale)),),
+    )
+
+
+def test_request_scaled_main_materializes_float32_division_and_restores_range():
+    assignments = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in definition(_BENCHMARK, "request_scaled_main").body
+        if isinstance(node, ast.Assign)
+    }
+    assert assignments["divisor"] == "torch.full_like(amax, 448.0)"
+    assert assignments["scale"] == (
+        "torch.where(amax > 0, (amax / divisor).float(), 1)"
+    )
+    represented, scale, staged = numeric_request_scaled_main([[2688.0, 1.0, -1.0, 7.0]])
+    assert scale.rows == ((6.0,),)
+    assert represented.rows == ((2688.0, 1.03125, -1.03125, 6.75),)
+    assert staged == (
+        "float32",
+        ((448.0, float32(1 / 6), float32(-1 / 6), float32(7 / 6)),),
+    )
+    # This valid decoded FP4 value distinguishes division from reciprocal multiply;
+    # the recorded FP32 intermediate also rejects an FP64 quotient before FP8 cast.
+    assert staged[1][0][3] != 7 / 6
+    assert staged[1][0][3] != float32(7 * float32(1 / 6))
+
+
+@pytest.mark.parametrize("amax", [1.0, 2**-10, 224.0])
+def test_request_scaled_main_allows_descales_below_one(amax):
+    represented, scale, staged = numeric_request_scaled_main([[amax, -amax]])
+    expected_scale = float32(amax / 448)
+    assert 0 < expected_scale < 1 and scale.rows == ((expected_scale,),)
+    assert represented.rows == ((448 * expected_scale, -448 * expected_scale),)
+    assert staged[0] == "float32"
+
+
+@pytest.mark.parametrize("rows", [[[]], [[0.0, -0.0]]])
+def test_request_scaled_main_uses_one_for_empty_or_zero_requests(rows):
+    represented, scale, _ = numeric_request_scaled_main(rows)
+    assert scale.dtype == "float32" and scale.rows == ((1.0,),)
+    assert represented.rows == tuple(tuple(row) for row in rows)
+    if rows[0]:
+        assert math.copysign(1, represented.rows[0][1]) == -1
+
+
+def test_request_scaled_main_keeps_duplicate_and_all_zero_valid_samples():
+    represented, scale, _ = numeric_request_scaled_main([[0.0, 0.0], [7.0, 7.0]])
+    assert scale.rows == ((1.0,), (float32(7 / 448),))
+    assert represented.rows == ((0.0, 0.0), (7.0, 7.0))
+    assert represented.shape == (2, 2, 1)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(1.0625, 1.0), (1.1875, 1.25), (-1.0625, -1.0), (2**-10, 0.0), (2688, 448)],
+)
+def test_stdlib_e4m3_rn_satfinite_ties_subnormal_and_saturation(value, expected):
+    assert e4m3_rn_satfinite(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -434,6 +705,50 @@ def test_benchmark_threads_mode_to_fixture_gate_and_json():
     )
 
 
+def test_benchmark_times_full_public_replay_and_labels_request_scaled_preparation():
+    main = definition(_BENCHMARK, "main")
+    replay = next(
+        node.value
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "fns[backend]"
+    )
+    plan, out, lse = (object() for _ in range(3))
+    args = (object(),) * 6
+    decode = Mock(return_value=(out, lse, plan))
+    # The callable given to graph() invokes the whole API on every replay.
+    fn = eval(
+        compile(ast.Expression(replay), str(_BENCHMARK), "eval"),
+        {
+            "args": args,
+            "plans": {"prims-ts": plan},
+            "backend": "prims-ts",
+            "deepseek_v41_decode": decode,
+        },
+    )
+    assert fn() == (out, lse) and fn() == (out, lse)
+    assert decode.call_args_list == [call(*args, plan=plan, backend="prims-ts")] * 2
+    graphs = next(
+        node.value
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "graphs"
+    )
+    assert ast.unparse(graphs) == "{name: graph(fn) for name, fn in fns.items()}"
+    report = next(
+        node.value
+        for node in main.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "report"
+    )
+    metadata = {
+        ast.literal_eval(key): ast.literal_eval(value)
+        for key, value in zip(report.keys, report.values, strict=True)
+        if ast.literal_eval(key) in {"scope", "comparison"}
+    }
+    assert "selection/count/amax preparation" in metadata["scope"]
+    assert "selected-tile staging, both source passes and merge" in metadata["scope"]
+    assert "request_scaled E4M3" in metadata["comparison"]
+
+
 def test_legacy_metric_formulas_are_unchanged():
     branch = next(
         node
@@ -505,11 +820,23 @@ def test_arm_json_labels_representation_shape_and_accuracy(name, mode):
         )
         assert "original E4M3 Q, no BF16 query scratch" in metadata["arithmetic"]
         assert metadata["global_conversion"] == (
-            "selected scaled E2M1 -> unit E4M3 SMEM; RTNE + finite saturation "
-            "[-448,448], preserving signed zero/subnormals; lossy (finite products "
-            "reach +/-2688)"
+            "request_scaled: valid selected E2M1 * signed finite group16 E4M3; "
+            "one FP32 s[b]=RN(selected payload amax/448), 1 only for zero/empty; "
+            "RN_FP32(x/s) -> E4M3 RN/satfinite SMEM; represented double(staged)*double(s), "
+            "not unit-clipped (decoded finite range +/-2688); Q/SWA remain unit E4M3"
         )
-        assert "finite-clamped/RTNE unit E4M3" in contract["reference"]
+        assert metadata["global_precision"] == "request_scaled_e4m3"
+        assert metadata["main_scale"] == (
+            "FP32[B] scratch, refreshed per call; None in window-only plans"
+        )
+        assert metadata["compile_marker"] == (
+            "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3"
+        )
+        assert contract["reference"] == (
+            "independent FP64 over stored E4M3 Q/SWA and request_scaled main KV; "
+            "mask selected packed bytes before exact decode/amax, materialize FP32 "
+            "x/s before E4M3 RN/satfinite, then double(staged)*double(s)"
+        )
         assert "componentwise" in contract["output"]
         assert contract["lse"] == "sink-exclusive; rtol=0, atol=1e-5"
         assert "exact zero" in contract["empty"]
@@ -531,6 +858,9 @@ def test_arm_json_labels_representation_shape_and_accuracy(name, mode):
         }
         assert label[name] in metadata["arithmetic"]
         assert "componentwise_bound" not in contract
+        assert (
+            not {"global_precision", "main_scale", "compile_marker"} & metadata.keys()
+        )
 
 
 def source_bindings():
@@ -550,6 +880,7 @@ def test_native_source_hash_defaults_stay_native_only():
     assert "experimental/deepseek_v41/prims_ts.py" in sources
     assert "experimental/deepseek_v41/prims_ts_fp8.py" in sources
     assert "experimental/deepseek_v41/prims_ts_resources.py" in sources
+    assert "cute_dsl/fp4_common.py" in sources
     assert "attention/prims_ts/kernels/mla_decode/helpers/ops.py" in sources
     assert not any("mxfp8" in source for source in sources)
     assert extensions == (

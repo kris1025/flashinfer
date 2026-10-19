@@ -102,31 +102,76 @@ independent source passes.
 
 In ordinary-FP8 mode, SWA uses the native typed E4M3 TMA/QK/P/PV path; there
 are no BF16 SWA stages or dequantized KV buffers. Main/global storage remains
-packed E2M1 plus group16 E4M3 scales in width-288 page planes. Only selected main
-tiles apply their scales, then round to unit E4M3 with round-to-nearest-even and
-finite saturation to `[-448,448]`, preserving signed zero, subnormals and
-halfway-even behavior. This is lossy: finite scaled FP4 values can reach ±2688.
-The FP8 shared-memory tiles feed QK and PV in a separate BK128/E4M3 pass using
-the original FP8 Q, not BF16 attention. Neither mixed nor window-only native mode
-expands Q to BF16 or allocates BF16 query scratch or a full converted cache.
+packed E2M1 plus group16 E4M3 scales in width-288 page planes. Preparation computes
+one positive FP32 descale per request from the exact amax of its valid selected
+main values, after applying their group scales: `s = div.rn.f32(amax, 448)`, or 1
+for zero/empty selections. It reads actual payload, not `max(group_scale) * 6`,
+and excludes invalid/unselected slots. Scales below 1 are allowed. Only selected
+main tiles are normalized by `div.rn.f32(x, s)`, then rounded/saturated to E4M3,
+retaining signed zero, subnormals and halfway-even behavior. The FP8 shared-memory
+tiles feed QK and PV in a separate BK128/E4M3 pass using the original FP8 Q.
+The main-only private `sparse_request_kv_scale` opt-in retains static base factors
+and restores `ss[request]` in both the softmax and output factors. Its producer
+receives that same FP32 `[B]` tensor via optional `kv_producer_runtime_args`;
+ordinary static and dynamic scalar `[0]` paths are unchanged. Neither mixed nor
+window-only native mode expands Q to BF16 or allocates BF16 query scratch or a
+full converted cache. Computing amax adds a selected-main read; performance is
+unmeasured.
 A narrow internal `source_state_store` hook publishes normalized FP32 O before
 native BF16 packing, with sink-free log2 LSE. It permits only
 nonfinalizing, direct-index, sink-free 1CTA Keep/M64/D512/no-RoPE/Sq1/V1,
 split-1/nonpersistent configurations and is mutually exclusive with output
 quantization. It does not add a public `out_dtype="fp32"` mode. The existing
-P448 compensation is retained; source O must not receive another 448 factor.
-`MergeMlaSourceStates` merges the FP32 states, applies the sink once and rounds
-only final O to BF16, returning FP32 natural-log KV LSE. Window-only additionally
-omits global source states; unused compiled slots alias the live source.
+P448 compensation is retained; source O must not receive another 448 factor or
+another main descale. `MergeMlaSourceStates` merges the FP32 states, applies the
+sink once and rounds only final O to BF16, returning FP32 natural-log KV LSE.
+Mixed mode owns FP32 `[B]` main-scale scratch, refreshed on every call/replay even
+for zero/empty selections. Window-only omits global source states, main-scale
+storage and amax work; unused compiled slots alias existing buffers without being
+read or written as main scales.
 
-The independent native FP64 reference applies the main E4M3 clamp/round before
-both logits and V. Main-only, mixed and window-only use the unchanged per-component
-FP8 probability-rounding bound, strict `atol=1e-5, rtol=0` sink-exclusive LSE and
+The independent native reference gathers/masks before decoding main values,
+materializes FP32 amax/448 and FP32 x/s, then reconstructs FP64
+`E4M3(x/s) * s` before both logits and V. Main-only, mixed and window-only use the
+unchanged per-component FP8 probability-rounding bound, strict `atol=1e-5, rtol=0` sink-exclusive LSE and
 exact empty gates, not BF16 main-only gates. The joint KV maximum bounds each
 source's local maximum, so the existing summed underflow term covers both FP8
 source passes. Frost and optional BF16-Q/MXFP8 values/references/gates are unchanged.
 
-Current FP8-main CPU/static acceptance (2026-10-16) passed **321/321** cases:
+Request-scaled GPU validation (2026-10-18) passed on one allocated B200 / 148 SMs
+in `umb-b200-237` (job `5103699`, DSL 4.8.0 / bundled compiler 13.4): isolated
+capture **1/1**, smoke **32/32**, full **271/271** (157 decode / 48 cache / 66 native
+sparse MLA) and independent selected dense **57/57**, with no failures, errors or
+skips. Both real-stage conversion branches, distinct request scales, FP32 division
+and K/V restoration witnesses, zero/empty transitions, all-width changed-data
+graph replay and writer/decode integration passed. All phase exits were 0 and
+Slurm root/batch/extern completed with `0:0`. The independent report has
+`default_gpu_qualification=true`, with exact ordered JUnit identities, complete
+setup/call/teardown and all 6568 fingerprints/Git/visibility matching before
+validation-note edits. Numerical gates and default GC/capture settings were
+unchanged. The root allocation used 1h36m07s (5767 GPU-seconds) of the fresh
+assistant-imposed three-GPU-hour cap. This qualifies only the tested request-scaled
+B200/4.8/13.4 snapshot and selected dense subset, not the entire dense suite, other
+hardware/toolchains or checkpoint/full-model behavior. Examples and benchmarks
+have not run; no performance claim is made. See the example README for evidence.
+
+Separate CPU/static acceptance (2026-10-18) passed **413/413** cases: 219 native source-state/
+resource/adapter/oracle, 41 optional-MXFP8, 7 conversion-lifetime, 100 benchmark/
+example-default, 40 native host and 6 unknown-backend contracts. The fresh
+`-I -B -S` Python 3.12.3 / Torch 2.11.0+cu128 process used the existing DSL 4.8.0
+overlay / bundled compiler metadata 13.4, static `sm_100`, thread caps and disabled
+plugin autoload/JIT. Pytest/strict exits were 0, with no failures/errors/skips or
+intercepted calls and uninitialized Torch CUDA. Independent postflight matched
+exact ordered JUnit identities, complete setup/call/teardown reports, all 158
+fingerprints, Git state and visibility before validation-note edits. The exact
+tested patch is preserved; 28 static compatibility/arithmetic-witness checks and
+focused Ruff/syntax/whitespace checks also passed. These qualify host/static
+contracts, not CuTe lowering or GPU numerics; see the example README for evidence.
+
+The following historical CPU/GPU records qualify the earlier unit-scale FP8-main
+snapshot only, not the new amax, normalization or scale restoration.
+
+Historical unit-scale FP8-main CPU/static acceptance (2026-10-16) passed **321/321** cases:
 146 native source-state/resource/adapter/oracle, 37 optional-MXFP8, 7 conversion
 lifetime, 85 benchmark/example defaults, 40 native host and 6 unknown-backend
 contracts. The fresh `-I -B -S` Python 3.12.3 / Torch 2.11.0+cu128 process used the
@@ -139,7 +184,7 @@ CUDA visibility matched independent postflight, before validation-note edits.
 These are guarded host/static contracts, not GPU/JIT qualification; see the example
 README for records and runnable allocated-GPU commands.
 
-Current FP8-main GPU validation (2026-10-16) passed on one allocated B200 / 148 SMs
+Historical unit-scale FP8-main GPU validation (2026-10-16) passed on one allocated B200 / 148 SMs
 in `umb-b200-263` (job `5049128`, DSL 4.8.0 / bundled compiler 13.4): isolated
 capture **1/1**, smoke **27/27**, full **271/271** (157 decode / 48 cache / 66 native
 sparse MLA) and independent selected dense **57/57**, with no failures, errors or
@@ -150,15 +195,15 @@ teardown reports, all 5871 frozen fingerprints, Git state and scheduler visibili
 before validation-note edits; numerical gates and default GC/capture settings
 were unchanged. Every phase exited 0 and Slurm root/batch/extern completed `0:0`.
 The allocation used 1h36m04s of the three-GPU-hour budget. This qualifies only the
-tested B200/4.8/13.4 snapshot and selected dense subset, not other hardware/
-toolchains, the entire dense suite or checkpoint/full-model behavior. Examples
+tested B200/4.8/13.4 unit-scale snapshot and selected dense subset, not request
+scaling, other hardware/toolchains, the entire dense suite or checkpoint/full-model behavior. Examples
 and benchmarks have not run; no performance claim is made. See the example README
 for the independent report and terminal evidence.
 
 The remaining validation records below describe pre-FP8-main source snapshots,
 including the original pre-reorganization GPU runs. The historical 257-case GPU
 and later 299-case CPU acceptances do not qualify current main conversion/staging/
-attention; the separate current GPU run above does.
+attention; the unit-scale GPU run above also predates request scaling.
 
 Post-conversion-lifetime-repair default validation passed on one allocated B200
 in `umb-b200-260` (job `5008381`, DSL 4.8.0 / bundled CUDA 13.4): **257/257** full

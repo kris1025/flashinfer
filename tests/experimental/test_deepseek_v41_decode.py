@@ -620,6 +620,7 @@ def test_fp4_fp8_all_finite_codes(native_fp4, conversion_kernels):
     import cutlass.utils as utils
     from cutlass.cute.runtime import from_dlpack
     from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+    from flashinfer.experimental.deepseek_v41.prims_ts_fp8 import Fp8SwaDecodeKernel
     from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
         Fp4Fp8SmemKvResource,
     )
@@ -630,31 +631,43 @@ def test_fp4_fp8_all_finite_codes(native_fp4, conversion_kernels):
     ):
         pytest.skip("native BF16-register conversion requires bundled CUDA >= 13.2")
 
-    _, main = _make_fp8_sources(512, 1, native_fp4)
+    swa, main = _make_fp8_sources(512, 1, native_fp4)
+    prepare = Fp8SwaDecodeKernel(swa, main, 512)
     cfg = main._make_config()
     assert cfg.qkv_dtype == "e4m3" and cfg.tile_size_kv == 128
     assert cfg.head_dim_per_stage_kv == 128 and cfg.kv_stages == 8
+    assert cfg.sparse_request_kv_scale
     # The standalone CTA contains just the production four-warp load group.
     # Change its warp origin, not the tile shape, dtype or stage/store layout.
-    resource = main.kv_producer.make_resource(
-        (None,), name="fp4_fp8_probe", cfg=dataclasses.replace(cfg, load_warp_idx=0)
-    )
-    assert type(resource) is Fp4Fp8SmemKvResource
+    probe_cfg = dataclasses.replace(cfg, load_warp_idx=0)
     stage_bytes = 128 * 128
 
     @cute.kernel
     def convert(
-        pool: cute.Tensor, selected: cute.Tensor, out: cute.Tensor, guards: cute.Tensor
+        pool: cute.Tensor,
+        selected: cute.Tensor,
+        main_scale: cute.Tensor,
+        out: cute.Tensor,
+        guards: cute.Tensor,
     ):
         tid = cute.arch.thread_idx()[0]
-        tile = cute.arch.block_idx()[0]
+        request, tile = cute.arch.block_idx()[0], cute.arch.block_idx()[1]
         lane, warp = tid % 32, tid // 32
+        resource = main.kv_producer.make_resource(
+            (pool,),
+            runtime_args=(main_scale,),
+            name="fp4_fp8_probe",
+            cfg=probe_cfg,
+            batch_idx=request,
+        )
+        assert type(resource) is Fp4Fp8SmemKvResource
         storage = utils.SmemAllocator().allocate(8 * stage_bytes + 256, 128)
         smem = cute.make_tensor(
             cute.recast_ptr(storage, dtype=cutlass.Uint8),
             cute.make_layout((8 * stage_bytes + 256,)),
         )
-        # Production stages are cutlass.Array subviews, not bare CuTe pointers.
+        # Keep the flat rank-one tuple layout required by make_array_view.
+        # Production stages are native Array subviews, not bare CuTe pointers.
         staging = cutlass.make_array_view(smem)
         smem[tid] = cutlass.Uint8(0x5A)
         smem[128 + 8 * stage_bytes + tid] = cutlass.Uint8(0xA5)
@@ -669,11 +682,12 @@ def test_fp4_fp8_all_finite_codes(native_fp4, conversion_kernels):
                 )
                 if lane < 8:
                     cached[page_slot * cfg.sparse_cache_words + entry] = selected[
-                        tile * 256 + page_slot * 128 + warp * 32 + lane * 4 + entry
+                        request,
+                        tile * 256 + page_slot * 128 + warp * 32 + lane * 4 + entry,
                     ]
             for stage_idx in cutlass.range_constexpr(4):
-                # Exercise the inherited page-plane loader and real FP8 stores,
-                # including both cached-page slots and all eight retained stages.
+                # Inherited page-plane loads and real scaled FP8 stores cover
+                # both cached-page slots and all eight retained stages.
                 resource._load_fp4_stage(
                     pool,
                     staging.subview(128 + (page_slot * 4 + stage_idx) * stage_bytes),
@@ -689,21 +703,58 @@ def test_fp4_fp8_all_finite_codes(native_fp4, conversion_kernels):
                     # Independently read the native E4M3 SW128 byte layout,
                     # rather than reusing the producer's store/swizzle helper.
                     swizzled = (row * 128 + tid) ^ ((row & 7) * 16)
-                    out[tile * 256 + page_slot * 128 + row, stage_idx * 128 + tid] = (
-                        smem[128 + (page_slot * 4 + stage_idx) * stage_bytes + swizzled]
-                    )
-        guards[tile, tid] = smem[tid]
-        guards[tile, 128 + tid] = smem[128 + 8 * stage_bytes + tid]
+                    out[
+                        request,
+                        tile * 256 + page_slot * 128 + row,
+                        stage_idx * 128 + tid,
+                    ] = smem[128 + (page_slot * 4 + stage_idx) * stage_bytes + swizzled]
+        guards[request, tile, tid] = smem[tid]
+        guards[request, tile, 128 + tid] = smem[128 + 8 * stage_bytes + tid]
 
     @cute.jit
-    def launch(pool, selected, out, guards, stream: cuda.CUstream):
-        convert(pool, selected, out, guards).launch(
-            grid=(selected.shape[0] // 256, 1, 1), block=(128, 1, 1), stream=stream
+    def launch(
+        pool,
+        swa_indices,
+        global_indices,
+        selected_swa,
+        selected_global,
+        swa_lengths,
+        global_lengths,
+        empty_lengths,
+        swa_counts,
+        global_counts,
+        main_scale,
+        out,
+        guards,
+        stream: cuda.CUstream,
+    ):
+        # Use the actual 128-thread/request production prep, not a precomputed
+        # host scale: its gathered amax must feed this exact resource argument.
+        prepare._prepare(
+            swa_indices,
+            global_indices,
+            selected_swa,
+            selected_global,
+            swa_lengths,
+            global_lengths,
+            empty_lengths,
+            swa_counts,
+            global_counts,
+            pool,
+            main_scale,
+            cutlass.Int64(0),
+            cutlass.Int64(cute.size(pool)) // 288,
+        ).launch(grid=(global_indices.shape[0], 1, 1), block=(128, 1, 1), stream=stream)
+        convert(pool, selected_global, main_scale, out, guards).launch(
+            grid=(global_indices.shape[0], global_indices.shape[1] // 256, 1),
+            block=(128, 1, 1),
+            stream=stream,
         )
 
-    rows = torch.arange(512, device="cuda", dtype=torch.int64)[:, None]
+    rows = torch.arange(768, device="cuda", dtype=torch.int64)[:, None]
     dims = torch.arange(512, device="cuda", dtype=torch.int64)[None, :]
-    # Each group contains every E2M1 code, with changing adjacent-code order.
+    # The first request selects all 16 * 254 finite code/scale pairs, with
+    # changing adjacent-code order, finite signed scales and both signed zeros.
     codes = ((dims & 15) * (2 * (rows % 8) + 1) + rows * 7 + (dims // 16) * 3) & 15
     payload = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
     finite_scales = torch.tensor(
@@ -713,46 +764,89 @@ def test_fp4_fp8_all_finite_codes(native_fp4, conversion_kernels):
     )
     groups = torch.arange(32, device="cuda", dtype=torch.int64)[None, :]
     scales = finite_scales[(rows * 17 + groups * 29) % finite_scales.numel()]
-    assert (scales[:, :-1] != scales[:, 1:]).all()
+    assert (scales[:512, :-1] != scales[:512, 1:]).all()
     coverage = torch.bincount(
-        (scales.long().repeat_interleave(16, -1) * 16 + codes).flatten(),
+        (scales[:512].long().repeat_interleave(16, -1) * 16 + codes[:512]).flatten(),
         minlength=256 * 16,
     ).view(256, 16)
     assert (coverage[finite_scales.long()] > 0).all()
+    # A disjoint request has max 6 * 112, hence s=1.5 rather than s=6.
+    # Accidentally binding batch zero's scale cannot pass its byte gate.
+    scales[512:].fill_(0x6E)
     pool = pack(payload, scales, 288)
     permutation = (torch.arange(512, device="cuda", dtype=torch.int32) * 197 + 63) % 512
+    second = (
+        torch.arange(256, device="cuda", dtype=torch.int32) * 197 + 63
+    ) % 256 + 512
     boundaries = torch.tensor(
-        [0, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 511, -1, 0x7FFFFFFF, 512, -17],
+        [
+            512,
+            519,
+            520,
+            527,
+            528,
+            543,
+            544,
+            575,
+            576,
+            639,
+            640,
+            767,
+            -1,
+            0x7FFFFFFF,
+            768,
+            -17,
+        ],
         device="cuda",
         dtype=torch.int32,
     ).repeat(16)
-    selected = torch.cat((permutation, boundaries))
-    out = torch.full((selected.numel(), 512), 255, device="cuda", dtype=torch.uint8)
-    guards = torch.empty(
-        (selected.numel() // 256, 256), device="cuda", dtype=torch.uint8
+    wi = torch.full((2, 128), -1, device="cuda", dtype=torch.int32)
+    ci = torch.stack((permutation, torch.cat((second, boundaries))))
+    selected_swa = torch.full_like(wi, 0x7FFFFFFF)
+    selected_global = torch.full_like(ci, 0x7FFFFFFF)
+    swa_lengths, global_lengths, empty_lengths, swa_counts, global_counts = (
+        torch.full((2,), 0x7FFFFFFF, device="cuda", dtype=torch.int32) for _ in range(5)
     )
-    tensors = [from_dlpack(x) for x in (pool.view(-1), selected, out, guards)]
+    main_scale = torch.full((2,), math.nan, device="cuda", dtype=torch.float32)
+    out = torch.full((2, 512, 512), 255, device="cuda", dtype=torch.uint8)
+    guards = torch.empty((2, 2, 256), device="cuda", dtype=torch.uint8)
+    tensors = [
+        from_dlpack(x)
+        for x in (
+            pool.view(-1),
+            wi,
+            ci,
+            selected_swa,
+            selected_global,
+            swa_lengths,
+            global_lengths,
+            empty_lengths,
+            swa_counts,
+            global_counts,
+            main_scale,
+            out,
+            guards,
+        )
+    ]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(launch, *tensors, stream)
     conversion_kernels.append(compiled)
     compiled(*tensors, stream)
 
-    # Do not use unpack()/the attention LUT here: code 8 is negative zero.
-    lut = torch.tensor(
-        [0.0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        device="cuda",
-        dtype=torch.float64,
+    staged, expected_scale, valid = fp8_main_reference(pool, ci[:, None])
+    torch.testing.assert_close(
+        expected_scale, torch.tensor([6.0, 1.5], device="cuda"), rtol=0, atol=0
     )
-    products = lut[codes] * scales.view(torch.float8_e4m3fn).double().repeat_interleave(
-        16, -1
-    )
-    encoded = products.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
-    assert (encoded == 0x80).any() and (products.abs() > 448).any()
-    assert (products.abs() == 2**-10).any()
-    valid = (selected >= 0) & (selected < 512)
-    expected = torch.where(valid[:, None], encoded[selected.clamp(0, 511).long()], 0)
-    assert torch.equal(out, expected)
-    assert (guards[:, :128] == 0x5A).all() and (guards[:, 128:] == 0xA5).all()
+    torch.testing.assert_close(main_scale, expected_scale, rtol=0, atol=0)
+    assert main_scale.dtype == torch.float32 and main_scale.shape == (2,)
+    assert (staged.view(torch.uint8) == 0x80).any()
+    assert torch.equal(out, staged.view(torch.uint8))
+    assert torch.equal(selected_global, torch.where(valid, ci, -1))
+    assert (selected_swa == -1).all() and (swa_counts == 0).all()
+    torch.testing.assert_close(global_counts, valid.sum(-1).int(), rtol=0, atol=0)
+    assert (swa_lengths == 128).all() and (global_lengths == 512).all()
+    assert (empty_lengths == 0).all()
+    assert (guards[..., :128] == 0x5A).all() and (guards[..., 128:] == 0xA5).all()
 
 
 @pytest.mark.parametrize("backend", ["cute-dsl", "prims-ts"])
@@ -984,47 +1078,73 @@ def test_finite_sink_overflow_changed_graph(batch, compressed_k, backend):
         )
 
 
-def make_fp8_case(batch, compressed):
-    q, _, main, wi, ci, sink = make_case(batch, compressed, seed=9175)
+def make_fp8_case(batch, compressed, seed=9175):
+    q, _, main, wi, ci, sink = make_case(batch, compressed, seed=seed)
     q = (q.float() * 0.5).to(torch.float8_e4m3fn)
     swa = (torch.randn(8, 64, 1, 512, device=q.device) * 0.5).to(torch.float8_e4m3fn)
     return q, swa, main, wi, ci, sink
 
 
+def fp8_main_reference(pool, ids):
+    """Independently gather selected bytes, decode exactly in FP32 and stage FP8.
+
+    Mask invalid payload/scale bytes before interpreting E4M3 scales, so empty
+    requests never decode clamped uninitialized/NaN rows. Every finite E2M1 *
+    E4M3 product is exact in FP32. Only these selected products enter amax;
+    neither six times a scale maximum nor any unselected row contributes.
+    """
+    pages = pool.view(pool.shape[0], -1)
+    # Split each page plane without flattening across page gaps (which could
+    # copy the whole pool). Only the following page/token gathers read bytes.
+    payload = pages[:, : 64 * 256].view(pool.shape[0], 64, 256)
+    scale_bytes = pages[:, 64 * 256 :].view(pool.shape[0], 64, 32)
+    index = ids[:, 0].long()
+    capacity = pool.shape[0] * 64
+    valid = (index >= 0) & (index < capacity) & (index != 0x7FFFFFFF)
+    selected = index.clamp(0, capacity - 1)
+    page, token = selected // 64, selected % 64
+    payload = torch.where(valid[..., None], payload[page, token], 0)
+    scale_bytes = torch.where(
+        valid[..., None], scale_bytes[page, token], 0
+    ).contiguous()
+    codes = torch.stack((payload & 15, payload >> 4), dim=-1).reshape(*index.shape, 512)
+    lut = torch.tensor(
+        [0.0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device=pool.device,
+        dtype=torch.float32,
+    )
+    scales = scale_bytes.view(torch.float8_e4m3fn).float()
+    decoded = lut[codes.long()] * scales.repeat_interleave(16, -1)
+    amax = decoded.abs().amax((1, 2))
+    main_scale = torch.where(
+        amax > 0, amax / torch.full_like(amax, 448.0), torch.ones_like(amax)
+    )
+    # Both divisions have FP32 tensor operands. A FP64 quotient followed by
+    # an FP32 cast, or a rounded reciprocal multiply, is a different contract.
+    normalized = decoded / main_scale[:, None, None]
+    staged = normalized.clamp(-448, 448).to(torch.float8_e4m3fn)
+    return staged, main_scale, valid
+
+
 def fp8_oracle(q, swa, global_cache, wi, ci, sink):
     """FP64 attention and the native componentwise FP8 rounding bound.
 
-    Use stored E4M3 Q/SWA and independently decode E2M1 times group16 E4M3
-    scales, then RTNE/saturate main KV to unit E4M3 before both QK and PV.
-    Neither the adapter nor its source states enter the oracle.
+    Stored E4M3 Q/SWA remain unchanged. Main uses independent selected-value
+    amax, FP32 division and FP8 RTNE/satfinite; restore double(staged) *
+    double(request descale) in both QK and V. No adapter/source states enter.
     """
     values, masks = [], []
     for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
         if pool is None:
             continue
-        if not fp4:
-            decoded = pool.double().reshape(-1, 512)
+        if fp4:
+            staged, main_scale, valid = fp8_main_reference(pool, ids)
+            gathered = staged.double() * main_scale.double()[:, None, None]
         else:
-            pages = pool.view(pool.shape[0], -1)
-            payload = pages[:, : 64 * 256].reshape(-1, 256)
-            codes = torch.stack((payload & 15, payload >> 4), dim=-1).reshape(-1, 512)
-            lut = torch.tensor(
-                [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
-                device=q.device,
-                dtype=torch.float64,
-            )
-            scales = (
-                pages[:, 64 * 256 :]
-                .contiguous()
-                .view(torch.float8_e4m3fn)
-                .reshape(-1, 32)
-                .double()
-            )
-            decoded = lut[codes.long()] * scales.repeat_interleave(16, -1)
-            decoded = decoded.clamp(-448, 448).to(torch.float8_e4m3fn).double()
-        index = ids[:, 0].long()
-        valid = (index >= 0) & (index < decoded.shape[0]) & (index != 0x7FFFFFFF)
-        gathered = decoded[index.clamp(0, decoded.shape[0] - 1)]
+            decoded = pool.double().reshape(-1, 512)
+            index = ids[:, 0].long()
+            valid = (index >= 0) & (index < decoded.shape[0]) & (index != 0x7FFFFFFF)
+            gathered = decoded[index.clamp(0, decoded.shape[0] - 1)]
         values.append(torch.where(valid[..., None], gathered, 0))
         masks.append(valid)
     kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
@@ -1096,8 +1216,14 @@ def test_fp8_swa_fp64_and_selection_counts(batch, compressed):
         torch.testing.assert_close(plan.global_counts, expected_global, rtol=0, atol=0)
         assert (plan.global_lengths == compressed).all()
         assert plan.part_c.dtype == torch.float32 and plan.lse_c.dtype == torch.float32
+        assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (
+            batch,
+        )
+        _, expected_scale, _ = fp8_main_reference(main, ci)
+        torch.testing.assert_close(plan.main_scale, expected_scale, rtol=0, atol=0)
+        assert (plan.main_scale > 0).all()
     else:
-        assert plan.part_c is None and plan.lse_c is None
+        assert plan.part_c is None and plan.lse_c is None and plan.main_scale is None
         assert (plan.global_counts == 0).all() and (plan.global_lengths == 0).all()
         window_out, window_lse, _ = deepseek_v41_window_decode(
             q, swa, wi, sink, plan=plan, backend="prims-ts"
@@ -1134,9 +1260,13 @@ def test_fp8_swa_changed_graph(compressed):
         sink.normal_()
         sink[0], sink[1], sink[2] = 1000, -1000, -math.inf
         if step == 1:
-            replacement = make_fp8_case(4, compressed)
+            replacement = make_fp8_case(4, compressed, seed=9176)
+            assert not torch.equal(
+                swa.view(torch.uint8), replacement[1].view(torch.uint8)
+            )
             swa.copy_(replacement[1])
             if compressed:
+                assert not torch.equal(main, replacement[2])
                 main.copy_(replacement[2])
         if step == 2:
             wi[0].fill_(-1)
@@ -1144,7 +1274,13 @@ def test_fp8_swa_changed_graph(compressed):
             if compressed:
                 ci[0].fill_(-1)
                 ci[2].fill_(-1)
-        for state in (plan.part_s, plan.part_c, plan.lse_s, plan.lse_c):
+        for state in (
+            plan.part_s,
+            plan.part_c,
+            plan.lse_s,
+            plan.lse_c,
+            plan.main_scale,
+        ):
             if state is not None:
                 state.fill_(math.nan)
         for metadata in (
@@ -1172,7 +1308,10 @@ def test_fp8_swa_changed_graph(compressed):
                 plan.global_counts, expected_global, rtol=0, atol=0
             )
             assert (plan.global_lengths == compressed).all()
+            _, expected_scale, _ = fp8_main_reference(main, ci)
+            torch.testing.assert_close(plan.main_scale, expected_scale, rtol=0, atol=0)
         else:
+            assert plan.main_scale is None
             assert (plan.global_counts == 0).all() and (plan.global_lengths == 0).all()
     # Eager calls may change addresses but retain the declaration and ownership.
     replacement_args = tuple(None if x is None else x.clone() for x in args)
@@ -1190,6 +1329,13 @@ def test_fp8_swa_changed_graph(compressed):
     aliased_q = plan.part_s.view(torch.float8_e4m3fn).flatten()[: q.numel()].view_as(q)
     with pytest.raises(ValueError, match="overlap"):
         deepseek_v41_decode(aliased_q, *args[1:], plan=plan, backend="prims-ts")
+    if compressed:
+        with pytest.raises(ValueError, match="overlap"):
+            deepseek_v41_decode(
+                *args,
+                plan=dataclasses.replace(plan, main_scale=sink[: q.shape[0]]),
+                backend="prims-ts",
+            )
 
 
 @pytest.mark.parametrize("source", ["swa", "global"])
@@ -1262,7 +1408,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     )
     check_fp8(out, lse, fp8_oracle(*args))
     assert not hasattr(plan, "expanded_q")
-    assert len(launches) == 1 and len(launches[0]) == 19
+    assert len(launches) == 1 and len(launches[0]) == 20
     assert launches[0][0].data_ptr() == args[0].data_ptr()
     assert launches[0][0].dtype == launches[0][1].dtype == torch.float8_e4m3fn
     assert launches[0][1].data_ptr() == args[1].data_ptr()
@@ -1277,6 +1423,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     assert cfg.sparse_reuse_kv and cfg.sparse_direct and not cfg.fuse_sparse_epilogue
     assert cfg.use_persistent_scheduler == 0 and cfg.num_ctas_per_seq_kv == 1
     assert swa.kv_producer is None and swa.source_state_store is not None
+    assert not cfg.sparse_request_kv_scale and cfg.sparse_static_scales
     assert (
         swa.source_state_store.compile_signature()[0]
         == "dsv41_fp32_normalized_source_v1"
@@ -1294,8 +1441,11 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
         )
 
         assert type(main.kv_producer) is Fp4Fp8KvProducer
+        assert cfg.sparse_request_kv_scale and cfg.sparse_static_scales
+        assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (1,)
+        assert launches[0][12].data_ptr() == plan.main_scale.data_ptr()
         assert main.kv_producer.compile_signature() == (
-            "dsv41_page64_fp4_group16_to_e4m3",
+            "dsv41_page64_fp4_group16_to_request_scaled_e4m3",
             main.kv_producer.native_fp4,
         )
         assert main.source_state_store is not None
@@ -1304,11 +1454,11 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
             0,
         )
     else:
-        assert main is None
+        assert main is None and plan.main_scale is None
 
 
 @pytest.mark.parametrize("native_fp4", [False, True])
-def test_fp8_main_rounding_saturation_underflow_changed_graph(native_fp4):
+def test_fp8_main_scale_rounding_underflow_changed_graph(native_fp4):
     gate("prims-ts")
     import cutlass
     from flashinfer.experimental.deepseek_v41.prims_ts import _compile
@@ -1319,53 +1469,106 @@ def test_fp8_main_rounding_saturation_underflow_changed_graph(native_fp4):
     ):
         pytest.skip("native BF16-register conversion requires bundled CUDA >= 13.2")
 
-    q, swa, _, wi, ci, sink = make_fp8_case(1, 192)
+    q, swa, _, wi, ci, sink = make_fp8_case(2, 192)
     wi.fill_(-1)
     swa.view(torch.uint8).fill_(127)  # An empty SWA must not read poisoned data.
     sink.fill_(-math.inf)
-    data = torch.empty((128, 256), device=q.device, dtype=torch.uint8)
-    scales = torch.empty((128, 32), device=q.device, dtype=torch.uint8)
-    main = torch.empty((2, 64, 1, 288), device=q.device, dtype=torch.uint8)
+    # Requests select disjoint 256-row regions. A ninth, unselected page carries
+    # NaNs and the largest finite product, neither of which may influence s[b].
+    data = torch.empty((576, 256), device=q.device, dtype=torch.uint8)
+    scales = torch.empty((576, 32), device=q.device, dtype=torch.uint8)
+    main = torch.empty((9, 64, 1, 288), device=q.device, dtype=torch.uint8)
     query = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
     args = q, swa, main, wi, ci, sink
 
-    def update(code, scale_code, query_level, count):
-        data.fill_(code | (code << 4))
-        negative = code ^ 8
-        data[:, 8:16].fill_(negative | (negative << 4))
-        data[:, 16:24].fill_(0x22)  # An exact-one V group remains nonempty.
-        scales.fill_(scale_code)
-        scales[:, 2].fill_(0x38)
+    # (name, ordinary code, ordinary scales / last-group maximum codes and
+    #  scales per request, exact expected FP32 descales, live counts). No live
+    # magnitude-six code is present in the division or request-one s=1/4 cases.
+    cases = [
+        ("scale6", 2, (0x38, 0x38), (7, 2), (0x7E, 0x6E), (6.0, 0.25), (64, 127)),
+        (
+            "fp32-div",
+            3,
+            (0x41, 0x45),
+            (2, 2),
+            (0x51, 0x55),
+            (9 / 448, 13 / 448),
+            (127, 64),
+        ),
+        ("underflow", 1, (0x01, 0x01), (7, 2), (0x7E, 0x6E), (6.0, 0.25), (129, 129)),
+        ("zero", 0, (0xFE, 0xFE), (0, 0), (0xFE, 0xFE), (1.0, 1.0), (127, 0)),
+        ("empty", 0, (0xFE, 0xFE), (0, 0), (0xFE, 0xFE), (1.0, 1.0), (0, 0)),
+    ]
+
+    def update(case, step):
+        name, code, scale_codes, max_codes, max_scales, _, counts = case
+        data.fill_(0x77)
+        scales.fill_(0x7F)
+        scales[-1].fill_(0x7E)  # Unselected finite max = 6 * 448.
+        ci.copy_(
+            torch.tensor(
+                [-1, 0x7FFFFFFF, 576, -17], device=q.device, dtype=torch.int32
+            ).repeat(2, 1, 48)
+        )
+        for request, count in enumerate(counts):
+            if not count:
+                continue
+            rows = (
+                torch.arange(count, device=q.device, dtype=torch.int32) * 197
+                + 63
+                + step * 11
+            ) % 256 + request * 256
+            if step % 2:
+                rows = rows.flip(0)
+            rows[3] = rows[2]  # Duplicates count as separate selected positions.
+            ci[request, 0, :count] = rows
+            data[rows] = 0
+            scales[rows] = 0x38
+            scale_code = scale_codes[request]
+            if name == "zero":
+                # Valid all-zero data differs from an empty source, even with
+                # negative/large group scales and mixed signs of payload zero.
+                data[rows] = 0x80
+                scales[rows] = scale_code
+            else:
+                data[rows, :16] = code | (code << 4)
+                scales[rows, 0] = scale_code
+                scales[rows, 1] = scale_code ^ 0x80
+                data[rows, 16:24] = 0x22  # Nonzero V even when group zero underflows.
+                # The only new maximum is the final channel of the last live
+                # selected row: count 129 puts it in the second BK128 tile.
+                data[rows[-1], -1] = max_codes[request] << 4
+                scales[rows[-1], -1] = max_scales[request]
+                if max_codes[request] != 7:
+                    assert ((data[rows] & 7) != 7).all()
+                    assert (((data[rows] >> 4) & 7) != 7).all()
         main.copy_(pack(data, scales, 288))
         query.zero_()
-        query[..., 0] = query_level
+        query[..., 0] = -1.0 if step % 2 else 1.0
         q.copy_(query.to(q.dtype))
-        ci.fill_(-1)
-        ci[..., :count] = (
-            torch.arange(count, device=q.device, dtype=torch.int32) * 197 + 63
-        ) % 128
 
-    # (E2M1 code, E4M3 scale byte, nonzero Q, exact product, unit E4M3, count).
-    # The first is a halfway-even round-up; the others saturate and underflow.
-    cases = [
-        (3, 0x39, 1.0, 1.6875, 1.75, 64),
-        (7, 0x7E, 2**-8, 2688.0, 448.0, 127),
-        (1, 0x01, 1.0, 2**-10, 0.0, 129),
-    ]
-    update(cases[0][0], cases[0][1], cases[0][2], cases[0][5])
+    update(cases[0], 0)
     _, _, plan = deepseek_v41_decode(*args, backend="prims-ts")
     plan = dataclasses.replace(
         plan, kernel=_compile(q.device.index, 192, native_fp4=native_fp4)
     )
     out, lse, _ = deepseek_v41_decode(*args, plan=plan, backend="prims-ts")
     assert not hasattr(plan, "expanded_q")
+    assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (2,)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         deepseek_v41_decode(*args, plan=plan, backend="prims-ts")
-    for code, scale_code, query_level, raw, converted, count in cases:
-        update(code, scale_code, query_level, count)
+    for step, case in enumerate(cases):
+        update(case, step)
+        name, _, _, _, _, scales_expected, counts = case
+        expected_scale = torch.tensor(
+            scales_expected, device=q.device, dtype=torch.float32
+        )
         for state in (plan.part_s, plan.part_c, plan.lse_s, plan.lse_c):
             state.fill_(math.nan)
+        # Reset a separately poisoned scale on every replay, including valid
+        # zero and empty requests after the larger/smaller positive descales.
+        plan.main_scale.fill_(math.nan if step % 2 else -123.0)
         for metadata in (
             plan.selected_swa,
             plan.selected_global,
@@ -1380,24 +1583,88 @@ def test_fp8_main_rounding_saturation_underflow_changed_graph(native_fp4):
         lse.fill_(math.nan)
         graph.replay()
         check_fp8(out, lse, fp8_oracle(*args))
-        # Identical live rows make every normalized probability exactly the
-        # same. This exact V gate, unlike the general FP8 rounding bound, rejects
-        # a BF16 V pass even if its K values alone were converted correctly.
-        expected = torch.full_like(out, converted)
-        expected[..., 16:32] = -converted
-        expected[..., 32:48] = 1
-        torch.testing.assert_close(out, expected, rtol=0, atol=0)
-        expected_lse = math.log(count) + query_level * converted * 512**-0.5
-        torch.testing.assert_close(
-            lse.double(),
-            torch.full_like(lse, expected_lse, dtype=torch.float64),
-            rtol=0,
-            atol=1e-5,
+        staged, oracle_scale, valid = fp8_main_reference(main, ci)
+        torch.testing.assert_close(oracle_scale, expected_scale, rtol=0, atol=0)
+        torch.testing.assert_close(plan.main_scale, expected_scale, rtol=0, atol=0)
+        if name == "scale6":
+            # Decisive rescale witness: raw one becomes E4M3(1/6) * 6,
+            # i.e. 0.171875 * 6 = 1.03125, not clipped one or unscaled 1/6.
+            converted = torch.tensor(
+                [1.03125, 1.0], device=q.device, dtype=torch.float64
+            )
+            raw = 1.0
+        elif name == "fp32-div":
+            # m=9/x=3.375 and m=13/x=4.875 have rounded-down FP32 descales.
+            # FP32 division yields midpoint 168, then E4M3 ties round to even
+            # 160; FP64 quotients lie above it and would round to 176 instead.
+            raw_values = torch.tensor([3.375, 4.875], device=q.device)
+            midpoint = torch.full_like(raw_values, 168.0)
+            torch.testing.assert_close(
+                raw_values / expected_scale, midpoint, rtol=0, atol=0
+            )
+            assert (
+                midpoint.double() * expected_scale.double() < raw_values.double()
+            ).all()
+            # Request one also rejects reciprocal multiply: s=15578843*2^-29,
+            # RN32(1/s)=9033886*2^-18. Its product with x is 168+18*2^-21,
+            # above half an FP32 ULP, so that path would also yield FP8 176.
+            assert expected_scale[1].item() == 15578843 * 2**-29
+            torch.testing.assert_close(
+                staged[:, 0, 0].float(),
+                torch.full_like(raw_values, 160.0),
+                rtol=0,
+                atol=0,
+            )
+            converted = 160.0 * expected_scale.double()
+            raw = 3.375
+        elif name == "underflow":
+            converted = torch.tensor(
+                [0.0, 2**-10], device=q.device, dtype=torch.float64
+            )
+            raw = 2**-10
+        else:
+            converted = torch.zeros(2, device=q.device, dtype=torch.float64)
+            raw = 0.0
+        expected_lse = torch.full(
+            (2, 64), -math.inf, device=q.device, dtype=torch.float64
         )
-        # Conversely, a BF16 K pass with only V converted must fail strict LSE.
-        assert abs(query_level * (raw - converted) * 512**-0.5) > 1e-5
-        assert raw != converted
-        assert (plan.global_counts == count).all() and (plan.swa_counts == 0).all()
+        for request, count in enumerate(counts):
+            if not count:
+                continue
+            # Constant first/second V groups have an exact BF16 publication
+            # gate independent of the general componentwise FP8-P bound. Tail
+            # channels, including the isolated maximum, retain that full gate.
+            torch.testing.assert_close(
+                out[request, ..., :16],
+                converted[request].bfloat16().expand(1, 64, 16),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                out[request, ..., 16:32],
+                (-converted[request]).bfloat16().expand(1, 64, 16),
+                rtol=0,
+                atol=0,
+            )
+            expected_lse[request] = (
+                math.log(count)
+                + query[request, 0, :, 0].double() * converted[request] * 512**-0.5
+            )
+        torch.testing.assert_close(
+            lse[..., 0].double(), expected_lse, rtol=0, atol=1e-5
+        )
+        if name in ("scale6", "fp32-div", "underflow"):
+            # Nonzero Q makes raw/BF16 K with only V scaled fail strict LSE.
+            assert abs(raw - converted[0].item()) * 512**-0.5 > 1e-5
+            assert expected_scale[0] != expected_scale[1]
+        torch.testing.assert_close(
+            plan.global_counts,
+            torch.tensor(counts, device=q.device, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.equal(plan.selected_global, torch.where(valid, ci[:, 0], -1))
+        assert (plan.swa_counts == 0).all()
         assert (plan.global_lengths == 192).all() and (plan.swa_lengths == 128).all()
         assert (plan.empty_lengths == 0).all()
 
@@ -1455,6 +1722,9 @@ def test_fp8_swa_empty_poison_and_mode_guards(monkeypatch):
     check_fp8(out, lse, fp8_oracle(*args))
     assert torch.equal(plan.part_s, torch.zeros_like(plan.part_s))
     assert torch.equal(plan.part_c, torch.zeros_like(plan.part_c))
+    torch.testing.assert_close(
+        plan.main_scale, torch.ones_like(plan.main_scale), rtol=0, atol=0
+    )
     with pytest.raises(ValueError, match="Q must be BF16"):
         deepseek_v41_decode(*args)
     with pytest.raises(ValueError, match="page size"):

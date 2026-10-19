@@ -503,6 +503,7 @@ def build_throughput_latency_mla_task_manager(
     kv_producer_args=None,
     source_state_store=None,
     source_state_store_args=None,
+    kv_producer_runtime_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the throughput-latency 1CTA MLA TaskManager for validation or execution.
 
@@ -527,6 +528,12 @@ def build_throughput_latency_mla_task_manager(
         raise ValueError(
             "custom KV producers require the single-pipe Keep-AB task graph"
         )
+    if cfg.sparse_request_kv_scale and (
+        kv_producer is None or source_state_store is None
+    ):
+        raise ValueError("request KV scales require a custom producer and source store")
+    if kv_producer_runtime_args is not None and kv_producer is None:
+        raise ValueError("KV producer runtime arguments require a custom producer")
     if source_state_store is not None:
         validate_source_state_store_config(cfg)
         if output_quant is not None:
@@ -571,6 +578,7 @@ def build_throughput_latency_mla_task_manager(
             kv_producer_args=kv_producer_args,
             source_state_store=source_state_store,
             source_state_store_args=source_state_store_args,
+            kv_producer_runtime_args=kv_producer_runtime_args,
         )
 
     agent = pipeline.Agent
@@ -1216,6 +1224,7 @@ def _make_single_kv_pipe_task_graph(
     kv_producer_args=None,
     source_state_store=None,
     source_state_store_args=None,
+    kv_producer_runtime_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the single-stream 1CTA task graph.
 
@@ -1399,6 +1408,8 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_head_dim_v=cta_idx_head_dim_v,
         name="ll_mla_q64_smem_kv",
     )
+    if kv_producer_runtime_args is not None:
+        smem_kv_args["runtime_args"] = kv_producer_runtime_args
     smem_kv = (
         SmemKvResource(**smem_kv_args)
         if kv_producer is None
@@ -1773,6 +1784,7 @@ class ThroughputLatencyMlaDecodeTs:
         # Both representations reuse the same metadata staging and KV loaders.
         self.direct_sparse = source_state_store is not None
         self.direct_static_scales = False
+        self.direct_request_kv_scale = False
         self.direct_sparse_capacities = (0, 0)
 
         cfg = self._make_config()
@@ -1903,6 +1915,12 @@ class ThroughputLatencyMlaDecodeTs:
                 raise ValueError("FP32 source states require a direct sparse profile")
             if self.source_state_store.block_size not in (1, 2, 4, 8, 16, 32, 64):
                 raise ValueError("unsupported FP32 source-state store block size")
+        if self.direct_request_kv_scale and (
+            self.kv_producer is None or self.source_state_store is None
+        ):
+            raise ValueError(
+                "request KV scales require a custom producer and source store"
+            )
         cfg = make_throughput_latency_mla_config(
             batch_size=self.batch_size,
             num_heads_q=self.num_heads,
@@ -1931,6 +1949,7 @@ class ThroughputLatencyMlaDecodeTs:
                 finalize_output=self.finalize_output,
                 direct_inputs=self.direct_sparse,
                 static_scales=self.direct_static_scales,
+                request_kv_scale=self.direct_request_kv_scale,
                 source_capacities=self.direct_sparse_capacities,
                 source_state_store=self.source_state_store is not None,
             )
@@ -2023,12 +2042,45 @@ class ThroughputLatencyMlaDecodeTs:
         stream: object,
         output_quant_args=None,
         source_state_store_args=None,
+        kv_producer_runtime_args=None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self._make_config()
         self._validate_source_state_store_args(
             source_state_store_args, output_quant_args
         )
+        if cutlass.const_expr(
+            kv_producer_runtime_args is not None and self.kv_producer is None
+        ):
+            raise ValueError("KV producer runtime arguments require a custom producer")
+        if cutlass.const_expr(cfg.sparse_request_kv_scale):
+            if cutlass.const_expr(
+                cu_seqlens_q is not None
+                or kv_producer_runtime_args is None
+                or len(kv_producer_runtime_args) != 1
+            ):
+                raise ValueError(
+                    "request KV scales require fixed Q and one producer scale"
+                )
+            request_scale = block_split_kvs[6]
+            if cutlass.const_expr(
+                request_scale is None
+                or request_scale.element_type != cutlass.Float32
+                or len(request_scale.shape) != 1
+            ):
+                raise ValueError("request KV scales must be contiguous FP32[B]")
+            runtime_assert(
+                request_scale.stride[0] == 1, "request KV scales must be contiguous"
+            )
+            runtime_assert(
+                request_scale.shape[0] == q_latent.shape[3],
+                "request KV scales must match the batch size",
+            )
+            runtime_assert(
+                request_scale.iterator.toint()
+                == kv_producer_runtime_args[0].iterator.toint(),
+                "attention and producer must share request KV scales",
+            )
 
         # Public fixed tensors use [H,D,SQ,B]/[H,SQ,B]; compact ragged tensors
         # use [H,D,totalQ]/[H,totalQ]. Both flatten H x Q for TMA because the
@@ -2355,6 +2407,7 @@ class ThroughputLatencyMlaDecodeTs:
             output_quant_args,
             kv_producer_args,
             source_state_store_args,
+            kv_producer_runtime_args,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2477,6 +2530,7 @@ class ThroughputLatencyMlaDecodeTs:
         output_quant_args=None,
         kv_producer_args=None,
         source_state_store_args=None,
+        kv_producer_runtime_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2504,6 +2558,12 @@ class ThroughputLatencyMlaDecodeTs:
                     * LOG2_E
                 )
                 output_scale = cutlass.Float32(os[0]) * cutlass.Float32(ss[0])
+            elif cutlass.const_expr(cfg.sparse_request_kv_scale):
+                # The packed main producer normalizes K/V by this request's
+                # descale. Restore K before softmax and V in normalized O.
+                kv_descale = cutlass.Float32(ss[request])
+                softmax_scale_log2 *= kv_descale
+                output_scale *= kv_descale
             sparse_epilogue_params = sinks
         elif cutlass.const_expr(self.device_scales):
             softmax_scale_log2 = cutlass.Float32(sparse_scale_params[0]) * LOG2_E
@@ -2637,6 +2697,7 @@ class ThroughputLatencyMlaDecodeTs:
             kv_producer_args=kv_producer_args,
             source_state_store=self.source_state_store,
             source_state_store_args=source_state_store_args,
+            kv_producer_runtime_args=kv_producer_runtime_args,
         )
         if cutlass.const_expr(has_runtime_activity_guard):
             # Initialize resource containers outside runtime control flow; only

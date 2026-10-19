@@ -2,17 +2,21 @@
 # Licensed under the Apache License, Version 2.0.
 """Native E4M3 attention and FP32 source states for the V4.1 adapter.
 
-SWA stays native FP8 through TMA, QK, P and PV. The optional main pass rounds
-selected scaled FP4 tiles to E4M3 and uses the original FP8 Q. Neither pass
-rounds its normalized O before merging.
+SWA stays native FP8 through TMA, QK, P and PV. The optional main pass normalizes
+selected FP4 values by a live request descale before E4M3 staging, then restores
+their units in QK and normalized O. Both passes use the original FP8 Q and keep
+normalized O in FP32 until merging.
 """
 
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
 
 from ...attention.prims_ts.kernels.separate_reduction import MergeMlaSourceStates
+from ...cute_dsl.fp4_common import block_reduce, fdiv_rn, fmax_f32, warp_reduce
+from .prims_ts_resources import _fp4_group_amax
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,8 @@ class Fp8SwaDecodeKernel:
         empty_lengths: cute.Tensor,
         swa_counts: cute.Tensor,
         global_counts: cute.Tensor,
+        global_cache: cute.Tensor,
+        main_scale: cute.Tensor,
         swa_capacity: cutlass.Int64,
         global_capacity: cutlass.Int64,
     ):
@@ -104,6 +110,30 @@ class Fp8SwaDecodeKernel:
             cute.arch.atomic_add(swa_counts.iterator + request, count_s, scope="cta")
             cute.arch.atomic_add(global_counts.iterator + request, count_c, scope="cta")
 
+        if cutlass.const_expr(self.compressed_k > 0):
+            # One warp owns one selected row; its lanes cover the 32 group16s
+            # with coalesced payload/scale reads. All selections are published
+            # before any warp reads another thread's sanitized slot.
+            cute.arch.sync_threads()
+            reduction_buffer = utils.SmemAllocator().allocate_tensor(
+                cutlass.Float32, cute.make_layout((1, 4)), byte_alignment=4
+            )
+            local_amax = cutlass.Float32(0.0)
+            for column in cutlass.range(lane // 32, self.compressed_k, 4):
+                slot = cutlass.Int32(selected_global[request, column])
+                if slot >= cutlass.Int32(0):
+                    group_amax = _fp4_group_amax(global_cache, slot, lane % 32)
+                    local_amax = fmax_f32(local_amax, group_amax)
+            warp_amax = warp_reduce(local_amax, fmax_f32)
+            amax = block_reduce(
+                warp_amax, fmax_f32, reduction_buffer, cutlass.Float32(0.0)
+            )
+            if lane == 0:
+                descale = cutlass.Float32(1.0)
+                if amax > cutlass.Float32(0.0):
+                    descale = fdiv_rn(amax, cutlass.Float32(448.0))
+                main_scale[request] = descale
+
     @cute.jit
     def __call__(
         self,
@@ -119,6 +149,7 @@ class Fp8SwaDecodeKernel:
         empty_lengths: cute.Tensor,
         swa_counts: cute.Tensor,
         global_counts: cute.Tensor,
+        main_scale: cute.Tensor,
         part_s: cute.Tensor,
         part_c: cute.Tensor,
         lse_s: cute.Tensor,
@@ -138,6 +169,8 @@ class Fp8SwaDecodeKernel:
             empty_lengths,
             swa_counts,
             global_counts,
+            global_cache,
+            main_scale,
             cutlass.Int64(swa_cache.shape[2]),
             cutlass.Int64(cute.size(global_cache)) // 288,
         ).launch(
@@ -189,7 +222,7 @@ class Fp8SwaDecodeKernel:
                 empty_lengths,
                 None,
                 None,
-                None,
+                main_scale,
                 None,
                 None,
             )
@@ -210,6 +243,7 @@ class Fp8SwaDecodeKernel:
                 cutlass.Float32(1.0),
                 stream,
                 source_state_store_args=(part_c, global_counts),
+                kv_producer_runtime_args=(main_scale,),
             )
         final_out = cute.make_tensor(
             out.iterator,

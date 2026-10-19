@@ -610,6 +610,7 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
     )
     from .test_deepseek_v41_decode import (
         check_fp8,
+        fp8_main_reference,
         fp8_oracle,
         gate as decode_gate,
     )
@@ -617,6 +618,8 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
     decode_gate("prims-ts")
     torch.manual_seed(941 + compressed_k)
     x = torch.randn(max(128, compressed_k), 512, device="cuda", dtype=torch.bfloat16)
+    x.clamp_(-0.5, 0.5)
+    x[0, -1] = 3  # Exact writer-decoded max; the last group must enter prep amax.
     swa = deepseek_v41_quantize_cache(x[:128], format="swa_fp8")
     main = (
         deepseek_v41_quantize_cache(x, format="main_kv_fp4") if compressed_k else None
@@ -653,10 +656,23 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
                 strict=True,
             ):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            _, expected_scale, _ = fp8_main_reference(main, ci)
+            assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (
+                1,
+            )
+            torch.testing.assert_close(plan.main_scale, expected_scale, rtol=0, atol=0)
+        else:
+            assert plan.main_scale is None
         check_fp8(out, lse, fp8_oracle(*args))
 
     out, lse, plan = run()
     check()
+    if compressed_k:
+        torch.testing.assert_close(
+            plan.main_scale, torch.full_like(plan.main_scale, 3 / 448), rtol=0, atol=0
+        )
+        previous_scale = plan.main_scale.clone()
+        previous_bytes = main.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         deepseek_v41_quantize_cache(x[:128], format="swa_fp8", out=swa)
@@ -664,7 +680,10 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
             deepseek_v41_quantize_cache(x, format="main_kv_fp4", out=main)
         run(plan)
     for step in range(3):
-        x.normal_()
+        x.normal_().clamp_(-1, 1).mul_(step + 1)
+        # Live replays use exact writer group scales one/two and decoded
+        # maxima 6/12. Captured prep must reread the changed bytes, not reuse s.
+        x[0, -1] = 6 * (step + 1)
         q_source.normal_()
         q.copy_(q_source.to(torch.float8_e4m3fn))
         sink.normal_()
@@ -677,7 +696,9 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
                 )
             )
             ci[..., ::17] = -1
+            ci[..., 1] = 0  # Keep the changed maximum selected on live replays.
             main.fill_(255)
+            plan.main_scale.fill_(float("nan"))
         if step == 2:
             wi.fill_(-1)
             if compressed_k:
@@ -687,3 +708,17 @@ def test_swa_fp8_prepared_cache_feeds_prims_decode(compressed_k):
         lse.fill_(float("nan"))
         graph.replay()
         check()
+        if compressed_k:
+            _, written_scales = unpack_bytes(main, x.shape[0], True)
+            assert written_scales[0, -1].item() == (0x38, 0x40, 0x44)[step]
+            expected_scale = 1.0 if step == 2 else 6 * (step + 1) / 448
+            torch.testing.assert_close(
+                plan.main_scale,
+                torch.full_like(plan.main_scale, expected_scale),
+                rtol=0,
+                atol=0,
+            )
+            assert not torch.equal(main, previous_bytes)
+            assert not torch.equal(plan.main_scale, previous_scale)
+            previous_bytes.copy_(main)
+            previous_scale.copy_(plan.main_scale)

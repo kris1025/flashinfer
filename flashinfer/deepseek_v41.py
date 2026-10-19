@@ -26,13 +26,16 @@ def deepseek_v41_decode(
     Decode never implicitly quantizes BF16 Q. Both SWA and main attention use
     E4M3 Q/K/V/P with the original FP8 Q. SWA uses native TMA, not BF16
     dequantization. Optional uint8 FP4 global[pages,64,1,288] retains packed
-    E2M1 data and group16 E4M3 scales in global memory. Only selected tiles
-    apply those scales, then round to unit E4M3 with round-to-nearest-even
-    and finite saturation to [-448,448], preserving signed zero/subnormals.
-    This is lossy: finite scaled FP4 values can reach +/-2688. Converted
-    tiles are staged in FP8 shared memory and feed both QK and PV. Neither
-    mixed nor window-only native mode expands Q to BF16 or allocates BF16
-    query scratch or a full converted cache.
+    E2M1 data and group16 E4M3 scales in global memory. Each request computes
+    the exact amax of its valid selected main values after those scales,
+    then an FP32 descale s = amax / 448 (1 for zero/empty selections).
+    Both divisions use FP32 round-to-nearest: selected values x are normalized
+    by s, then rounded/saturated to E4M3 with signed zero/subnormal support.
+    The same s is restored in QK and normalized V output, rather than clipping
+    represented main values to +/-448. Conversion remains lossy. The FP8
+    shared-memory tiles feed both QK and PV; no full converted cache or BF16
+    query expansion/scratch is allocated. Only mixed mode owns FP32[B] main
+    descales; window-only omits the main pass, scale storage and amax work.
     Sink-free normalized FP32 source outputs and log2 LSE are merged before
     final BF16 output rounding; the sink contributes denominator mass once.
     Window-only also omits the global pass and global source states.
@@ -70,10 +73,11 @@ def deepseek_v41_decode(
     place or recapture when addresses change. Eager calls may change input
     addresses. One plan must not execute concurrently on different streams.
 
-    The current FP8-main snapshot passed the full 271-case matrix and selected
-    57-case dense subset on B200/DSL 4.8.0/bundled compiler 13.4 (job 5049128),
-    with unchanged numerical gates and default GC/capture settings. Historical
-    257-case GPU results used BF16 main attention and do not qualify this change.
+    Request-scaled main conversion/restoration passed full271/selected-dense57
+    on B200/DSL 4.8.0/bundled compiler 13.4 (job 5103699). Qualification covers
+    only that tested snapshot and selected dense subset, not the entire dense
+    suite or other hardware/toolchains. Historical job 5049128 qualifies only
+    unit-scale FP8 main; older full257 results used BF16 main attention.
     Examples and benchmarks have not run. Performance, crossovers and checkpoint/
     full-model behavior are unmeasured.
     See examples/deepseek_v41/README.md for scope and commands. Single-token
@@ -125,8 +129,9 @@ def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None
     any model-required RoPE. SM100 and page_size=64 only.
 
     ``main_kv_fp4`` uses E2M1 data, group16/E4M3 scales, no global scale;
-    native FP8 decode rounds/saturates only selected main tiles to E4M3 for
-    attention without changing this writer or packed storage ABI.
+    native FP8 decode computes a request-selected descale and normalizes only
+    selected main tiles before E4M3 staging, restoring it in attention without
+    changing this writer or packed storage ABI.
     ``swa_mxfp8`` uses E4M3 data and group32/E8M0 scales. Main-cache scales
     must be representable in E4M3. Opaque uint8 output has shape
     [pages,64,1,288] or [pages,64,1,528]. Each page holds all data rows,

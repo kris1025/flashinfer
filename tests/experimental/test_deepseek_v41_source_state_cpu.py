@@ -24,7 +24,9 @@ import ast
 from dataclasses import dataclass, replace
 import importlib
 import inspect
+import math
 import os
+import struct
 import textwrap
 from types import SimpleNamespace
 
@@ -187,16 +189,23 @@ def _make_kernel(native, **overrides):
 
 def test_source_state_interface_is_appended_and_optional(native):
     cls = native.kernel.ThroughputLatencyMlaDecodeTs
-    for method, name in (
-        (cls.__init__, "source_state_store"),
-        (cls.__call__, "source_state_store_args"),
+    parameters = inspect.signature(cls.__init__).parameters
+    assert list(parameters)[-1] == "source_state_store"
+    assert parameters["source_state_store"].default is None
+    assert parameters["source_state_store"].kind == inspect.Parameter.KEYWORD_ONLY
+    for method in (
+        cls.__call__,
+        cls.dense_kernel,
+        native.kernel.build_throughput_latency_mla_task_manager,
+        native.kernel._make_single_kv_pipe_task_graph,
     ):
         parameters = inspect.signature(method).parameters
-        assert list(parameters)[-1] == name
-        assert parameters[name].default is None
-    assert inspect.signature(cls.__init__).parameters["source_state_store"].kind == (
-        inspect.Parameter.KEYWORD_ONLY
-    )
+        assert list(parameters)[-2:] == [
+            "source_state_store_args",
+            "kv_producer_runtime_args",
+        ]
+        assert parameters["source_state_store_args"].default is None
+        assert parameters["kv_producer_runtime_args"].default is None
 
 
 @pytest.mark.parametrize("qkv_dtype", ("bf16", "e4m3"))
@@ -377,6 +386,449 @@ def test_source_state_compile_signature_is_opt_in_and_batch_independent(native):
     assert default.compile_signature()[-1] is store
 
 
+@pytest.mark.parametrize("qkv_dtype", ("bf16", "e4m3"))
+@pytest.mark.parametrize("source_store", (False, True))
+def test_request_kv_scale_defaults_off_without_changing_old_signatures(
+    native, qkv_dtype, source_store
+):
+    kwargs = dict(
+        qkv_dtype=qkv_dtype,
+        source_state_store=_SourceStateStore() if source_store else None,
+    )
+    kernel = _make_kernel(native, **kwargs)
+    explicit = _make_kernel(native, **kwargs)
+    explicit.direct_request_kv_scale = False
+    assert kernel.direct_request_kv_scale is False
+    assert kernel._make_config().sparse_request_kv_scale is False
+    assert kernel.compile_signature() == explicit.compile_signature()
+    parameter = inspect.signature(native.config.configure_sparse_mla).parameters[
+        "request_kv_scale"
+    ]
+    assert (
+        parameter.default is False and parameter.kind == inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+def test_request_kv_scale_is_part_of_the_batch_independent_compile_identity(native):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(192, 148, True)
+    scaled = main.compile_signature()
+    main.batch_size = 3
+    assert main.compile_signature() == scaled
+    main.direct_request_kv_scale = False
+    assert main.compile_signature() != scaled
+    assert main._make_config().sparse_static_scales
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"static_scales": False},
+        {"direct_inputs": False},
+        {"source_state_store": False},
+        {"qkv_dtype": "bf16"},
+    ),
+)
+def test_request_kv_scale_config_requires_static_direct_e4m3_sources(native, overrides):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    cfg = main._make_config()
+    options = dict(
+        static_scales=True,
+        direct_inputs=True,
+        source_state_store=True,
+        request_kv_scale=True,
+    )
+    if "qkv_dtype" in overrides:
+        cfg = replace(cfg, **overrides)
+    else:
+        options.update(overrides)
+    with pytest.raises(ValueError, match="static-base-scale direct E4M3 source states"):
+        native.config.configure_sparse_mla(cfg, main.sparse_profile, **options)
+
+
+@pytest.mark.parametrize("missing", ("producer", "source", "both"))
+@pytest.mark.parametrize("entry", ("config", "task_manager"))
+def test_request_kv_scale_requires_custom_producer_and_source_store(
+    native, missing, entry
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    cfg = main._make_config()
+    producer = None if missing in ("producer", "both") else main.kv_producer
+    store = None if missing in ("source", "both") else main.source_state_store
+    with pytest.raises(ValueError, match="custom producer and source store"):
+        if entry == "config":
+            main.kv_producer, main.source_state_store = producer, store
+            main._make_config()
+        else:
+            native.kernel.build_throughput_latency_mla_task_manager(
+                cfg, kv_producer=producer, source_state_store=store
+            )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("num_ctas_per_seq_kv", 2),
+        ("num_ctas_per_head_dim", 2),
+        ("use_multi_ctas_kv", 1),
+        ("use_cluster_reduction", 1),
+        ("use_persistent_scheduler", 1),
+        ("use_clc_dynamic_persistent_scheduler", 1),
+        ("use_attention_sinks", 1),
+        ("fuse_sparse_epilogue", True),
+        ("fuse_sparse_cluster_epilogue", True),
+        ("fuse_sparse_reduction", True),
+    ),
+)
+def test_request_kv_scale_retains_nonfinalizing_source_topology_guards(
+    native, field, value
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    cfg = replace(main._make_config(), **{field: value})
+    assert cfg.sparse_request_kv_scale
+    with pytest.raises(ValueError, match="FP32 source states require"):
+        native.kernel.build_throughput_latency_mla_task_manager(
+            cfg,
+            kv_producer=main.kv_producer,
+            source_state_store=main.source_state_store,
+        )
+
+
+def _function_ast(function):
+    return ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+
+
+def _host_function(function, namespace):
+    """Execute an inspected host prefix, never its decorated DSL entry point."""
+    function.decorator_list = []
+    function.returns = None
+    for arg in (
+        *function.args.posonlyargs,
+        *function.args.args,
+        *function.args.kwonlyargs,
+        function.args.vararg,
+        function.args.kwarg,
+    ):
+        if arg is not None:
+            arg.annotation = None
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    exec(compile(module, "<host-contract>", "exec"), namespace)
+    return namespace[function.name]
+
+
+def _scale_metadata(native, **overrides):
+    values = dict(
+        element_type=native.cutlass.Float32,
+        shape=(2,),
+        stride=(1,),
+        iterator=SimpleNamespace(toint=lambda: 0x100),
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _run_request_scale_guard(native, kernel, scale, runtime_args, *, compact_q=None):
+    function = _function_ast(native.kernel.ThroughputLatencyMlaDecodeTs.__call__)
+    first_tma = next(
+        i
+        for i, node in enumerate(function.body)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "tma_box0"
+    )
+    function.body = function.body[:first_tma]
+    checks = []
+
+    def runtime_assert(condition, message):
+        checks.append(message)
+        assert condition, message
+
+    guard = _host_function(
+        function,
+        dict(
+            cutlass=SimpleNamespace(
+                const_expr=lambda value: value, Float32=native.cutlass.Float32
+            ),
+            runtime_assert=runtime_assert,
+        ),
+    )
+    args = dict.fromkeys(inspect.signature(guard).parameters)
+    args.update(
+        self=kernel,
+        q_latent=SimpleNamespace(shape=(64, 512, 1, 2)),
+        block_split_kvs=(None,) * 6 + (scale, None, None),
+        source_state_store_args=(object(), object()),
+        kv_producer_runtime_args=runtime_args,
+        cu_seqlens_q=compact_q,
+    )
+    guard(**args)
+    return checks
+
+
+def test_request_kv_scale_runtime_guard_requires_one_shared_contiguous_fp32_batch(
+    native,
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    scale = _scale_metadata(native)
+    assert _run_request_scale_guard(native, main, scale, (scale,)) == [
+        "request KV scales must be contiguous",
+        "request KV scales must match the batch size",
+        "attention and producer must share request KV scales",
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad,error,match",
+    (
+        ("compact_q", ValueError, "fixed Q and one producer scale"),
+        ("missing", ValueError, "fixed Q and one producer scale"),
+        ("empty", ValueError, "fixed Q and one producer scale"),
+        ("extra", ValueError, "fixed Q and one producer scale"),
+        ("none", ValueError, "contiguous FP32"),
+        ("dtype", ValueError, "contiguous FP32"),
+        ("rank0", ValueError, "contiguous FP32"),
+        ("rank2", ValueError, "contiguous FP32"),
+        ("stride", AssertionError, "must be contiguous"),
+        ("batch", AssertionError, "match the batch size"),
+        ("pointer", AssertionError, "must share request KV scales"),
+    ),
+)
+def test_request_kv_scale_runtime_guard_rejects_invalid_bindings(
+    native, bad, error, match
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    scale = _scale_metadata(native)
+    compact_q, runtime_args = None, (scale,)
+    if bad == "compact_q":
+        compact_q = object()
+    elif bad == "missing":
+        runtime_args = None
+    elif bad == "empty":
+        runtime_args = ()
+    elif bad == "extra":
+        runtime_args = (scale, scale)
+    elif bad == "none":
+        scale = None
+    elif bad == "dtype":
+        scale.element_type = native.cutlass.BFloat16
+    elif bad == "rank0":
+        scale.shape = ()
+    elif bad == "rank2":
+        scale.shape = (2, 1)
+    elif bad == "stride":
+        scale.stride = (2,)
+    elif bad == "batch":
+        scale.shape = (3,)
+    else:
+        runtime_args = (
+            _scale_metadata(native, iterator=SimpleNamespace(toint=lambda: 0x200)),
+        )
+    with pytest.raises(error, match=match):
+        _run_request_scale_guard(native, main, scale, runtime_args, compact_q=compact_q)
+
+
+def test_kv_producer_runtime_args_cannot_reach_default_native_resources(native):
+    kernel = _make_kernel(native, source_state_store=_SourceStateStore())
+    with pytest.raises(ValueError, match="runtime arguments require a custom producer"):
+        _run_request_scale_guard(native, kernel, None, (object(),))
+    with pytest.raises(ValueError, match="runtime arguments require a custom producer"):
+        native.kernel.build_throughput_latency_mla_task_manager(
+            kernel._make_config(), kv_producer_runtime_args=(object(),)
+        )
+
+
+@pytest.mark.parametrize("mode", ("request", "static", "dynamic", "device", "host"))
+def test_request_scale_restores_both_factors_without_changing_old_scale_paths(
+    native, mode
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(64, 148, True)
+    cfg = main._make_config()
+    function = _function_ast(native.kernel.ThroughputLatencyMlaDecodeTs.dense_kernel)
+    branch = next(
+        node
+        for node in function.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "cutlass.const_expr(cfg.sparse_direct)"
+    )
+    # Only this host branch is executed. Substitute the view binder so even
+    # the function-local import cannot enter a native/DSL execution path.
+    branch.body = [node for node in branch.body if not isinstance(node, ast.ImportFrom)]
+    function.name = "scale_factors"
+    function.args = (
+        ast.parse(
+            "def scale_factors(self, cfg, sparse_scale_params, softmax_scale_log2, output_scale): pass"
+        )
+        .body[0]
+        .args
+    )
+    function.body = [
+        branch,
+        ast.Return(
+            value=ast.Tuple(
+                elts=[
+                    ast.Name(id=name, ctx=ast.Load())
+                    for name in (
+                        "softmax_scale_log2",
+                        "output_scale",
+                        "sparse_epilogue_params",
+                    )
+                ],
+                ctx=ast.Load(),
+            )
+        ),
+    ]
+    reads, bindings = [], []
+
+    class Scale(list):
+        def __init__(self, name, values):
+            super().__init__(values)
+            self.name = name
+
+        def __getitem__(self, index):
+            reads.append((self.name, index))
+            return super().__getitem__(index)
+
+    def bind(*args, **kwargs):
+        bindings.append((args, kwargs))
+        return object(), object()
+
+    log2_e = math.log2(math.e)
+    factors = _host_function(
+        function,
+        dict(
+            cutlass=SimpleNamespace(
+                const_expr=lambda value: value, Float32=float, Int64=int
+            ),
+            cute=SimpleNamespace(arch=SimpleNamespace(block_idx=lambda: (0, 0, 1))),
+            bind_sparse_views=bind,
+            LOG2_E=log2_e,
+        ),
+    )
+    sinks = object()
+    si, ci, sl, cl = object(), object(), object(), object()
+    if mode == "request":
+        params = (si, ci, sl, cl, None, None, Scale("ss", (3.0, 6.0)), None, sinks)
+        expected, expected_reads = (1.5, 15.0, sinks), [("ss", 1)]
+    elif mode == "static":
+        cfg = replace(cfg, sparse_request_kv_scale=False)
+        params = (si, ci, sl, cl, None, None, None, None, sinks)
+        expected, expected_reads = (0.25, 2.5, sinks), []
+    elif mode == "dynamic":
+        cfg = replace(cfg, sparse_static_scales=False, sparse_request_kv_scale=False)
+        params = (
+            si,
+            ci,
+            sl,
+            cl,
+            Scale("sm", (0.125,)),
+            Scale("qs", (2.0,)),
+            Scale("ss", (3.0,)),
+            Scale("os", (5.0,)),
+            sinks,
+        )
+        expected = (0.125 * 2.0 * 3.0 * log2_e, 15.0, sinks)
+        expected_reads = [("sm", 0), ("qs", 0), ("ss", 0), ("os", 0), ("ss", 0)]
+    else:
+        cfg = replace(cfg, sparse_direct=False, sparse_request_kv_scale=False)
+        params = Scale("device", (0.75, 3.0)) if mode == "device" else None
+        expected = (
+            (0.75 * log2_e, 3.0, params) if mode == "device" else (0.25, 2.5, None)
+        )
+        expected_reads = [("device", 0), ("device", 1)] if mode == "device" else []
+    actual = factors(
+        SimpleNamespace(device_scales=mode == "device"), cfg, params, 0.25, 2.5
+    )
+    assert actual == expected and reads == expected_reads
+    if cfg.sparse_direct:
+        assert bindings == [
+            ((si, ci, sl, cl, cfg.total_kv_tiles * cfg.tile_size_kv), {"request": 1})
+        ]
+    else:
+        assert not bindings
+
+
+def test_kv_producer_runtime_args_are_forwarded_through_every_kernel_layer(native):
+    cls = native.kernel.ThroughputLatencyMlaDecodeTs
+    for function, callee, positional in (
+        (cls.__call__, "self.dense_kernel", True),
+        (cls.dense_kernel, "build_throughput_latency_mla_task_manager", False),
+        (
+            native.kernel.build_throughput_latency_mla_task_manager,
+            "_make_single_kv_pipe_task_graph",
+            False,
+        ),
+    ):
+        calls = [
+            node
+            for node in ast.walk(_function_ast(function))
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == callee
+        ]
+        assert len(calls) == 1
+        argument = (
+            calls[0].args[-1]
+            if positional
+            else next(
+                kw.value
+                for kw in calls[0].keywords
+                if kw.arg == "kv_producer_runtime_args"
+            )
+        )
+        assert ast.unparse(argument) == "kv_producer_runtime_args"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_request_scale_runtime_args_reach_the_single_pipe_resource(native, monkeypatch):
+    from flashinfer.experimental.deepseek_v41.prims_ts import _make_fp8_sources
+
+    _, main = _make_fp8_sources(192, 148, True)
+    cfg = main._make_config()
+    producer = main.kv_producer
+    factory = type(producer).make_resource
+    calls = []
+
+    def make_resource(self, pools, **kwargs):
+        resource = factory(self, pools, **kwargs)
+        calls.append((pools, kwargs, resource))
+        return resource
+
+    monkeypatch.setattr(type(producer), "make_resource", make_resource)
+    pools, runtime_args, source_args = (
+        (object(), object()),
+        (object(),),
+        (object(), object()),
+    )
+    signature = main.compile_signature()
+    manager, corr = native.kernel.build_throughput_latency_mla_task_manager(
+        cfg,
+        total_kv_tiles=cfg.total_kv_tiles,
+        use_page_offsets=True,
+        batch_idx=1,
+        kv_producer=producer,
+        kv_producer_args=pools,
+        kv_producer_runtime_args=runtime_args,
+        source_state_store=main.source_state_store,
+        source_state_store_args=source_args,
+    )
+    assert manager.tasks and len(calls) == 1
+    actual_pools, kwargs, resource = calls[0]
+    assert actual_pools is pools and kwargs["runtime_args"] is runtime_args
+    assert resource.main_scale is runtime_args[0] and resource.batch_idx == 1
+    assert resource.fp4_cache is pools[0] and resource.cfg is cfg
+    assert corr.source_state_store_args is source_args
+    assert main.compile_signature() == signature
+
+
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_source_state_task_resource_plumbing_preserves_ownership(native):
     store = _SourceStateStore()
@@ -532,6 +984,8 @@ def test_fp8_adapter_builds_native_swa_and_fp4_only_global(
     assert cfg.num_ctas_per_head_dim == cfg.num_ctas_per_seq_kv == 1
     assert not cfg.fuse_sparse_epilogue and not cfg.use_persistent_scheduler
     assert swa.kv_producer is None and swa.direct_static_scales
+    assert not swa.direct_request_kv_scale and not cfg.sparse_request_kv_scale
+    assert cfg.sparse_static_scales
     assert swa.direct_sparse_capacities == (128, 0)
     signature = swa.compile_signature()
     assert signature[-1] == (
@@ -542,6 +996,8 @@ def test_fp8_adapter_builds_native_swa_and_fp4_only_global(
         cfg = main._make_config()
         assert (cfg.qkv_dtype, cfg.tile_size_kv, cfg.kv_stages) == ("e4m3", 128, 8)
         assert cfg.is_fp8_qkv() and cfg.head_dim_per_stage_kv == 128
+        assert main.direct_static_scales and main.direct_request_kv_scale
+        assert cfg.sparse_static_scales and cfg.sparse_request_kv_scale
         assert main.direct_sparse_capacities == (compressed, 0)
         assert main.seq_len_k == max(256, ((compressed + 127) // 128) * 128)
         from flashinfer.experimental.deepseek_v41.prims_ts_resources import (
@@ -552,7 +1008,7 @@ def test_fp8_adapter_builds_native_swa_and_fp4_only_global(
         assert main.kv_producer.native_fp4 == native_fp4
         assert (
             main.kv_producer.compile_signature()[0]
-            == "dsv41_page64_fp4_group16_to_e4m3"
+            == "dsv41_page64_fp4_group16_to_request_scaled_e4m3"
         )
         assert (
             main.source_state_store.compile_signature()
@@ -575,17 +1031,25 @@ def test_fp4_fp8_resource_reuses_exact_conversion_and_all_writer_publication(
     cfg = main._make_config()
     producer = main.kv_producer
     assert producer.compile_signature() == (
-        "dsv41_page64_fp4_group16_to_e4m3",
+        "dsv41_page64_fp4_group16_to_request_scaled_e4m3",
         native_fp4,
     )
     assert (
         producer.compile_signature()
         != fp4.Fp4KvProducer(native_fp4).compile_signature()
     )
-    primary, unused = object(), object()
-    resource = producer.make_resource((primary, unused), name="fp4_fp8", cfg=cfg)
+    primary, unused, scale, request = object(), object(), object(), object()
+    runtime_args = (scale,)
+    resource = producer.make_resource(
+        (primary, unused),
+        runtime_args=runtime_args,
+        name="fp4_fp8",
+        cfg=cfg,
+        batch_idx=request,
+    )
     assert type(resource) is fp4.Fp4Fp8SmemKvResource
     assert resource.fp4_cache is primary and resource.native_fp4 is native_fp4
+    assert resource.main_scale is scale and resource.batch_idx is request
     assert resource.cfg is cfg and cfg.kv_smem_tile_bytes == 128 * 128
     assert cfg.kv_smem_tile_bytes * cfg.kv_stages == 128 * 1024
     for method in (
@@ -624,6 +1088,18 @@ def test_fp4_fp8_resource_reuses_exact_conversion_and_all_writer_publication(
     ]
 
 
+@pytest.mark.parametrize("runtime_args", (None, (), (None,), (object(), object())))
+def test_fp4_fp8_producer_rejects_missing_or_ambiguous_request_scale(
+    native, runtime_args
+):
+    from flashinfer.experimental.deepseek_v41.prims_ts_resources import Fp4Fp8KvProducer
+
+    with pytest.raises(ValueError, match="requires its request descale tensor"):
+        Fp4Fp8KvProducer(native_fp4=True).make_resource(
+            (object(),), runtime_args=runtime_args
+        )
+
+
 @pytest.mark.parametrize(
     "field,value",
     (
@@ -638,6 +1114,8 @@ def test_fp4_fp8_resource_reuses_exact_conversion_and_all_writer_publication(
         ("load_num_warps", 2),
         ("sparse_reuse_kv", False),
         ("sparse_direct", False),
+        ("sparse_static_scales", False),
+        ("sparse_request_kv_scale", False),
     ),
 )
 def test_fp4_fp8_producer_rejects_other_staging_topologies(native, field, value):
@@ -658,6 +1136,25 @@ def test_fp4_fp8_stage_is_one_sw128_plane_with_eight_byte_stores(native):
     function = ast.parse(
         textwrap.dedent(inspect.getsource(Fp4Fp8SmemKvResource._store_fragment))
     ).body[0]
+    assignments = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in function.body
+        if isinstance(node, ast.Assign)
+    }
+    assert assignments["values"] == "fragment.load().to(cutlass.Float32)"
+    assert assignments["descale"] == "cutlass.Float32(self.main_scale[self.batch_idx])"
+    pack = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "pack_float4_to_fp8_e4m3"
+    )
+    assert [ast.unparse(arg) for arg in pack.args] == [
+        "fdiv_rn(values[column], descale)",
+        "fdiv_rn(values[column + 1], descale)",
+        "fdiv_rn(values[column + 2], descale)",
+        "fdiv_rn(values[column + 3], descale)",
+    ]
     offset = next(
         node.value
         for node in function.body
@@ -724,6 +1221,133 @@ def test_fp4_fp8_stage_is_one_sw128_plane_with_eight_byte_stores(native):
     assert ast.unparse(stage_loads[0].args[1]) == (
         "staging.subview(128 + (page_slot * 4 + stage_idx) * stage_bytes)"
     )
+    factory = next(
+        node
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "main.kv_producer.make_resource"
+    )
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in factory.keywords}
+    assert keywords["runtime_args"] == "(main_scale,)"
+    assert keywords["batch_idx"] == "request"
+    preparation = next(
+        node
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "prepare._prepare"
+    )
+    assert [ast.unparse(arg) for arg in preparation.args[-4:]] == [
+        "pool",
+        "main_scale",
+        "cutlass.Int64(0)",
+        "cutlass.Int64(cute.size(pool)) // 288",
+    ]
+    conversion = next(
+        node
+        for node in ast.walk(probe)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "convert"
+    )
+    assert preparation.lineno < conversion.lineno
+    assert [ast.unparse(arg) for arg in conversion.args[:3]] == [
+        "pool",
+        "selected_global",
+        "main_scale",
+    ]
+
+
+def test_selected_main_amax_decodes_all_group16_values_and_signed_scale_planes(native):
+    from flashinfer.experimental.deepseek_v41.prims_ts_resources import _fp4_group_amax
+
+    function = _function_ast(_fp4_group_amax)
+    assignments = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in function.body
+        if isinstance(node, ast.Assign)
+    }
+    assert assignments["page_base"] == "cutlass.Int64(slot // 64) * (64 * 288)"
+    assert assignments["token"] == "cutlass.Int64(slot & 63)"
+    assert (
+        assignments["payload_offset"]
+        == "page_base + token * 256 + cutlass.Int64(group) * 8"
+    )
+    assert (
+        assignments["scale_offset"]
+        == "page_base + 64 * 256 + token * 32 + cutlass.Int64(group)"
+    )
+    loops = [node for node in ast.walk(function) if isinstance(node, ast.For)]
+    assert [(ast.unparse(node.target), ast.unparse(node.iter)) for node in loops] == [
+        ("word", "cutlass.range_constexpr(2)"),
+        ("element", "cutlass.range_constexpr(8)"),
+    ]
+    updates = [
+        ast.unparse(node.value)
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "magnitude"
+    ]
+    assert updates == ["fmax_f32(magnitude, fabs_f32(values[element]))"]
+    assert ast.unparse(function.body[-1].value) == "magnitude * fabs_f32(scale)"
+    source = ast.unparse(function)
+    assert "dtype=cutlass.Float4E2M1FN" in source
+    assert "cutlass.Float8E4M3FN" in source
+    assert "nvw.cvt_f4e2m1x8_to_f16x8(fp4)" in source
+    assert "cute.TensorSSA(fp16, (8,), cutlass.Float16).to(cutlass.Float32)" in source
+
+
+def test_selected_main_prepare_refreshes_scale_from_sanitized_live_rows_only(native):
+    from flashinfer.experimental.deepseek_v41.prims_ts_fp8 import Fp8SwaDecodeKernel
+
+    function = _function_ast(Fp8SwaDecodeKernel._prepare)
+    branch = function.body[-1]
+    assert isinstance(branch, ast.If)
+    assert ast.unparse(branch.test) == "cutlass.const_expr(self.compressed_k > 0)"
+    # Window-only compilation must have no main-cache/scale read or reduction.
+    main_nodes = {id(node) for node in ast.walk(branch)}
+    uses = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Name)
+        and node.id in ("global_cache", "main_scale", "_fp4_group_amax", "block_reduce")
+    ]
+    assert uses and all(id(node) in main_nodes for node in uses)
+    loop = next(node for node in branch.body if isinstance(node, ast.For))
+    assert ast.unparse(loop.iter) == "cutlass.range(lane // 32, self.compressed_k, 4)"
+    assert (
+        ast.unparse(loop.body[0].value)
+        == "cutlass.Int32(selected_global[request, column])"
+    )
+    live = loop.body[1]
+    assert ast.unparse(live.test) == "slot >= cutlass.Int32(0)"
+    assert (
+        ast.unparse(live.body[0].value)
+        == "_fp4_group_amax(global_cache, slot, lane % 32)"
+    )
+    assert ast.unparse(live.body[1].value) == "fmax_f32(local_amax, group_amax)"
+    assignments = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in branch.body
+        if isinstance(node, ast.Assign)
+    }
+    assert assignments["warp_amax"] == "warp_reduce(local_amax, fmax_f32)"
+    assert assignments["amax"] == (
+        "block_reduce(warp_amax, fmax_f32, reduction_buffer, cutlass.Float32(0.0))"
+    )
+    publish = branch.body[-1]
+    assert ast.unparse(publish.test) == "lane == 0"
+    assert ast.unparse(publish.body[0].value) == "cutlass.Float32(1.0)"
+    assert ast.unparse(publish.body[1].test) == "amax > cutlass.Float32(0.0)"
+    assert ast.unparse(publish.body[1].body[0].value) == (
+        "fdiv_rn(amax, cutlass.Float32(448.0))"
+    )
+    assert ast.unparse(publish.body[-1]) == "main_scale[request] = descale"
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    atomic_counts = [
+        ast.unparse(node.args[0])
+        for node in calls
+        if ast.unparse(node.func) == "cute.arch.atomic_add"
+    ]
+    assert atomic_counts == [
+        "swa_counts.iterator + request",
+        "global_counts.iterator + request",
+    ]
 
 
 def test_fp8_native_compiled_abi_and_both_source_queries_are_fp8(native):
@@ -732,7 +1356,13 @@ def test_fp8_native_compiled_abi_and_both_source_queries_are_fp8(native):
     function = ast.parse(
         textwrap.dedent(inspect.getsource(prims_ts_fp8.Fp8SwaDecodeKernel.__call__))
     ).body[0]
-    assert len(function.args.args[1:-1]) == 19
+    assert len(function.args.args[1:-1]) == 20
+    assert [arg.arg for arg in function.args.args[11:15]] == [
+        "swa_counts",
+        "global_counts",
+        "main_scale",
+        "part_s",
+    ]
     assert function.args.args[-1].arg == "stream"
     assert "expanded_q" not in prims_ts._Plan.__dataclass_fields__
     assert not hasattr(prims_ts_fp8.Fp8SwaDecodeKernel, "_expand_query")
@@ -771,6 +1401,7 @@ def test_fp8_native_compiled_abi_and_both_source_queries_are_fp8(native):
         "empty_lengths",
         "swa_counts",
         "global_counts",
+        "main_scale",
         "part_s",
         "part_c",
         "lse_s",
@@ -780,9 +1411,54 @@ def test_fp8_native_compiled_abi_and_both_source_queries_are_fp8(native):
         "lse",
         "stream",
     ]
+    main_scale = next(
+        node.value
+        for node in compiled.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "main_scale"
+    )
+    assert ast.unparse(main_scale) == "f(cutlass.Float32, (batch,), assumed_align=16)"
     source = inspect.getsource(inspect.unwrap(prims_ts._compile))
-    assert "dsv41_unit_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v2" in source
+    assert "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3" in source
     assert "globalbk128" in source and "globalbk64" not in source
+    assert "requestscale_fp32src" in source
+
+    bindings = {
+        ast.unparse(node.targets[0]): [ast.unparse(item) for item in node.value.elts]
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) in ("direct_swa", "direct_global")
+    }
+    assert bindings["direct_swa"] == [
+        "selected_swa",
+        "selected_global",
+        "swa_lengths",
+        "empty_lengths",
+        "None",
+        "None",
+        "None",
+        "None",
+        "None",
+    ]
+    assert bindings["direct_global"] == [
+        "selected_global",
+        "selected_swa",
+        "global_lengths",
+        "empty_lengths",
+        "None",
+        "None",
+        "main_scale",
+        "None",
+        "None",
+    ]
+    for call in source_calls:
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        if ast.unparse(call.func) == "self.global_attention":
+            assert keywords == {
+                "source_state_store_args": "(part_c, global_counts)",
+                "kv_producer_runtime_args": "(main_scale,)",
+            }
+        else:
+            assert keywords == {"source_state_store_args": "(part_s, swa_counts)"}
 
 
 @pytest.mark.parametrize("compressed", (0, 64, 192, 512))
@@ -797,16 +1473,19 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
     assert plan.empty_lengths.dtype == torch.int32 and plan.empty_lengths.shape == (2,)
     assert adapter.compilations == [(None, compressed)]
     call = adapter.launches[-1]
-    assert len(call) == 19
+    assert len(call) == 20
     assert call[0].shape == (64, 512, 1, 2) and call[0].dtype == args[0].dtype
     assert call[0].data_ptr() == args[0].data_ptr()
     assert call[1].shape == (1, 512, 128) and call[1].stride() == (512, 1, 512)
     assert call[9] is plan.empty_lengths
     assert call[10] is plan.swa_counts and call[11] is plan.global_counts
-    assert call[12] is plan.part_s and call[14] is plan.lse_s
+    assert call[13] is plan.part_s and call[15] is plan.lse_s
     assert (
-        call[17].data_ptr() == out.data_ptr() and call[18].data_ptr() == lse.data_ptr()
+        call[18].data_ptr() == out.data_ptr() and call[19].data_ptr() == lse.data_ptr()
     )
+    assert call[17] is args[5]
+    assert call[12].dtype == torch.float32 and call[12].shape == (2,)
+    assert call[12].device == args[0].device and call[12].is_contiguous()
     assert not hasattr(plan, "expanded_q")
     assert [
         name
@@ -816,17 +1495,34 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
     assert plan.selected_global.shape == (2, max(64, compressed))
     if compressed:
         assert plan.part_c.dtype == torch.float32 and plan.lse_c.dtype == torch.float32
-        assert call[13] is plan.part_c and call[15] is plan.lse_c
+        assert plan.main_scale.dtype == torch.float32 and plan.main_scale.shape == (2,)
+        assert call[12] is plan.main_scale
+        assert call[14] is plan.part_c and call[16] is plan.lse_c
     else:
-        assert plan.part_c is None and plan.lse_c is None
-        assert call[13] is plan.part_s and call[15] is plan.lse_s
+        assert plan.part_c is None and plan.lse_c is None and plan.main_scale is None
+        assert call[14] is plan.part_s and call[16] is plan.lse_s
+        assert call[12].data_ptr() == plan.lse_s.data_ptr()
         assert call[2].data_ptr() == plan.empty_cache.data_ptr()
         assert call[4].data_ptr() == plan.empty_indices.data_ptr()
+    floating_owned = {
+        name
+        for name, value in vars(plan).items()
+        if getattr(value, "dtype", None) == torch.float32
+    }
+    assert floating_owned == (
+        {"lse", "main_scale", "part_s", "part_c", "lse_s", "lse_c"}
+        if compressed
+        else {"lse", "part_s", "lse_s"}
+    )
     replacement = tuple(None if x is None else x.clone() for x in args)
     replay = adapter.run(replacement, plan)
     assert replay[0] is out and replay[1] is lse and replay[2] is plan
     assert len(adapter.compilations) == 1 and len(adapter.launches) == 2
     assert adapter.launches[-1][0].data_ptr() == replacement[0].data_ptr()
+    if compressed:
+        assert adapter.launches[-1][12] is plan.main_scale
+    else:
+        assert adapter.launches[-1][12].data_ptr() == plan.lse_s.data_ptr()
 
 
 @pytest.mark.parametrize(
@@ -841,6 +1537,7 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
         "empty_lengths",
         "swa_counts",
         "global_counts",
+        "main_scale",
         "part_s",
         "part_c",
         "lse_s",
@@ -852,12 +1549,17 @@ def test_fp8_adapter_owned_shapes_and_window_aliases(adapter, compressed):
 def test_fp8_adapter_checks_every_owned_buffer_for_input_overlap(adapter, field):
     args = _host_case()
     _, _, plan = adapter.run(args)
+    # Preserve FP32[B] metadata so the scale case reaches the overlap guard,
+    # rather than passing merely because the earlier dtype check rejected Q.
+    overlap = args[5][: args[0].shape[0]] if field == "main_scale" else args[0]
     with pytest.raises(ValueError, match="overlap"):
-        adapter.run(args, replace(plan, **{field: args[0]}))
+        adapter.run(args, replace(plan, **{field: overlap}))
     assert len(adapter.launches) == 1
 
 
-@pytest.mark.parametrize("field", ("out", "lse", "part_s", "part_c", "lse_s", "lse_c"))
+@pytest.mark.parametrize(
+    "field", ("out", "lse", "main_scale", "part_s", "part_c", "lse_s", "lse_c")
+)
 def test_fp8_adapter_checks_floating_scratch_for_autograd(adapter, field):
     args = _host_case()
     _, _, plan = adapter.run(args)
@@ -867,18 +1569,57 @@ def test_fp8_adapter_checks_floating_scratch_for_autograd(adapter, field):
     assert len(adapter.launches) == 1
 
 
-def test_fp8_adapter_rejects_unprepared_capture_and_wrong_plans(adapter, monkeypatch):
-    args = _host_case()
+@pytest.mark.parametrize("compressed", (0, 64, 192, 512))
+def test_fp8_adapter_rejects_unprepared_capture_and_wrong_plans(
+    adapter, monkeypatch, compressed
+):
+    args = _host_case(compressed=compressed)
     _, _, plan = adapter.run(args)
     for bad in (object(), replace(plan, signature=("different_mode",))):
         with pytest.raises(ValueError, match="declaration mismatch"):
             adapter.run(args, bad)
     monkeypatch.setattr(adapter.torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepared capture must not allocate or compile")
+
+    monkeypatch.setattr(adapter.module, "_compile", forbidden)
+    for name in ("empty", "empty_like", "full"):
+        monkeypatch.setattr(adapter.torch, name, forbidden)
     with pytest.raises(ValueError, match="before CUDA Graph capture"):
         adapter.run(args)
     assert len(adapter.compilations) == 1 and len(adapter.launches) == 1
     adapter.run(args, plan)
     assert len(adapter.compilations) == 1 and len(adapter.launches) == 2
+
+
+@pytest.mark.parametrize(
+    "bad", ("missing", "object", "dtype", "rank", "batch", "strided", "device")
+)
+def test_fp8_adapter_rejects_invalid_owned_request_scale_metadata(adapter, bad):
+    torch = adapter.torch
+    args = _host_case()
+    _, _, plan = adapter.run(args)
+    if bad == "missing":
+        scale = None
+    elif bad == "object":
+        scale = object()
+    elif bad == "dtype":
+        scale = torch.empty(2, dtype=torch.bfloat16)
+    elif bad == "rank":
+        scale = torch.empty(2, 1, dtype=torch.float32)
+    elif bad == "batch":
+        scale = torch.empty(3, dtype=torch.float32)
+    elif bad == "strided":
+        scale = torch.empty(4, dtype=torch.float32)[::2]
+        assert scale.shape == (2,) and not scale.is_contiguous()
+    else:
+        # A meta tensor supplies a genuinely different device without touching
+        # CUDA; metadata must be rejected before overlap/data-pointer checks.
+        scale = torch.empty(2, device="meta", dtype=torch.float32)
+    with pytest.raises(ValueError, match="contiguous same-device FP32"):
+        adapter.run(args, replace(plan, main_scale=scale))
+    assert len(adapter.compilations) == len(adapter.launches) == 1
 
 
 class _MetadataTensor:
@@ -1036,6 +1777,197 @@ def test_fp8_shared_validator_rejects_bad_declarations(native, monkeypatch, bad)
         _validate_inputs(*args, allow_fp8_swa=True)
 
 
+def _f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _e4m3_value(byte):
+    magnitude = byte & 0x7F
+    if magnitude == 0x7F:
+        return math.nan
+    exponent, mantissa = magnitude >> 3, magnitude & 7
+    value = (
+        math.ldexp(float(mantissa), -9)
+        if exponent == 0
+        else math.ldexp(1.0 + mantissa / 8, exponent - 7)
+    )
+    return -value if byte & 0x80 else value
+
+
+def _e4m3_byte(value):
+    """Independent finite E4M3 RTNE/satfinite, including signed zero."""
+    assert not math.isnan(value)
+    sign = 0x80 if math.copysign(1.0, value) < 0 else 0
+    magnitude = min(abs(value), 448.0)
+    if magnitude < 2**-6:
+        code = round(math.ldexp(magnitude, 9))
+    else:
+        exponent = math.frexp(magnitude)[1] - 1
+        code = round(math.ldexp(magnitude, 3 - exponent)) + (exponent + 6) * 8
+    return sign | code
+
+
+def _fp4_pages(rows, page_count=2):
+    """Build page planes independently; untouched rows deliberately contain NaNs."""
+    pages = [bytearray([0xFF]) * (64 * 288) for _ in range(page_count)]
+    for slot, codes, scales in rows:
+        assert len(codes) == 512 and len(scales) == 32
+        page, token = pages[slot // 64], slot % 64
+        page[token * 256 : (token + 1) * 256] = bytes(
+            codes[dim] | (codes[dim + 1] << 4) for dim in range(0, 512, 2)
+        )
+        start = 64 * 256 + token * 32
+        page[start : start + 32] = bytes(scales)
+    return tuple(bytes(page) for page in pages)
+
+
+def _selected_main_reference(pages, selections):
+    """Stdlib-only selected-value reference, with explicit binary32 division.
+
+    Decode only live selected rows, all 512 components and original signed
+    group16 E4M3 scales. Invalid addresses never inspect poisoned page bytes.
+    No production conversion, Torch cast, reciprocal or BF16 scratch is used.
+    """
+    fp4 = (
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    )
+    result = []
+    for indices in selections:
+        valid = tuple(
+            0 <= slot < len(pages) * 64 and slot != 0x7FFFFFFF for slot in indices
+        )
+        rows = []
+        for slot, keep in zip(indices, valid, strict=True):
+            if not keep:
+                rows.append((0.0,) * 512)
+                continue
+            page, token = pages[slot // 64], slot % 64
+            row = []
+            for dim in range(512):
+                byte = page[token * 256 + dim // 2]
+                code = (byte >> (4 * (dim % 2))) & 15
+                scale = _e4m3_value(page[64 * 256 + token * 32 + dim // 16])
+                row.append(fp4[code] * scale)
+            rows.append(tuple(row))
+        amax = max((abs(value) for row in rows for value in row), default=0.0)
+        scale = _f32(amax / 448.0) if amax > 0 else 1.0
+        staged = tuple(
+            bytes(_e4m3_byte(_f32(value / scale)) for value in row) for row in rows
+        )
+        represented = tuple(
+            tuple(_e4m3_value(byte) * scale for byte in row) for row in staged
+        )
+        result.append(
+            SimpleNamespace(
+                amax=amax,
+                scale=scale,
+                valid=valid,
+                staged=staged,
+                represented=represented,
+                selected=tuple(
+                    slot if keep else -1
+                    for slot, keep in zip(indices, valid, strict=True)
+                ),
+            )
+        )
+    return result
+
+
+def _check_selected_main_reference(native, pages, selections):
+    import torch
+    from .test_deepseek_v41_decode import fp8_main_reference
+
+    expected = _selected_main_reference(pages, selections)
+    pool = torch.tensor([list(page) for page in pages], dtype=torch.uint8).view(
+        len(pages), 64, 1, 288
+    )
+    ids = torch.tensor(selections, dtype=torch.int32)[:, None]
+    staged, scale, valid = fp8_main_reference(pool, ids)
+    assert staged.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.float32 and scale.shape == (len(selections),)
+    assert scale.tolist() == [request.scale for request in expected]
+    assert staged.view(torch.uint8).tolist() == [
+        [list(row) for row in request.staged] for request in expected
+    ]
+    assert valid.tolist() == [list(request.valid) for request in expected]
+    assert valid.sum(-1).tolist() == [sum(request.valid) for request in expected]
+    represented = staged.double() * scale.double()[:, None, None]
+    assert represented.tolist() == [
+        [list(row) for row in request.represented] for request in expected
+    ]
+    return expected
+
+
+@pytest.mark.parametrize("sign", (0, 0x80))
+def test_stdlib_e4m3_reference_roundtrips_all_finite_codes_and_signed_zero(sign):
+    for magnitude in range(0x7F):
+        code = sign | magnitude
+        assert _e4m3_byte(_e4m3_value(code)) == code
+    assert math.copysign(1.0, _e4m3_value(sign)) == (-1.0 if sign else 1.0)
+    assert _e4m3_byte(-math.inf if sign else math.inf) == sign | 0x7E
+
+
+def test_fp8_main_reference_selected_amax_fp32_division_signed_scales_and_replay(
+    native,
+):
+    codes = [0] * 512
+    codes[0], codes[511] = 5, 5
+    # Large-scale all-zero groups must contribute zero, not 6 * 448. Only the
+    # final component sets amax=9; the first component is the division witness.
+    scales = [0x7E] * 32
+    scales[0], scales[-1] = _e4m3_byte(1.125), _e4m3_byte(3.0)
+    pages = _fp4_pages(
+        (
+            (0, codes, scales),
+            (1, [7] * 512, [0x7E] * 32),  # finite but unselected amax=2688
+            (63, [2] * 512, [_e4m3_byte(-2.0)] * 32),
+            (64, [0, 8] * 256, [0xFE] * 32),
+        )
+    )
+    indices = [
+        [0, 63, 63, -1, 128, 0x7FFFFFFF, -17],
+        [64, 64, -1, 128, 0x7FFFFFFF, -17, -1],
+        [-1, 128, 0x7FFFFFFF, -17, -1, -1, -1],
+    ]
+    first, zero, empty = _check_selected_main_reference(native, pages, indices)
+    assert first.amax == 9.0 and first.scale == _f32(9.0 / 448.0)
+    assert first.valid == (True, True, True, False, False, False, False)
+    assert first.selected == (0, 63, 63, -1, -1, -1, -1)
+    assert first.staged[1] == first.staged[2]
+    assert first.staged[0][511] == 0x7E
+    assert _f32(3.375 / first.scale) == 168.0
+    assert first.staged[0][0] == 0x72  # RTNE(168) = 160, not 176
+    assert _e4m3_byte(3.375 / first.scale) == 0x73  # wrong FP64 normalization
+    assert first.represented[0][0] == 160.0 * first.scale
+    assert zero.amax == empty.amax == 0.0 and zero.scale == empty.scale == 1.0
+    assert sum(zero.valid) == 2 and sum(empty.valid) == 0
+    assert zero.staged[0][:2] == bytes((0x80, 0x00))
+    assert math.copysign(1.0, zero.represented[0][0]) == -1.0
+    assert all(row == bytes(512) for row in empty.staged)
+
+    changed = [list(row) for row in indices]
+    changed[0][0] = 1
+    replay = _check_selected_main_reference(native, pages, changed)
+    assert replay[0].amax == 2688.0 and replay[0].scale == 6.0
+    assert replay[0].valid == first.valid
+    assert replay[1].scale == replay[2].scale == 1.0
+
+
 def test_fp8_oracle_independent_page_planes_duplicates_and_bound(native):
     import math
     import torch
@@ -1053,12 +1985,16 @@ def test_fp8_oracle_independent_page_planes_duplicates_and_bound(native):
     wi[..., :5] = torch.tensor([0, 0, -1, 128, 0x7FFFFFFF], dtype=torch.int32)
     ci[..., :6] = torch.tensor([0, 64, 64, -1, 128, 0x7FFFFFFF], dtype=torch.int32)
     expected, lse, bound = fp8_oracle(q, swa, main, wi, ci, sink)
+    # Selected main amax is 4. The normalized 1.5 is exactly the RTNE tie
+    # 168 -> 160 after FP32 division; +/-4 stage at +/-448. SWA stays unit FP8.
+    descale = _f32(4.0 / 448.0)
+    small, large = 160.0 * descale, 448.0 * descale
     answer = torch.empty(1, 64, 512, dtype=torch.float64)
-    answer[..., ::2] = (2 * 0.3125 + 1.5 - 4 - 4) / 5
-    answer[..., 1::2] = (2 * 0.3125 + 4) / 5
+    answer[..., ::2] = (2 * 0.3125 + small - large - large) / 5
+    answer[..., 1::2] = (2 * 0.3125 + large) / 5
     sensitivity = torch.empty_like(answer)
-    sensitivity[..., ::2] = (2 * 0.3125 + 1.5 + 4 + 4) / 5
-    sensitivity[..., 1::2] = (2 * 0.3125 + 4) / 5
+    sensitivity[..., ::2] = (2 * 0.3125 + small + large + large) / 5
+    sensitivity[..., 1::2] = (2 * 0.3125 + large) / 5
     analytic_bound = ((2**-4 + 3 * 2**-8 + 1e-5) + 2**-10 / 448) * sensitivity + 1e-6
     torch.testing.assert_close(expected, answer, rtol=0, atol=1e-14)
     torch.testing.assert_close(
@@ -1076,44 +2012,58 @@ def test_fp8_oracle_independent_page_planes_duplicates_and_bound(native):
 
 
 @pytest.mark.parametrize(
-    "code,scale,represented",
+    "code,scale,anchor_code,anchor_scale,staged_code,anchor_staged",
     (
-        (3, 1.125, 1.75),
-        (11, 1.125, -1.75),
-        (7, 448.0, 448.0),
-        (15, 448.0, -448.0),
-        (1, 2**-9, 0.0),
-        (9, 2**-9, -0.0),
-        (1, 3 * 2**-9, 2**-8),
+        (3, 1.125, 2, 1.0, 0x7E, 0x78),
+        (11, 1.125, 2, 1.0, 0xFE, 0x78),
+        (7, 448.0, 2, 1.0, 0x7E, 0x23),
+        (15, 448.0, 2, 1.0, 0xFE, 0x23),
+        (1, 2**-9, 7, 448.0, 0x00, 0x7E),
+        (9, 2**-9, 7, 448.0, 0x80, 0x7E),
+        (1, 3 * 2**-7, 7, 448.0, 0x01, 0x7E),
+        (9, 3 * 2**-7, 7, 448.0, 0x81, 0x7E),
+        (1, 3 * 2**-9, 2, 1.0, 0x3A, 0x7E),
+        (0, -448.0, 7, 448.0, 0x80, 0x7E),
+        (8, -448.0, 7, 448.0, 0x00, 0x7E),
+        (1, 2**-9, 1, 2**-9, 0x7E, 0x7E),
     ),
 )
 def test_fp8_oracle_converts_main_before_both_logits_and_values(
-    native, code, scale, represented
+    native, code, scale, anchor_code, anchor_scale, staged_code, anchor_staged
 ):
-    import math
     import torch
     from .test_deepseek_v41_decode import fp8_oracle
 
     q, swa, main, wi, ci, sink = _host_case(batch=1)
     q.view(torch.uint8)[..., 0] = torch.tensor(0.5).to(q.dtype).view(torch.uint8)
     pages = main.view(2, -1)
+    pages.fill_(255)
     pages[0, :256].fill_(code | (code << 4))
-    scale_byte = torch.tensor(scale).to(q.dtype).view(torch.uint8).item()
-    pages[0, 64 * 256 : 64 * 256 + 32].fill_(scale_byte)
-    pages[1, :256].fill_(0x22)
-    pages[1, 64 * 256 : 64 * 256 + 32].fill_(0x38)
+    pages[0, 64 * 256 : 64 * 256 + 32].fill_(_e4m3_byte(scale))
+    pages[1, :256].fill_(anchor_code | (anchor_code << 4))
+    pages[1, 64 * 256 : 64 * 256 + 32].fill_(_e4m3_byte(anchor_scale))
     ci[..., :2] = torch.tensor([0, 64], dtype=torch.int32)
     sink.fill_(0.125)
+    reference = _check_selected_main_reference(
+        native, tuple(bytes(row) for row in pages.tolist()), [[0, 64]]
+    )[0]
+    assert reference.staged[0] == bytes([staged_code]) * 512
+    assert reference.staged[1] == bytes([anchor_staged]) * 512
+    represented = _e4m3_value(staged_code) * reference.scale
+    anchor = _e4m3_value(anchor_staged) * reference.scale
+    if abs(code) in (7, 15) and scale == 448.0:
+        assert reference.scale == 6.0 and abs(represented) == 2688.0
+        assert anchor == 1.03125  # s=6, raw 1 -> FP8(1/6) * 6
     expected, lse, bound = fp8_oracle(q, swa, main, wi, ci, sink)
     logits = torch.tensor(
-        [0.5 * represented / math.sqrt(512), 0.5 / math.sqrt(512), 0.125],
+        [0.5 * represented / math.sqrt(512), 0.5 * anchor / math.sqrt(512), 0.125],
         dtype=torch.float64,
     )
     weights = logits.softmax(0)[:2]
-    answer = weights[0] * represented + weights[1]
-    sensitivity = weights[0] * abs(represented) + weights[1]
+    answer = weights[0] * represented + weights[1] * anchor
+    sensitivity = weights[0] * abs(represented) + weights[1] * abs(anchor)
     underflow = torch.exp(logits[:2].max() - logits.logsumexp(0)) * (
-        abs(represented) + 1
+        abs(represented) + abs(anchor)
     )
     analytic_bound = (
         (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity + (2**-10 / 448) * underflow + 1e-6

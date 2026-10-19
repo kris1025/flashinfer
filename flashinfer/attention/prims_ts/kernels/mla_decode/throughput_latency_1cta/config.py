@@ -174,6 +174,7 @@ class MlaConfig:
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
     sparse_static_scales: bool = False
+    sparse_request_kv_scale: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
@@ -1755,6 +1756,7 @@ def configure_sparse_mla(
     finalize_output=False,
     direct_inputs=False,
     static_scales=False,
+    request_kv_scale=False,
     source_capacities=(0, 0),
     source_state_store=False,
 ) -> MlaConfig:
@@ -1822,6 +1824,15 @@ def configure_sparse_mla(
         raise ValueError("fused output requires one logical query per virtual request")
     if source_state_store and finalize_output:
         raise ValueError("FP32 source states cannot finalize output")
+    if request_kv_scale and (
+        not static_scales
+        or not direct_inputs
+        or not source_state_store
+        or cfg.qkv_dtype != "e4m3"
+    ):
+        raise ValueError(
+            "request KV scales require static-base-scale direct E4M3 source states"
+        )
     if direct_inputs and (
         not (finalize_output or source_state_store)
         or cfg.qkv_dtype not in ("bf16", "e4m3")
@@ -1838,6 +1849,7 @@ def configure_sparse_mla(
         defer_sparse_max_update=profile.defer_max_update,
         sparse_direct=direct_inputs,
         sparse_static_scales=static_scales,
+        sparse_request_kv_scale=request_kv_scale,
         sparse_direct_capacities=source_capacities if direct_inputs else (0, 0),
         fuse_sparse_epilogue=direct_finish,
         fuse_sparse_cluster_epilogue=cluster_finish,

@@ -70,11 +70,13 @@ def _make_fp8_sources(compressed_k, sm_count, native_fp4):
             source_state_store=Fp32SourceStore(),
         )
         attention.direct_static_scales = True
+        attention.direct_request_kv_scale = producer is not None
         attention.direct_sparse_capacities = (capacity, 0)
         return attention
 
     # Both sources use native FP8 BK128 with four D128 stages per tile.
-    # The main producer rounds selected scaled FP4 tiles into E4M3 SMEM.
+    # Main normalizes selected FP4 tiles by a live per-request descale before
+    # E4M3 staging; the same descale restores its QK and normalized O units.
     swa = source("dsv41_fp8_swa_source", 128)
     main = (
         source(
@@ -106,6 +108,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
 
     from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import kernel
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ...cute_dsl import fp4_common
     from . import hca_v41_primitives, prims_ts_fp8, prims_ts_resources
 
     sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -161,12 +164,13 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     ci, selected_global = indices(max(64, compressed_k)), indices(max(64, compressed_k))
     swa_lengths, global_lengths, empty_lengths = lengths(), lengths(), lengths()
     swa_counts, global_counts = lengths(), lengths()
+    main_scale = f(cutlass.Float32, (batch,), assumed_align=16)
     part_s, part_c = source_out(), source_out()
     lse_s, lse_c, lse = source_lse(), source_lse(), source_lse()
     sink = f(cutlass.Float32, (64,), assumed_align=16)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     signature = (
-        "dsv41_unit_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v2",
+        "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3",
         swa_attention.compile_signature(),
         global_attention.compile_signature() if global_attention is not None else None,
         "source_o_fp32",
@@ -180,7 +184,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
         f"h64_d512_swa128_c{compressed_k}_keep_bk128_globalbk128_kv8_split1_i64"
-        f"_fp4e4m3_fp32src_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
+        f"_fp4e4m3_requestscale_fp32src_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
             decode_kernel,
             q,
@@ -195,6 +199,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
             empty_lengths,
             swa_counts,
             global_counts,
+            main_scale,
             part_s,
             part_c,
             lse_s,
@@ -210,6 +215,7 @@ def _compile(device_index, compressed_k, *, native_fp4=None):
             prims_ts_fp8.__file__,
             prims_ts_resources.__file__,
             hca_v41_primitives.__file__,
+            fp4_common.__file__,
             *sorted(native_root.rglob("*.py")),
         ),
     )
@@ -264,6 +270,7 @@ class _Plan:
     empty_lengths: torch.Tensor
     swa_counts: torch.Tensor
     global_counts: torch.Tensor
+    main_scale: object
     part_s: torch.Tensor
     part_c: object
     lse_s: torch.Tensor
@@ -307,6 +314,7 @@ def _decode_fp8(
                 empty_lengths=allocate((batch,), torch.int32),
                 swa_counts=allocate((batch,), torch.int32),
                 global_counts=allocate((batch,), torch.int32),
+                main_scale=allocate((batch,), torch.float32) if ck else None,
                 part_s=allocate((batch, 64, 512), torch.float32),
                 part_c=allocate((batch, 64, 512), torch.float32) if ck else None,
                 lse_s=allocate((batch, 64), torch.float32),
@@ -315,6 +323,16 @@ def _decode_fp8(
                 empty_indices=torch.full(
                     (batch, 64), -1, device=q.device, dtype=torch.int32
                 ),
+            )
+        if ck and (
+            not isinstance(plan.main_scale, torch.Tensor)
+            or plan.main_scale.dtype != torch.float32
+            or plan.main_scale.device != q.device
+            or plan.main_scale.shape != (batch,)
+            or not plan.main_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "main request scales must be contiguous same-device FP32[B]"
             )
         owned = tuple(
             x
@@ -328,6 +346,7 @@ def _decode_fp8(
                 plan.empty_lengths,
                 plan.swa_counts,
                 plan.global_counts,
+                plan.main_scale,
                 plan.part_s,
                 plan.part_c,
                 plan.lse_s,
@@ -348,6 +367,9 @@ def _decode_fp8(
         # consume the original FP8 Q; only public O is rounded to BF16.
         part_c = plan.part_s if plan.part_c is None else plan.part_c
         lse_c = plan.lse_s if plan.lse_c is None else plan.lse_c
+        main_scale = (
+            plan.lse_s.view(-1)[:batch] if plan.main_scale is None else plan.main_scale
+        )
         plan.kernel(
             q.permute(2, 3, 1, 0),
             swa_cache.view(-1, 1, 512).permute(1, 2, 0),
@@ -361,6 +383,7 @@ def _decode_fp8(
             plan.empty_lengths,
             plan.swa_counts,
             plan.global_counts,
+            main_scale,
             plan.part_s,
             part_c,
             plan.lse_s,

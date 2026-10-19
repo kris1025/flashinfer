@@ -16,13 +16,17 @@ The native-FP8 implementation was the first commit in the source reorganization;
 optional Prims-TS MXFP8 compatibility was a separate follow-up. Native E4M3 Q/SWA
 remains the primary adapter and the Prims-TS example/benchmark default. Explicit
 BF16 Q with uint8 MXFP8 SWA selects the compatibility extension through a lazy
-import, without a public decode-format argument. The current native-only change
-also uses E4M3 for main-cache attention while retaining packed FP4 storage.
-The current FP8-main snapshot passed the full **271-case** GPU matrix and selected
-**57-case** dense subset on an allocated B200 / DSL 4.8.0 / bundled compiler 13.4
-(job `5049128`; see below). The historical 257-case GPU and 299-case CPU results
-predate this change and do not qualify it. Examples and benchmarks have not run;
-no performance or checkpoint/full-model qualification is claimed.
+import, without a public decode-format argument. Native main-cache attention uses
+E4M3 while retaining packed FP4 storage. The current change computes a new FP8
+descale from each request's actual selected main values, normalizes before FP8
+packing, and restores that scale in both QK and V/output. **The request-scaled
+snapshot passed the full 271-case GPU matrix and selected 57-case dense subset**
+on B200 / DSL 4.8.0 / bundled compiler 13.4 (job `5103699`; see current validation
+below). Qualification is limited to that tested snapshot and selected subset.
+The earlier unit-scale FP8-main results (job `5049128`) are historical, not evidence
+for request scaling; older 257-case GPU and 299-case CPU results additionally
+predate FP8 main attention. Examples and benchmarks have not run; no performance
+or checkpoint/full-model qualification is claimed.
 
 ## Native E4M3 attention
 
@@ -43,21 +47,42 @@ Both source passes use fixed
 Keep-AB/M64/BK128/D128/retained8/V1/split1/nonpersistent execution and E4M3
 Q/K/V/P. SWA uses native TMA, with no custom packed producer or BF16
 SWA dequantization. Optional main/global storage remains packed E2M1 plus group16
-E4M3 scales in the width-288 page-plane ABI. On selected main tiles only, the
-producer applies the scales, then converts to unit E4M3 using round-to-nearest-even
-and finite saturation to `[-448,448]`, preserving signed zero, subnormals and
-halfway-even behavior. The conversion is **lossy**: finite FP4-times-scale values
-can reach ±2688. The resulting FP8 shared-memory tiles feed both QK and PV with
-the original FP8 Q; there is no BF16 query expansion, BF16 query scratch or full
-converted cache in either mixed or window-only native mode. For example,
-`1.5 * 1.125 = 1.6875` rounds to `1.75`, `6 * 448 = 2688` saturates to `448`,
-and `±0.5 * 2^-9 = ±2^-10` rounds to signed zero.
+E4M3 scales in the width-288 page-plane ABI. Preparation reads only valid selected
+main slots and computes one exact amax over their decoded D512 values per request:
+
+```text
+x = E2M1(code) * E4M3(group_scale)
+amax[b] = max(abs(x)) over valid selected main values
+s[b] = div.rn.f32(amax[b], 448.0f) if amax[b] > 0 else 1.0f
+staged = E4M3_RN_SATFINITE(div.rn.f32(Float32(x), s[b]))
+represented main KV = staged * s[b]
+```
+
+The scale uses actual payload, not `max(abs(group_scale)) * 6`; invalid or
+unselected slots never contribute. Finite negative group scales are supported,
+as are signed zero and subnormals. Positive descales below 1 are not clamped to
+1. Valid all-zero rows remain attention positions, while zero/empty reductions
+use scale 1. Duplicates keep their attention multiplicity without changing amax.
+Both divisions explicitly round in FP32; an FP64 quotient or reciprocal-then-
+multiply can give different FP8 bytes at ties and is not the conversion contract.
+
+The producer packs only selected tiles into FP8 shared memory. The same descale
+restores K in the main softmax factor and V in normalized FP32 source O, exactly
+once. For example, a selected value `6 * 448 = 2688` sets `s=6`, so it stages as
+448 and represents 2688 rather than being clipped to 448. A raw component 1 in
+that request represents `E4M3(1/6) * 6 = 1.03125`; conversion is still **lossy**.
+The tiles feed both QK and PV with the original FP8 Q; neither native mode
+allocates BF16 query expansion/scratch or a full converted cache. Mixed mode adds
+only FP32 `[B]` main descales. Computing amax adds one selected-main read; no
+latency or throughput benefit has been measured.
 
 Both passes export sink-free normalized FP32 source O and log2 LSE, then a joint
 merge applies the sink once and rounds only final O to BF16. Returned FP32 LSE
 remains natural-log and excludes sinks. Window-only additionally omits global
-attention and global source states. Each call/replay refreshes selections, fixed
-execution lengths and true valid counts. Plans cannot cross modes or backends.
+attention, global source states, main-scale storage and main amax work. Each
+call/replay refreshes selections, fixed execution lengths, true valid counts and
+mixed-mode main descales, including transitions to zero/empty selections. Plans
+cannot cross modes or backends.
 
 Optional BF16-Q/MXFP8-SWA compatibility lives in `prims_ts_mxfp8.py`, with its
 own compiler, plan class and `deepseek_v41_prims_ts_mxfp8` JIT namespace. Its
@@ -70,9 +95,11 @@ the unchanged BF16 `Fp4KvProducer` / `Fp4SmemKvResource` in
 `Fp4Fp8KvProducer` / `Fp4Fp8SmemKvResource` in that same file. Native FP8 calls
 never import the compatibility extension.
 
-The independent native FP64 oracle uses actual stored E4M3 Q/SWA and selected
-main rows decoded with their E4M3 scales, then finite-clamped/RTNE to unit E4M3
-**before both logits and V**. Main-only, mixed and window-only native outputs all
+The independent native oracle uses actual stored E4M3 Q/SWA, masks/gathers main
+payload and scale bytes before decoding, computes request amax/448 and x/s with
+FP32 division, then reconstructs `double(E4M3(x/s)) * double(s)`
+**before both logits and V** in FP64 attention. Sensitivity and underflow use
+those same reconstructed values. Main-only, mixed and window-only native outputs all
 use the existing per-component FP8 probability-rounding bound:
 
 ```text
@@ -123,9 +150,117 @@ target; those calls are blocked, not allowed through. Use DSL 4.8 for clean stri
 host acceptance. An uninitialized Torch flag alone does not prove raw-driver
 isolation.
 
-### FP8-main CPU/static acceptance (2026-10-16)
+### Request-scaled FP8-main GPU validation (2026-10-18)
 
-The current native FP8-main change passed **321 CPU cases**: 146 guarded
+The request-selected amax, FP8 normalization and K/V scale restoration passed on
+one allocated **NVIDIA B200 / 148 SMs** in `umb-b200-237` (job `5103699`), using
+Python 3.12.3 / Torch 2.11.0+cu128 / CuTe-DSL 4.8.0 / bundled compiler 13.4.
+This is a fresh request-scaled run, not reuse of the historical unit-scale results.
+
+| Phase | Passed | Pytest duration | Warnings |
+|---|---:|---:|---:|
+| Isolated legacy capture | 1/1 | 4.31 s | 35 |
+| Smoke | 32/32 | 982.97 s | 187 |
+| Full `--full` matrix | 271/271 | 3324.13 s | 1641 |
+| Independent selected dense subset | 57/57 | 1213.53 s | 980 |
+
+There were **zero failures, errors or skips**. Full coverage was **157 decode /
+48 cache / 66 native sparse MLA** cases. Actual allocated collection matched the
+exact ordered candidate manifests: full271, smoke32 and dense57, preserving all
+207 original logical cases as 211 mode-expanded legacy identities. The smoke
+and isolated capture cases overlap the full matrix; these phase counts are not
+counts of distinct tests to add together. Full and dense ran without fail-fast;
+only smoke used `-x`.
+
+Both real-stage FP4-to-FP8 conversion branches passed all finite E2M1 codes and
+finite E4M3 scales, including distinct per-request descales, signed zero,
+page-plane addressing, retained stages, SW128 stores and guards. Both analytic
+changed-data graph cases passed payload-dependent amax, late maxima, FP32 division
+ties, below-one scales, independent K/V restoration and zero/empty transitions.
+Changed-data replay covered every global width `0/64/.../512`. Writer/decode
+integration passed, including native widths 0/128/192/512 and changed scale bytes.
+Existing source-state precision, sink-once, empty/poison, large-offset, legacy
+Frost and optional BF16-Q/MXFP8 regressions also passed under unchanged references
+and numerical gates.
+
+Every Python/timeout, tee, effective phase and job-wrapper exit was 0; Slurm
+root/batch/extern completed with `0:0`. The independent report has
+`default_gpu_qualification=true`, `fresh_arithmetic_results_only=true` and no
+evidence errors. Exact ordered collected and JUnit identities and complete passing
+setup/call/teardown triplets matched each phase manifest. All **6568 frozen
+fingerprints**, Git state and scheduler-assigned visibility matched through final
+postflight and independent terminal corroboration, before validation-note edits.
+Default Python GC remained enabled with thresholds `[700,10,10]` and
+`force_cudagraph_gc=False`; no GC/capture override manufactured these passes.
+The allocation used fresh per-run JIT/cache roots and left installed packages
+unchanged. The root allocation used **1h36m07s** (5767 GPU-seconds), within the
+fresh assistant-imposed three-GPU-hour cap; batch/extern time is not added again.
+
+Evidence is preserved in
+`/home/scratch.linquanh_gpu/tmp/dsv41-request-scaled-fp8-b200.PDBIjWZb/`:
+`independent-audit.json`, `terminal-receipt.json`, `freeze.json`,
+`frozen-source.patch`, `collection-summary.json`, phase `*-results.json`,
+`*.xml`, `*.log` and shell-exit records. The new ledger is `budget/budget.json`
+in that directory; historical evidence and budget ledgers were not reused.
+The exact tested patch is preserved against baseline `b41c42724`. Subsequent
+validation-note edits touch only three Markdown files and the public API validation
+docstring, not function bodies, tests, references or numerical gates; see
+`documentation-baseline.json` and `documentation-postflight.json` for the separate
+documentation-only drift record.
+
+These results qualify only this frozen request-scaled B200/4.8/13.4 snapshot and
+selected dense subset, **not the entire dense suite, other hardware/toolchains or
+checkpoint/full-model behavior**. Examples and benchmarks have not run; no
+performance or measured crossover is claimed. Pytest durations above are
+validation runtime, not GPU kernel-latency measurements.
+
+### Request-scaled FP8-main CPU/static acceptance (2026-10-18)
+
+The request-selected scale implementation passed **413/413 CPU cases**:
+
+| Suite | Passed |
+|---|---:|
+| Source-state/resource/adapter/independent-oracle contracts | 219 |
+| Optional BF16-Q/MXFP8 isolation and legacy-factory contracts | 41 |
+| Conversion-module lifetime contracts | 7 |
+| Benchmark/example defaults and extracted reference contracts | 100 |
+| Existing native host contracts | 40 |
+| Unknown-backend rejections | 6 |
+
+The fresh process used Python 3.12.3 / Torch 2.11.0+cu128 with the existing DSL
+4.8.0 overlay and bundled compiler metadata 13.4, `-I -B -S`, explicit package
+paths, thread caps of one, static `sm_100`, and disabled plugin autoload/JIT.
+Pytest and strict aggregate exited 0, with no failures, errors, skips or
+intercepted CUDA/JIT calls. Torch CUDA remained uninitialized; CUDA visibility
+and default GC state were unchanged. This matrix imports Torch/CuTe under guards,
+not in an accelerator-import-free process.
+
+Independent stdlib-only postflight matched the exact collected 413-case manifest,
+ordered JUnit identities, all passing setup/call/teardown reports, all **158**
+source/runner/selector/manifest fingerprints, Git state and visibility, before
+these validation-note edits. It also checked the complete interpreter/pytest
+commands and the literal ini `--import-mode=importlib` prepend. The exact tested
+patch is preserved against baseline `b41c42724`; later validation-note edits do
+not change function bodies, references or numerical gates. Records are in
+`/home/scratch.linquanh_gpu/tmp/dsv41-request-scaled-fp8-cpu.lOlVJCk7/`:
+`collect48.{json,log}`, `acceptance48.{json,xml,log}`, `manifest.json`,
+`postflight.json`, `static-checks.json` and `frozen-source.patch`.
+
+All 13 changed Python files passed focused Ruff formatting/lint without an F811
+exception, in-memory syntax compilation and whitespace checks. A separate
+**28-check** static pass preserved public API bodies, BF16 resources, legacy
+writers/adapters, source-store/merge arithmetic and numerical gates, and checked
+FP32-division/FP8-rounding witnesses without accelerator imports. The new host
+contracts cover shared per-request scale bindings, topology/ownership guards,
+legacy scalar paths, selected-only amax, signed zero, zero/empty transitions and
+independent represented-value references. These results qualify CPU/static
+configuration/plumbing/reference contracts only, **not CuTe lowering, GPU numerical
+accuracy/graph replay, examples or performance**. The separate allocated GPU
+qualification is recorded above. Examples and benchmarks remain unrun.
+
+### Historical unit-scale FP8-main CPU/static acceptance (2026-10-16)
+
+The earlier unit-scale FP8-main snapshot passed **321 CPU cases**: 146 guarded
 source-state/resource/adapter/oracle contracts, 37 optional-MXFP8 contracts,
 7 conversion-lifetime checks, 85 benchmark/example-default contracts, 40 existing
 native host contracts and 6 unknown-backend rejections. This includes independent
@@ -154,9 +289,10 @@ exception), in-memory Python syntax compilation and whitespace checks passed.
 These qualify host configuration/plumbing/reference and static contracts only,
 not CuTe lowering, GPU numerical accuracy/graph replay, examples or performance.
 
-### FP8-main GPU validation (2026-10-16)
+### Historical unit-scale FP8-main GPU validation (2026-10-16)
 
-The corrected FP8-main snapshot passed on one allocated **NVIDIA B200 / 148 SMs**
+These results predate request-selected scale computation and restoration and do
+not qualify either. The corrected unit-scale snapshot passed on one allocated **NVIDIA B200 / 148 SMs**
 in `umb-b200-263` (job `5049128`), using Python 3.12.3 / Torch 2.11.0+cu128 /
 CuTe-DSL 4.8.0 / bundled compiler 13.4:
 
@@ -193,9 +329,10 @@ Evidence is preserved in
 `independent-audit.json`, `terminal-corroboration.json`, `freeze.json`, phase
 `*-results.json`, `*.xml`, `*.log` and shell-exit records. The budget ledger is
 `/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-gpu-budget.3mr2xwkh/budget.json`.
-These results qualify only this frozen B200/4.8/13.4 FP8-main snapshot and the
-selected dense subset, not the entire dense suite, other GPU/toolchain
-combinations or checkpoint/full-model behavior. Examples and benchmarks have not
+These results qualify only that frozen B200/4.8/13.4 unit-scale FP8-main snapshot
+and the selected dense subset, not request-scaled conversion/restoration, the
+entire dense suite, other GPU/toolchain combinations or checkpoint/full-model
+behavior. Examples and benchmarks have not
 run; pytest durations above are validation runtime, not kernel-latency or
 performance measurements.
 
@@ -226,28 +363,34 @@ wrappers rejected pytest's default `maxfail=None` and an obsolete 266-case
 forecast, respectively. Their records remain in
 `/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200.CeS4DyWZ/` and
 `/home/scratch.linquanh_gpu/tmp/dsv41-fp4-fp8-b200-retry.sqz58o3d/`.
-The current manifest comes from real allocated collection; four historical
-plan-isolation IDs explicitly expand to both `fp8` and `mxfp8`, preserving all
+That historical manifest came from real allocated collection; four original
+plan-isolation IDs explicitly expanded to both `fp8` and `mxfp8`, preserving all
 207 original logical cases as 211 mode-expanded identities.
+
+### Request-scaled GPU probes
 
 On an explicitly allocated SM100/B200 with DSL >= 4.8 and its bundled CUDA 13
 compiler, start with the real-stage byte/conversion probe, analytic main-only
-rounding/saturation/underflow replay, and all-width changed-data replay:
+scale/rounding/underflow replay, and all-width changed-data replay:
 
 ```bash
 python -m pytest --full -v \
   tests/experimental/test_deepseek_v41_decode.py::test_fp4_fp8_all_finite_codes \
-  tests/experimental/test_deepseek_v41_decode.py::test_fp8_main_rounding_saturation_underflow_changed_graph \
+  tests/experimental/test_deepseek_v41_decode.py::test_fp8_main_scale_rounding_underflow_changed_graph \
   tests/experimental/test_deepseek_v41_decode.py::test_fp8_swa_changed_graph
 ```
 
 The byte probe covers all finite E2M1 codes × finite E4M3 scales, including signed
 zero, with neighboring group16 scales, permuted page selections, all eight
-retained D128 stages, invalid IDs and shared-memory guards. It uses the real
-inherited page-plane loader and both conversion branches. Both corrected probes
-compiled, launched and passed in smoke and full-suite order in job `5049128`,
-alongside the full decode/cache/native sparse MLA matrix and selected dense
-subset above. The example and reference-checked benchmark remain unrun.
+retained D128 stages, invalid IDs and shared-memory guards. It uses actual
+production preparation, two requests with distinct descales, the inherited
+page-plane loader and both conversion branches. Analytic replay checks K and V
+restoration, FP32 division ties, below-one scales, payload-dependent maxima,
+changed payload/scale/index data, poisoned scratch and zero/empty transitions.
+These request-scaled probes/replays passed on B200 / DSL 4.8.0 / bundled compiler
+13.4 in job `5103699`, as recorded above. Historical job `5049128` passed the
+earlier unit-scale versions, not these assertions. The example and
+reference-checked benchmark remain unrun.
 
 ### Historical native-first split acceptance (2026-10-15, pre-FP8-main)
 
@@ -886,13 +1029,16 @@ and optional FlashMLA retain that legacy representation and their original gates
 and share the global FP4 pool, selections and sink, but each is checked against
 its own represented-value FP64 oracle. The native arm uses the componentwise
 rounding bound and exact empty/strict sink-exclusive LSE gates above. Its reference
-decodes only selected global rows, applies their scales and finite-clamped/RTNE
-E4M3 conversion before QK and V, not the entire production-sized pool. The legacy
+gathers/masks only selected global bytes before exact decode, computes request
+amax/448 and x/s in FP32, then restores `double(staged) * double(s)` before QK
+and V; it does not convert the entire production-sized pool. The legacy
 references retain their decoded BF16 main values. JSON labels each arm's dtype,
-SWA encoding, packed main storage, selected-tile conversion (including lossy clamp),
-shapes, actual attention arithmetic and accuracy contract. Source provenance
-includes the shared FP8 packing helper in `mla_decode/helpers/ops.py`, without
-importing adapter modes merely to hash them. Native FP8 versus MXFP8 timings are
+SWA encoding, packed main storage, selected-tile conversion/scale direction,
+shapes, actual attention arithmetic and accuracy contract. Native main precision
+is `request_scaled_e4m3`; metadata also records FP32 `[B]` mixed-mode scale scratch
+and the v3 compile marker. Source provenance includes the shared FP8 packing
+helper in `mla_decode/helpers/ops.py` and reduction/division helpers in
+`cute_dsl/fp4_common.py`, without importing adapter modes merely to hash them. Native FP8 versus MXFP8 timings are
 **not** a like-for-like backend comparison:
 
 ```bash
@@ -920,7 +1066,9 @@ fixture before graph capture. The benchmark creates fresh metadata per shape.
 
 Each backend gets an independent plan. Timing uses warm CUDA Graph/events,
 32 complete public calls per replay and symmetric backend order, so all per-call
-metadata preparation, decode and merge GPU work is included. JSON records
+selection/count/amax preparation, selected-tile staging, source attention and
+merge GPU work is included. Data-dependent descales are not hoisted out of timing.
+JSON records
 correctness metrics, per-backend split counts and latency samples, toolchain
 versions and source SHA256 hashes. Quantization, JIT, allocation, graph capture
 and CPU overhead are excluded. These component measurements are not model
@@ -942,9 +1090,15 @@ explicit FP8 Q and BF16 main attention at widths 0/128/192/512; all passed withi
 the pre-FP8-main clean post-repair full257 run on `umb-b200-260` (job `5008381`,
 B200 / DSL 4.8.0 / bundled CUDA 13.4), including changed-data CUDA Graph replay
 and exact encoded-byte references. They do not qualify current E4M3 main staging
-or attention. The separate current FP8-main full271 run on `umb-b200-263`
-(job `5049128`, B200 / DSL 4.8.0 / bundled compiler 13.4) passed all **48 cache
-cases**, including native writer/decode graph replay, as recorded above.
+or attention. The later historical unit-scale FP8-main full271 run on
+`umb-b200-263` (job `5049128`, B200 / DSL 4.8.0 / bundled compiler 13.4) passed all
+**48 cache cases**, including native writer/decode graph replay, as recorded above.
+Neither historical result qualifies request-selected amax, FP8 normalization or
+scale restoration. The separate request-scaled run on `umb-b200-237` (job
+`5103699`, B200 / DSL 4.8.0 / bundled compiler 13.4) passed all **48 cache cases**,
+including the new writer/replay assertions at native global widths 0/128/192/512.
+The captured writer/decode path verified changed scale bytes, refreshed request
+descales and zero/empty transitions under the unchanged byte and FP64 decode gates.
 
 ```bash
 pytest tests/experimental/test_deepseek_v41_decode.py \

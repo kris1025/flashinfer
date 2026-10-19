@@ -7,9 +7,10 @@
 """Selected FP4-cache tiles for the D512 Prims-TS Keep-AB graph.
 
 The independent global pass consumes the primary pool as page64/group16 FP4.
-Native E4M3 attention rounds scaled FP4 values into FP8 shared-memory stages;
-the BF16 base remains unchanged for optional MXFP8 compatibility. Both retain
-thread-written D128 stages until delayed PV releases K, without materializing
+Native E4M3 attention normalizes decoded FP4 values by a live request descale
+before rounding into FP8 shared-memory stages; the BF16 base remains unchanged
+for optional MXFP8 compatibility. Both retain thread-written D128 stages until
+delayed PV releases K, without materializing
 a dequantized KV tensor in global memory.
 """
 
@@ -27,7 +28,45 @@ from ...attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
 from ...attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
 )
+from ...cute_dsl.fp4_common import fabs_f32, fdiv_rn, fmax_f32
 from . import hca_v41_primitives as hw
+
+
+@cute.jit
+def _fp4_group_amax(pool, slot, group):
+    # One warp covers all 32 group16s of a selected row. Do not assume a group
+    # contains E2M1's maximum code: large scales with zero payload contribute 0.
+    page_base = cutlass.Int64(slot // 64) * (64 * 288)
+    token = cutlass.Int64(slot & 63)
+    payload_offset = page_base + token * 256 + cutlass.Int64(group) * 8
+    scale_offset = page_base + 64 * 256 + token * 32 + cutlass.Int64(group)
+    data_ptr = cute.make_ptr(
+        cutlass.Int32,
+        pool.iterator.toint() + payload_offset,
+        cute.AddressSpace.gmem,
+        assumed_align=8,
+    )
+    words = cute.make_rmem_tensor(cute.make_layout(2), cutlass.Int32)
+    words.store(cute.make_tensor(data_ptr, cute.make_layout(2)).load())
+    magnitude = cutlass.Float32(0.0)
+    for word in cutlass.range_constexpr(2):
+        fp4 = cute.make_tensor(
+            cute.recast_ptr(words.iterator + word, dtype=cutlass.Float4E2M1FN),
+            cute.make_layout(8),
+        ).load()
+        fp16 = nvw.cvt_f4e2m1x8_to_f16x8(fp4)
+        values = cute.TensorSSA(fp16, (8,), cutlass.Float16).to(cutlass.Float32)
+        for element in cutlass.range_constexpr(8):
+            magnitude = fmax_f32(magnitude, fabs_f32(values[element]))
+    scale_ptr = cute.make_ptr(
+        cutlass.Float8E4M3FN,
+        pool.iterator.toint() + scale_offset,
+        cute.AddressSpace.gmem,
+        assumed_align=1,
+    )
+    scale = cute.make_tensor(scale_ptr, cute.make_layout(1))[0].to(cutlass.Float32)
+    # E2M1 times finite E4M3 is exact in FP32 (and in inherited BF16 staging).
+    return magnitude * fabs_f32(scale)
 
 
 @dataclass(frozen=True)
@@ -232,7 +271,7 @@ class Fp4SmemKvResource(SmemKvResource):
 @dataclass(frozen=True)
 class Fp4Fp8KvProducer(Fp4KvProducer):
     def compile_signature(self):
-        return ("dsv41_page64_fp4_group16_to_e4m3", self.native_fp4)
+        return ("dsv41_page64_fp4_group16_to_request_scaled_e4m3", self.native_fp4)
 
     def pipeline_config(self, cfg, load_group, umma_group, cta_layout_vmnk):
         if (
@@ -247,6 +286,8 @@ class Fp4Fp8KvProducer(Fp4KvProducer):
             or cfg.load_num_warps != 4
             or not cfg.sparse_reuse_kv
             or not cfg.sparse_direct
+            or not cfg.sparse_static_scales
+            or not cfg.sparse_request_kv_scale
         ):
             raise ValueError(
                 "V4.1 FP4-to-E4M3 KV requires Keep-AB/M64/BK128/KV8 retained stages"
@@ -262,9 +303,12 @@ class Fp4Fp8KvProducer(Fp4KvProducer):
             consumer_signaling_threads=SignalingThreads.CtaLeader,
         )
 
-    def make_resource(self, pools, **kwargs):
+    def make_resource(self, pools, *, runtime_args=None, **kwargs):
+        if runtime_args is None or len(runtime_args) != 1 or runtime_args[0] is None:
+            raise ValueError("FP4-to-E4M3 KV requires its request descale tensor")
         return Fp4Fp8SmemKvResource(
             fp4_cache=pools[0],
+            main_scale=runtime_args[0],
             native_fp4=self.native_fp4,
             **kwargs,
         )
@@ -272,19 +316,22 @@ class Fp4Fp8KvProducer(Fp4KvProducer):
 
 @dataclass(kw_only=True)
 class Fp4Fp8SmemKvResource(Fp4SmemKvResource):
+    main_scale: object = None
+
     @cute.jit
     def _store_fragment(self, fragment, stage_base, row, dim):
-        # Scaled E2M1 is exact in the inherited BF16 registers. Round once to
-        # unit-scale E4M3 (including finite saturation), before both QK and PV.
+        # Scaled E2M1 is exact in inherited BF16 registers. Normalize with the
+        # same request descale that attention restores in QK and normalized O.
         values = fragment.load().to(cutlass.Float32)
+        descale = cutlass.Float32(self.main_scale[self.batch_idx])
         packed = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.rmem)
         for word in cutlass.range_constexpr(2):
             column = word * 4
             packed[word] = pack_float4_to_fp8_e4m3(
-                values[column],
-                values[column + 1],
-                values[column + 2],
-                values[column + 3],
+                fdiv_rn(values[column], descale),
+                fdiv_rn(values[column + 1], descale),
+                fdiv_rn(values[column + 2], descale),
+                fdiv_rn(values[column + 3], descale),
             )
         # Native FP8 D128 descriptors use one SW128 byte plane. Eight values
         # occupy eight bytes, unlike the BF16 base's split-plane 16-byte store.

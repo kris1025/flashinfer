@@ -7,9 +7,11 @@ python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
 
 The default remains cute-dsl with BF16 Q/MXFP8 SWA. Selecting prims-ts defaults
 to explicit E4M3 Q/ordinary FP8 SWA and E4M3 Q/K/V/P attention for both sources.
-Selected packed FP4 main tiles apply group16 E4M3 scales, then round to unit
-E4M3 with RTNE and finite saturation to [-448,448] before QK/PV. This is lossy:
-finite scaled values can reach +/-2688. No BF16 query expansion is used.
+Valid selected packed FP4 main rows apply group16 E4M3 scales, then share one
+request FP32 descale RN(selected payload amax/448), or 1 for zero/empty requests.
+FP32 x/descale is rounded to E4M3 with RN/satfinite; represented K/V multiply by
+the descale, so decoded values up to +/-2688 are not clipped to +/-448. Q/SWA
+remain unit E4M3. No BF16 query expansion is used.
 --prims-ts-mode mxfp8 explicitly selects BF16 Q/packed MXFP8 SWA and legacy gates.
 Native and legacy arms have different represented inputs and arithmetic, not
 identical precision. All derive from common seeded BF16 sources and share one
@@ -17,15 +19,15 @@ packed global FP4 pool/indices, not a full converted cache.
 FlashMLA is an optional external legacy BF16-Q/MXFP8 benchmark dependency,
 enabled only by --flashmla, not a shipped decode backend. Cache-writer
 quantization, allocation, JIT and host overhead are excluded from GPU timing.
-Each timed invocation includes the full public replay, including GPU metadata,
-selected-tile conversion, attention and merge.
+Each timed invocation includes the full public replay: GPU selection/count/amax
+preparation, selected-tile staging, both source passes and merge.
 Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
 a nonpersistent schedule. The source implementation historically passed the
 expanded 257-case B200 matrix and selected 57-case dense subset with DSL 4.8.0 /
 bundled CUDA 13.4. Those pre-FP8-main runs used BF16 main attention and predate the
-native-only source split; neither they nor historical 299-case CPU acceptance
-qualify this change. No GPU/JIT or benchmark validation has run for FP8 main
-attention; performance and backend crossovers are unmeasured.
+native-only source split. Neither those runs nor later unit-clipped FP8-main
+validation qualify request-scaled conversion. No GPU/JIT or benchmark validation
+has run for this change; performance and backend crossovers are unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
@@ -47,6 +49,7 @@ PRIMS_TS_SOURCES = (
     "experimental/deepseek_v41/prims_ts.py",
     "experimental/deepseek_v41/prims_ts_fp8.py",
     "experimental/deepseek_v41/prims_ts_resources.py",
+    "cute_dsl/fp4_common.py",
     "attention/prims_ts/kernels/mla_decode/helpers/ops.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
     "attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/tasks.py",
@@ -154,14 +157,54 @@ def legacy_reference(q, swa, main, wi, ci, sink):
     return expected, scores.logsumexp(-1)
 
 
+def request_scaled_main(decoded):
+    """Independent FP32 normalization, then FP64 represented main K/V."""
+    decoded = decoded.float()
+    if decoded.shape[1]:
+        amax = decoded.abs().amax(dim=(1, 2), keepdim=True)
+    else:
+        amax = torch.zeros(
+            (decoded.shape[0], 1, 1), device=decoded.device, dtype=torch.float32
+        )
+    # CUDA scalar division may strength-reduce to reciprocal multiplication.
+    divisor = torch.full_like(amax, 448.0)
+    scale = torch.where(amax > 0, (amax / divisor).float(), 1)
+    # Materialize float32 division, not an FP64 quotient or reciprocal multiply.
+    normalized = (decoded / scale).float()
+    staged = normalized.clamp(-448, 448).to(torch.float8_e4m3fn)
+    return staged.double() * scale.double(), scale
+
+
+def selected_main_fp8(pool, safe, valid):
+    """Gather/mask selected bytes before decoding; never convert the full cache."""
+    pages = pool.view(pool.shape[0], -1)
+    page, row = safe // 64, safe % 64
+    column = torch.arange(512, device=safe.device)
+    payload = pages[page[..., None], row[..., None] * 256 + column // 2]
+    payload = torch.where(valid[..., None], payload, 0)
+    code = (payload >> (4 * (column % 2))) & 15
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device=safe.device,
+        dtype=torch.float32,
+    )
+    data = lut[code.long()]
+    scale = pages[page[..., None], 64 * 256 + row[..., None] * 32 + column // 16]
+    scale = torch.where(valid[..., None], scale, 0)
+    scale = scale.contiguous().view(torch.float8_e4m3fn).float()
+    decoded = data * scale  # E2M1 * finite E4M3 is exact in float32.
+    represented, _ = request_scaled_main(decoded)
+    return represented
+
+
 def fp8_oracle(q, swa, global_cache, wi, ci, sink):
     """FP64 represented-input oracle and native componentwise FP8 bound.
 
-    Decode only selected FP4 rows, then finite-clamp/RTNE to unit E4M3 for both
-    QK and V, not the entire production-sized global pool. Scaled FP4 values can
-    reach +/-2688, so the [-448,448] conversion is lossy. The attention/bound
-    calculation matches the independent native GPU tests; neither production
-    conversion helpers nor intermediate source states enter this oracle.
+    Gather and mask selected main bytes before decoding exact scaled E2M1.
+    Each request uses its payload amax/448 in FP32 (1 only for zero/empty),
+    FP32 x/scale, E4M3 RN/satfinite, then FP64 staged*scale for both QK and V.
+    Q/SWA remain unit E4M3. The attention/bound calculation matches the independent
+    native GPU tests; no production conversion helper or source state is reused.
     """
     values, masks = [], []
     for pool, ids, fp4 in ((swa, wi, False), (global_cache, ci, True)):
@@ -173,8 +216,7 @@ def fp8_oracle(q, swa, global_cache, wi, ci, sink):
         if not fp4:
             gathered = pool.double().reshape(-1, 512)[safe]
         else:
-            gathered = selected(pool, safe[:, None], True, round_bf16=False)
-            gathered = gathered.clamp(-448, 448).to(torch.float8_e4m3fn).double()
+            gathered = selected_main_fp8(pool, safe, valid)
         values.append(torch.where(valid[..., None], gathered, 0))
         masks.append(valid)
     kv, valid = torch.cat(values, 1), torch.cat(masks, 1)
@@ -285,14 +327,16 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
             "original E4M3 Q, no BF16 query scratch"
         )
         global_conversion = (
-            "selected scaled E2M1 -> unit E4M3 SMEM; RTNE + finite saturation "
-            "[-448,448], preserving signed zero/subnormals; lossy (finite products "
-            "reach +/-2688)"
+            "request_scaled: valid selected E2M1 * signed finite group16 E4M3; "
+            "one FP32 s[b]=RN(selected payload amax/448), 1 only for zero/empty; "
+            "RN_FP32(x/s) -> E4M3 RN/satfinite SMEM; represented double(staged)*double(s), "
+            "not unit-clipped (decoded finite range +/-2688); Q/SWA remain unit E4M3"
         )
         contract.update(
             reference=(
-                "independent FP64 over stored E4M3 Q/SWA and selected main KV "
-                "after scaled E2M1 -> finite-clamped/RTNE unit E4M3"
+                "independent FP64 over stored E4M3 Q/SWA and request_scaled main KV; "
+                "mask selected packed bytes before exact decode/amax, materialize FP32 "
+                "x/s before E4M3 RN/satfinite, then double(staged)*double(s)"
             ),
             output="componentwise native FP8 P-rounding bound (not legacy relative gates)",
             componentwise_bound=(
@@ -318,7 +362,7 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
         contract.update(
             rel_l2_lt=0.005, max_scaled_lt=0.01, sink_exclusive_lse_abs_lt=1e-5
         )
-    return {
+    metadata = {
         "prims_ts_mode": prims_ts_mode if name == "prims-ts" else None,
         "q_dtype": str(q.dtype),
         "swa_encoding": "swa_fp8" if native_fp8 else "swa_mxfp8",
@@ -329,6 +373,15 @@ def arm_metadata(name, args, *, prims_ts_mode="fp8"):
         "arithmetic": arithmetic,
         "accuracy_contract": contract,
     }
+    if native_fp8:
+        metadata.update(
+            global_precision="request_scaled_e4m3",
+            main_scale="FP32[B] scratch, refreshed per call; None in window-only plans",
+            compile_marker=(
+                "dsv41_request_scaled_e4m3_q_swa512_fp4_to_e4m3_fp32_sources_v3"
+            ),
+        )
+    return metadata
 
 
 def graph(fn):
@@ -413,15 +466,17 @@ def main():
         ),
         "comparison": (
             "common seeded BF16 source Q/SWA; one shared packed global FP4 pool "
-            "and indices; native FP8 (when selected) converts main tiles to lossy "
-            "finite-clamped/RTNE E4M3; legacy represented main values remain BF16; "
+            "and indices; native FP8 (when selected) uses selected-request payload "
+            "amax and FP32 division for request_scaled E4M3 main tiles, not unit clipping; "
+            "legacy represented main values remain BF16; "
             "arm-specific arithmetic and accuracy contracts"
         ),
         "seed": opts.seed,
         "timing": "CUDA Graph/event, 32 calls/replay, symmetric order, 30 samples/arm",
         "scope": (
-            "full public replay GPU latency, including metadata+decode+merge; "
-            "excludes cache preparation/JIT/allocation/capture/host time"
+            "full public replay GPU latency, including selection/count/amax preparation, "
+            "selected-tile staging, both source passes and merge; "
+            "excludes cache-writer preparation/JIT/allocation/capture/host time"
         ),
         "sha256": {
             name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -444,8 +499,8 @@ def main():
                 for backend in opts.backends:
                     args = arm_args[backend]
                     plans[backend] = deepseek_v41_decode(*args, backend=backend)[2]
-                    # Capture the complete public call, not just attention:
-                    # Prims-TS also sanitizes live selections on the GPU.
+                    # Capture selection/count/amax prep, staging, source passes
+                    # and merge together; never hoist per-request descales.
                     fns[backend] = lambda args=args, plan=plans[
                         backend
                     ], backend=backend: (
