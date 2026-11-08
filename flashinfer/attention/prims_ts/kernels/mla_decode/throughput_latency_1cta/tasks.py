@@ -622,6 +622,23 @@ def create_keeps_mma_ab_correction_task(
                 inst_idx=0,
                 is_tail=True,
             )
+            if cfg.ws_tail_staged_stripes:
+                # Read O, release it to the next tile's PV, then finish the tail.
+                tmem_corr.correct_tail_and_stage(
+                    old_max_arr=old_max_arr,
+                    new_max_arr=new_max_arr,
+                    sum_arr=sum_arr,
+                    inst0_new_max_arr=inst0_new_max_arr,
+                    inst0_sum_arr=inst0_sum_arr,
+                    inst1_new_max_arr=inst1_new_max_arr,
+                    inst1_sum_arr=inst1_sum_arr,
+                    o_stage_idx=o_stage_idx,
+                    tail_o_stage_idx_0=tail_o_stage_idx_0,
+                    tail_o_stage_idx_1=tail_o_stage_idx_1,
+                )
+                tmem_o.release()
+                tmem_corr.store_staged_tail()
+                return local_state, tail_o_stage_idx_0, tail_o_stage_idx_1
             tmem_corr.correct_tail_and_store(
                 old_max_arr=old_max_arr,
                 new_max_arr=new_max_arr,
@@ -1317,8 +1334,17 @@ def create_throughput_latency_load_task(
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             schedule_token_throttle_head(schedule_token_throttle)
             smem_q.acquire()
-            smem_q.load_q()
-            smem_q.commit()
+            if cfg.q_in_kv:
+                # The Q pipeline hands the tile over without bytes; its Q lands
+                # in the next two K/V ring slices, ahead of the tile's K.
+                smem_q.commit()
+                for half in range(2):
+                    smem_kv.acquire()
+                    smem_kv.load_q_half(half=half)
+                    smem_kv.commit()
+            else:
+                smem_q.load_q()
+                smem_q.commit()
             if cfg.serial_swap_reuse:
                 load_kv(
                     head_dim_stages=cfg.qk_head_dim_stages,
@@ -1948,7 +1974,13 @@ def create_single_kv_pipe_mma_task(
                 if not swap:
                     p_resource.init_stage_work_tile_state()
             smem_q.wait()
-            q_desc, q_desc_rope = smem_q.q_desc()
+            if cfg.q_in_kv:
+                # Both K/V ring slices of the tile's Q, then the copy to TMEM.
+                smem_kv.wait()
+                smem_kv.wait()
+                q_desc, q_desc_rope = smem_kv.q_desc_from_kv()
+            else:
+                q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
             staged_qk_mma(
                 smem_kv,
@@ -1963,6 +1995,11 @@ def create_single_kv_pipe_mma_task(
                 # the copy and the first QK; the loader prefetches the next Q
                 # during the rest of this tile.
                 smem_q.release()
+                if cfg.q_in_kv:
+                    # The oldest unreleased ring slices are Q's: release them
+                    # before any of the K slices QK retains for PV.
+                    smem_kv.release()
+                    smem_kv.release()
             with domain_loop(0, domain, 1):
                 if pv_before_qk:
                     pv_mma(

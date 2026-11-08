@@ -2445,6 +2445,290 @@ class TmemCorrResource(MlaResource):
             )
         prims.cp_async_bulk_commit_group()
 
+    def _tail_staged_stripes(self):
+        """Lane tail stripes (of eight 32-channel ones) held as BF16 words across the O release.
+
+        The WS quantized tail otherwise quantizes every stripe while it holds the O stage,
+        so the next tile's first PV waits for the whole epilogue. Staged stripes are only
+        loaded and rounded before the release and quantized after it
+        (``cfg.ws_tail_staged_stripes``; 0 keeps the current tail).
+        """
+        if not (
+            self._ws_tma_quant_output()
+            and hasattr(self.output_quant, "round_words")
+            and hasattr(self.output_quant, "store_words")
+            and hasattr(self.output_quant, "store_scales")
+            and self.output_quant.block_size == 32
+            and self.cfg.kernel_variant == "keeps_mma_ab"
+            and self.cfg.v_head_dim_stages == 4
+            and self.cfg.head_dim_per_stage_v == 128
+        ):
+            return 0
+        return self.cfg.ws_tail_staged_stripes
+
+    @producer_work
+    @cute.jit
+    def correct_tail_and_stage(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr,
+        new_max_arr,
+        sum_arr,
+        inst0_new_max_arr,
+        inst0_sum_arr,
+        inst1_new_max_arr,
+        inst1_sum_arr,
+        o_stage_idx,
+        tail_o_stage_idx_0,
+        tail_o_stage_idx_1,
+    ):
+        """``correct_tail_and_store`` up to the O release; ``store_staged_tail`` finishes it."""
+        del old_max_arr, o_stage_idx
+        if cutlass.const_expr(self._tail_staged_stripes() == 0):
+            self._normalize_and_store_tail_o(
+                stage_info,
+                new_max_arr=new_max_arr,
+                sum_arr=sum_arr,
+                inst0_new_max_arr=inst0_new_max_arr,
+                inst0_sum_arr=inst0_sum_arr,
+                inst1_new_max_arr=inst1_new_max_arr,
+                inst1_sum_arr=inst1_sum_arr,
+                tail_o_stage_idx_0=tail_o_stage_idx_0,
+                tail_o_stage_idx_1=tail_o_stage_idx_1,
+            )
+        else:
+            self._stage_ws_quant_tail(
+                stage_info,
+                new_max_arr=new_max_arr,
+                sum_arr=sum_arr,
+                inst0_new_max_arr=inst0_new_max_arr,
+                inst0_sum_arr=inst0_sum_arr,
+                inst1_new_max_arr=inst1_new_max_arr,
+                inst1_sum_arr=inst1_sum_arr,
+                tail_o_stage_idx_0=tail_o_stage_idx_0,
+            )
+
+    @producer_work
+    @cute.jit
+    def store_staged_tail(self, stage_info: StageInfo):
+        """Quantize and store the stripes ``correct_tail_and_stage`` held, after the O release."""
+        if cutlass.const_expr(self._tail_staged_stripes() > 0):
+            halves, quant_staged, task_cache, head_dim_offset = self._tail_staged
+            quant = self.output_quant
+            for half in halves:
+                (
+                    h,
+                    slice_offset,
+                    slice_base,
+                    row,
+                    col_base,
+                    rotary,
+                    rotary_scratch,
+                    words,
+                ) = half[:8]
+                scale_word = half[8]
+                if cutlass.const_expr(len(words) > 0):
+                    if cutlass.const_expr(len(words) == 4):
+                        # No stripe of this half wrote its slice before the release.
+                        prims.cp_async_bulk_wait_group(1, read=True)
+                        cute.arch.sync_warp()
+                        if cutlass.const_expr(rotary and quant_staged is not None):
+                            rotary_scratch = self._quant_scratch.data_ptr().toint(
+                                Int32
+                            ) + task_cache[_TASK_CACHE_WARP_IDX] * Int32(
+                                quant.rotary_scratch_bytes
+                            )
+                            quant.stage_rotary(quant_staged, rotary_scratch)
+                    for stripe, stripe_words in words:
+                        scale = quant.store_words(
+                            self.output_quant_args,
+                            stripe_words,
+                            row,
+                            col_base + Int32(stripe * quant.block_size),
+                            lane_stride=1,
+                            rotary=rotary,
+                            shared_output=slice_base,
+                            rotary_scratch=rotary_scratch,
+                            scale_out=True,
+                        )
+                        scale_word = scale_word | (Uint32(scale) << Uint32(8 * stripe))
+                    self._finish_ws_quant_half(
+                        task_cache,
+                        row=row,
+                        col_base=col_base,
+                        slice_offset=slice_offset,
+                        scale_word=scale_word,
+                    )
+            self._reduce_cluster_partials_and_store(
+                stage_info, task_cache, head_dim_offset
+            )
+
+    @cute.jit
+    def _finish_ws_quant_half(
+        self, task_cache, *, row, col_base, slice_offset, scale_word
+    ):
+        """Store a quantized WS half's block scales and its 32-row TMA box."""
+        quant = self.output_quant
+        heads_per_group = cutlass.const_expr(quant.num_heads // quant.num_groups)
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        quant.store_scales(self.output_quant_args, row, col_base, scale_word)
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        first_row = Int64(row) - Int64(lane_idx)
+        token = Int32(first_row // quant.num_heads)
+        first_head = Int32(first_row % quant.num_heads)
+        if prims.elect_sync():
+            prims.cp_async_bulk_tensor_global_shared_cta(
+                self.tma_o_desc,
+                self._smem_o_coalesce_bytes.subview(slice_offset),
+                (
+                    col_base,
+                    first_head % Int32(heads_per_group),
+                    token,
+                    first_head // Int32(heads_per_group),
+                ),
+            )
+        prims.cp_async_bulk_commit_group()
+
+    @cute.jit
+    def _stage_ws_quant_tail(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr,
+        sum_arr,
+        inst0_new_max_arr,
+        inst0_sum_arr,
+        inst1_new_max_arr,
+        inst1_sum_arr,
+        tail_o_stage_idx_0,
+    ):
+        """The O-reading part of the WS quantized tail.
+
+        Lane l of correction warp w owns output row (w % 2) * 32 + l and, per half h,
+        128 channels from h * 256 + (w // 2) * 128: stripes 4h..4h+3 of 32 channels.
+        The last ``_tail_staged_stripes()`` stripes are loaded, scaled and rounded to
+        BF16 words; the others are quantized into the half's staging slice now, as
+        ``_store_ws_half_quant_via_tma`` does. A half without staged stripes is stored
+        now. ``store_staged_tail`` quantizes the rest after the O release, with the same
+        operations in the same order per value, so the output bytes do not change.
+        """
+        cfg = self.cfg
+        quant = self.output_quant
+        staged_from = cutlass.const_expr(8 - self._tail_staged_stripes())
+        task_cache = decode_gen_task_cache(stage_info)
+        quant_staged = None
+        if cutlass.const_expr(self._prefetches_output_quant()):
+            quant_staged = quant.prefetch(
+                self.output_quant_args,
+                self._ws_lane_output_row(stage_info, task_cache),
+                1,
+                state=self._tail_quant_state,
+            )
+        tmem_row_base = task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+        cta_idx_head_dim_v = cta_idx_head_dim_v_for_stage(
+            self.cta_idx_head_dim_v, stage_info
+        )
+        head_dim_offset = head_dim_cta_offset_v(cfg, cta_idx_head_dim_v)
+        final_max, reduced_sum, final_scale0, _ = self._compute_tail_softmax_scales(
+            task_cache,
+            stage_info,
+            new_max_arr=new_max_arr,
+            sum_arr=sum_arr,
+            inst0_new_max_arr=inst0_new_max_arr,
+            inst0_sum_arr=inst0_sum_arr,
+            inst1_new_max_arr=inst1_new_max_arr,
+            inst1_sum_arr=inst1_sum_arr,
+        )
+        self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
+        store_scale = final_scale0[0]
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        row = self._ws_lane_output_row(stage_info, task_cache)
+        slice_bytes = 32 * 128
+        halves = []
+        for h in cutlass.range_constexpr(2):
+            v_stage_idx = 2 * h
+            base_addr0 = (
+                tmem_row_base
+                + self._o_base_col()
+                + o_stage_tmem_col_offset(cfg, tail_o_stage_idx_0, v_stage_idx)
+            )
+            col_base = (
+                head_dim_offset
+                + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+                + (warp_idx // Int32(2)) * Int32(128)
+            )
+            slice_offset = warp_idx * Int32(2 * slice_bytes) + Int32(h * slice_bytes)
+            slice_base = self._smem_o_coalesce.data_ptr().toint(Int32) + slice_offset
+            rotary = cutlass.const_expr(v_stage_idx + 2 == cfg.v_head_dim_stages)
+            direct = [s for s in range(4) if 4 * h + s < staged_from]
+            rotary_scratch = None
+            if cutlass.const_expr(len(direct) > 0):
+                # Keep at most the other half's store in flight.
+                prims.cp_async_bulk_wait_group(1, read=True)
+                cute.arch.sync_warp()
+                if cutlass.const_expr(rotary and quant_staged is not None):
+                    rotary_scratch = self._quant_scratch.data_ptr().toint(
+                        Int32
+                    ) + warp_idx * Int32(quant.rotary_scratch_bytes)
+                    quant.stage_rotary(quant_staged, rotary_scratch)
+            scale_word = Uint32(0)
+            words = []
+            for stripe in cutlass.range_constexpr(4):
+                loaded = prims.tcgen05_ld(
+                    prims.Tcgen05LdStShape.SHAPE_32X32B,
+                    prims.make_tmem_ptr(
+                        base_addr0 + Int32(stripe * quant.block_size), Float32
+                    ),
+                    num=quant.block_size,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                cute.arch.fence_view_async_tmem_load()
+                values = cutlass.Array(
+                    Float32, quant.block_size, space=cutlass.AddressSpace.rmem
+                )
+                for i in cutlass.range_constexpr(0, quant.block_size, 2):
+                    pair = fmul2((store_scale, store_scale), (loaded[i], loaded[i + 1]))
+                    values[i], values[i + 1] = pair[0], pair[1]
+                if cutlass.const_expr(4 * h + stripe >= staged_from):
+                    words.append((stripe, quant.round_words(values)))
+                else:
+                    scale = quant.store(
+                        self.output_quant_args,
+                        values,
+                        row,
+                        col_base + Int32(stripe * quant.block_size),
+                        lane_stride=1,
+                        rotary=rotary,
+                        shared_output=slice_base,
+                        rotary_scratch=rotary_scratch,
+                        scale_out=True,
+                    )
+                    scale_word = scale_word | (Uint32(scale) << Uint32(8 * stripe))
+            if cutlass.const_expr(len(words) == 0):
+                self._finish_ws_quant_half(
+                    task_cache,
+                    row=row,
+                    col_base=col_base,
+                    slice_offset=slice_offset,
+                    scale_word=scale_word,
+                )
+            halves.append(
+                (
+                    h,
+                    slice_offset,
+                    slice_base,
+                    row,
+                    col_base,
+                    rotary,
+                    rotary_scratch,
+                    words,
+                    scale_word,
+                )
+            )
+        self._tail_staged = (halves, quant_staged, task_cache, head_dim_offset)
+
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def drain_output_stores(self, stage_info: StageInfo) -> None:

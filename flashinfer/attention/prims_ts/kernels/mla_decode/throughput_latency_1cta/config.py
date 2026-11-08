@@ -211,6 +211,12 @@ class MlaConfig(Nvfp4KVConfig):
     # WS final BF16 output leaves each SW128 SMEM chunk through a TMA tensor
     # store instead of thread stores (requires ws_coalesce_cols == 64).
     ws_tma_output: bool = False
+    # WS quantized tail: lane stripes held as BF16 words across the O release
+    # (requires ws_tma_output); 0 quantizes every stripe before the release.
+    ws_tail_staged_stripes: int = 0
+    # Q lands in two K/V ring slices and the MMA warp copies it to TMEM from
+    # there; the Q pipeline only carries a zero-byte tile token (see SparseMlaProfile).
+    q_in_kv: bool = False
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
     sparse_reuse_kv: bool = False
@@ -2111,6 +2117,12 @@ def configure_sparse_mla(
         raise ValueError("ws_store_cols must be 0, 32 or 64")
     if profile.ws_tma_store and profile.ws_store_cols != 64:
         raise ValueError("WS TMA output stores need 64-column (128-byte) chunks")
+    if not 0 <= profile.ws_tail_staged_stripes <= 8:
+        raise ValueError("ws_tail_staged_stripes must be in [0, 8]")
+    if profile.ws_tail_staged_stripes and not profile.ws_tma_store:
+        raise ValueError("a staged WS tail needs WS TMA output stores")
+    if profile.ws_q_in_kv and not (keep and ws_fp8):
+        raise ValueError("Q in the K/V ring needs the keeps-MMA-AB WS FP8 schedule")
     if profile.ws_tma_store and cfg.logical_num_heads_q % 32:
         # One box holds a correction warp's 32 consecutive heads of one query.
         raise ValueError("WS TMA output stores need a multiple of 32 heads")
@@ -2211,6 +2223,8 @@ def configure_sparse_mla(
                 q_tmem_mma_copy=True,
                 ws_coalesce_cols=profile.ws_store_cols,
                 ws_tma_output=profile.ws_tma_store,
+                ws_tail_staged_stripes=profile.ws_tail_staged_stripes,
+                q_in_kv=profile.ws_q_in_kv,
                 tmem_s_cols=64,
             )
     else:

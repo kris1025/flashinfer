@@ -47,6 +47,14 @@ class SparseMlaProfile:
     ws_store_cols: int = 0
     # With ws_store_cols=64: store each output chunk with a TMA tensor store.
     ws_tma_store: bool = False
+    # With ws_tma_store and a quantized output: how many of each lane's eight
+    # 32-channel tail stripes are only read and rounded to BF16 before the tail
+    # releases O, and quantized after it, overlapping the next tile (0..8).
+    ws_tail_staged_stripes: int = 0
+    # Keep-AB WS FP8: stage a tile's Q in the next two K/V ring slices instead of a
+    # dedicated 32 KB stage (the MMA warp still copies it to TMEM), so the ring
+    # can retain more K/V slices.
+    ws_q_in_kv: bool = False
 
 
 def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):

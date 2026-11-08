@@ -1283,13 +1283,13 @@ def _make_single_kv_pipe_task_graph(
         ),
         advance_on_wait=True,
     )
+    # With Q in the K/V ring the Q pipeline only hands each tile over: no bytes.
+    q_pipe_bytes = 0 if cfg.q_in_kv else cfg.qk_smem_tile_bytes
     smem_q_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stages,
-        num_bytes=cfg.qk_smem_tile_bytes,
+        num_bytes=q_pipe_bytes,
         num_bytes_per_warp_per_cta=(
-            cfg.qk_smem_tile_bytes // cfg.load_num_warps
-            if cfg.load_num_warps > 1
-            else None
+            q_pipe_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
         ),
         producer_group=tma_group,
         producer_signaling_threads=(
@@ -1440,6 +1440,16 @@ def _make_single_kv_pipe_task_graph(
     )
     if cfg.q_tma_stage:
         smem_q.kv_alias_ref = smem_kv
+    if cfg.q_in_kv:
+        # Q occupies two consecutive D128 ring slices; every ring item spans an
+        # even number of them, so the pair is contiguous like a dedicated stage.
+        assert (
+            cfg.q_tmem_mma_copy
+            and 2 * cfg.kv_smem_tile_bytes == cfg.qk_smem_tile_bytes
+            and not cfg.whole_kv_tile
+            and cfg.kv_stages % 2 == 0
+        ), "q_in_kv needs an MMA-copied Q of two D128 K/V slices and an even ring"
+        smem_kv.q_ref = smem_q
     if cfg.async_nvfp4_kv_gather:
         smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(

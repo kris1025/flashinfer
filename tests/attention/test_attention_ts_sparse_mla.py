@@ -953,6 +953,110 @@ def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
     assert configs
 
 
+# The 64-head WS FP8 gather schedule on a persistent grid: warp-specialized M64
+# MMAs, Q copied into TMEM, and TMA tensor stores of the output.
+_WS_GATHER_PROFILE = dict(
+    family="keep",
+    tile_size_q=64,
+    split_kv=1,
+    scheduler="static",
+    head_dim_ctas=1,
+    gather_issue_warps=8,
+    reuse_kv=True,
+    kv_tile_size=128,
+    uniform_offset_cache=True,
+    paired_correction=True,
+    ws_mma=True,
+    ws_store_cols=64,
+    ws_tma_store=True,
+    page_pipeline_stages=2,
+)
+
+
+@pytest.mark.parametrize("q_in_kv", [False, True])
+def test_keep_ab_ws_gather_graph(q_in_kv, monkeypatch):
+    """Q staged in two K/V ring slices lets the WS schedule retain ten D128 stages."""
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    options = dict(ws_q_in_kv=True, reuse_kv_stages=10) if q_in_kv else {}
+    profile = SparseMlaProfile(**_WS_GATHER_PROFILE, **options)
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    compile_kernel = mla_decode._get_compiled_mla_decode
+    configs = []
+
+    def checked_compile(spec):
+        cfg = spec.kernel._make_config()
+        assert cfg.kernel_variant == "keeps_mma_ab"
+        assert cfg.ws_pv and cfg.ws_tma_output
+        assert cfg.q_in_kv == q_in_kv
+        # The Q stage shrinks to a stub, so the ring keeps two more slices.
+        assert cfg.kv_stages == (10 if q_in_kv else 8)
+        configs.append(cfg)
+        return compile_kernel(spec)
+
+    monkeypatch.setattr(mla_decode, "_get_compiled_mla_decode", checked_compile)
+    # Keep the independent oracle and changed-metadata replay gates unchanged.
+    test_native_graph(torch.float8_e4m3fn, sms + 1, 1, 64, 513, True, False, True)
+    assert configs
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        pytest.param(
+            dict(ws_tma_store=False, ws_store_cols=0, ws_tail_staged_stripes=4),
+            "staged WS tail needs WS TMA output stores",
+            id="staged-tail-without-tma-store",
+        ),
+        pytest.param(
+            dict(ws_tail_staged_stripes=9),
+            r"ws_tail_staged_stripes must be in \[0, 8\]",
+            id="staged-tail-stripes",
+        ),
+        pytest.param(
+            dict(ws_mma=False, ws_store_cols=0, ws_tma_store=False, ws_q_in_kv=True),
+            "Q in the K/V ring needs the keeps-MMA-AB WS FP8 schedule",
+            id="q-in-kv-without-ws",
+        ),
+    ],
+)
+def test_keep_ab_ws_gather_profile_rejected(overrides, message, monkeypatch):
+    """Profile options a schedule cannot honor fail at plan time."""
+    from dataclasses import replace
+
+    from flashinfer.attention.prims_ts import mla_decode
+    from flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+    )
+
+    profile = replace(SparseMlaProfile(**_WS_GATHER_PROFILE), **overrides)
+    monkeypatch.setattr(
+        mla_decode, "select_sparse_mla_profile", lambda **kwargs: profile
+    )
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    w = BatchSparseMLADecodePagedTSWrapper()
+    with pytest.raises(ValueError, match=message):
+        w.plan(
+            torch.device("cuda"),
+            sms + 1,
+            64,
+            max_topk=128,
+            max_extra_topk=513,
+            max_q_len=1,
+            q_dtype=torch.float8_e4m3fn,
+            kv_layout="NHD",
+            use_attention_sinks=True,
+            return_lse=True,
+            assume_valid_prefix=True,
+        )
+
+
 def test_caller_workspace_single_source_and_eager_api():
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
