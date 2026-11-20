@@ -2798,7 +2798,7 @@ def create_mma_task_dual_transform_kv(
             _consume_staged_qk_mma(
                 tmem_k, tmem_s0, q_desc, "k_desc_0", "qk_mma_head", FmhaStage.Head, cfg
             )
-            with domain_loop(0, domain, 1, unroll=1):
+            with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
                 _consume_staged_qk_mma(
                     tmem_k,
                     tmem_s0,
@@ -3093,13 +3093,13 @@ def create_kv_operand_transform_task(
             if not is_v:
                 convert_tile()
             if flatten_loop:
-                with domain_loop(0, domain * stages, 1, unroll=1):
+                with domain_loop(0, runtime_domain_end(domain * stages), 1, unroll=1):
                     if early_prefetch:
                         convert_prefetched_stage(smem_kv.prefetch_nvfp4_loop_row)
                     else:
                         convert_stage(getattr(converted_kv, f"{label}_loop_stage"))
             else:
-                with domain_loop(0, domain, 1, unroll=1):
+                with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
                     convert_tile()
             if is_v:
                 convert_tile()
@@ -3223,7 +3223,9 @@ def create_transform_kv_task(
         # otherwise fully unroll this transform body once per K/V tile.
         if flatten_loop:
             source = source_for_label(loop_labels[0])
-            with domain_loop(0, runtime_domain_end(domain * loop_stages_per_step), 1, unroll=1):
+            with domain_loop(
+                0, runtime_domain_end(domain * loop_stages_per_step), 1, unroll=1
+            ):
                 smem_transformed_kv.acquire()
                 source.wait()
                 smem_transformed_kv.transform_kv_loop_stage()
@@ -3368,7 +3370,7 @@ def create_nvfp4_keeps_transform_task(
                 smem_kv_raw.release()
 
         transform_one(smem_k0, KV_KIND_K)
-        with domain_loop(0, domain, 1, unroll=1):
+        with domain_loop(0, runtime_domain_end(domain), 1, unroll=1):
             transform_one(smem_k0, KV_KIND_K)
             transform_one(smem_v0, KV_KIND_V)
         transform_one(smem_v0, KV_KIND_V)
